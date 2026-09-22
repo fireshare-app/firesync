@@ -169,7 +169,9 @@ export interface UploadEvent {
   id: number
   path: string
   size: number
-  state: 'done' | 'duplicate' | 'failed' | 'waiting' | 'paused'
+  /** Bytes handed to the socket so far, on an `uploading` event. */
+  sent: number
+  state: 'uploading' | 'done' | 'duplicate' | 'failed' | 'waiting' | 'paused'
   reason: string | null
   url: string | null
   landedAs: string | null
