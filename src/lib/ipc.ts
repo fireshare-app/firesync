@@ -88,3 +88,68 @@ export const api = {
   saveSettings: (settings: Settings) => invoke<void>('save_settings', { settings }),
   configLocation: () => invoke<string>('config_location'),
 }
+
+// --- Phase 2: ledger + watcher -------------------------------------------
+
+export type FileState =
+  | 'baseline'
+  | 'queued'
+  | 'uploading'
+  | 'done'
+  | 'duplicate'
+  | 'skipped'
+  | 'failed'
+
+export interface FileRow {
+  id: number
+  folderId: string
+  path: string
+  size: number
+  mtime: number
+  state: FileState
+  reason: string | null
+  attempts: number
+  observedAt: number
+  updatedAt: number
+}
+
+export interface FolderSummary extends WatchedFolder {
+  counts: [string, number][]
+  baselineCount: number
+}
+
+export interface NewFolder {
+  path: string
+  includeSubfolders?: boolean
+  media?: MediaKind[]
+  destFolder?: string | null
+  game?: string | null
+  minSizeBytes?: number | null
+  maxSizeBytes?: number | null
+  uploadExisting?: boolean
+}
+
+/** Pushed from Rust when the watcher settles on a file. */
+export interface Decision {
+  folderId: string
+  path: string
+  outcome: 'queued' | 'skipped' | 'requeued' | 'unchanged' | 'held'
+  reason: string | null
+  size: number
+  at: number
+}
+
+export const folders = {
+  list: () => invoke<FolderSummary[]>('list_folders'),
+  add: (folder: NewFolder) => invoke<FolderSummary>('add_folder', { folder }),
+  remove: (id: string) => invoke<void>('remove_folder', { id }),
+  setEnabled: (id: string, enabled: boolean) =>
+    invoke<void>('set_folder_enabled', { id, enabled }),
+  uploadExisting: (folderId: string, paths: string[]) =>
+    invoke<number>('upload_existing', { folderId, paths }),
+  problems: () => invoke<string[]>('watcher_problems'),
+}
+
+export const activity = {
+  recent: (limit = 200) => invoke<FileRow[]>('recent_activity', { limit }),
+}

@@ -2,11 +2,15 @@ mod api;
 mod commands;
 mod config;
 mod error;
+mod ledger;
+mod queue;
 mod secrets;
+mod watcher;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use commands::AppState;
+use watcher::settle::SettleConfig;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -27,10 +31,36 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
-            app.manage(AppState::new(app_data_dir));
+
+            let (state, rx) = AppState::new(app_data_dir)?;
+            let ledger = state.ledger.clone();
+            let settings = state.settings.clone();
+            let types = state.types.clone();
+
+            // Decisions are pushed rather than polled: a clip can settle minutes
+            // after the event that started the wait, long after any request the
+            // UI made would have returned.
+            let handle = app.handle().clone();
+            watcher::spawn_event_loop(
+                rx,
+                ledger,
+                settings,
+                types,
+                SettleConfig::default(),
+                move |decision| {
+                    let _ = handle.emit("firesync://decision", decision);
+                },
+            );
+
+            app.manage(state);
+            let problems = app.state::<AppState>().resync_watchers();
+            for problem in problems {
+                eprintln!("firesync: {problem}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -38,6 +68,13 @@ pub fn run() {
             commands::connection_status,
             commands::disconnect,
             commands::upload_options,
+            commands::add_folder,
+            commands::remove_folder,
+            commands::set_folder_enabled,
+            commands::list_folders,
+            commands::upload_existing,
+            commands::recent_activity,
+            commands::watcher_problems,
             commands::get_settings,
             commands::save_settings,
             commands::config_location,

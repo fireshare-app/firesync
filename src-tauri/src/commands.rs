@@ -1,27 +1,48 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::Manager;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::api::client::normalize_base_url;
 use crate::api::discovery::{check_token, fetch_options, TokenCheck, UploadOptions};
-use crate::config::{self, Settings};
+use crate::config::{self, MediaKind, Settings, WatchedFolder};
 use crate::error::{AppError, Result};
+use crate::ledger::{FileRow, Ledger};
+use crate::queue::rules::SupportedTypes;
 use crate::secrets;
+use crate::watcher::{scan_existing, Watchers};
+
+pub type WatchEvent = (String, PathBuf);
 
 pub struct AppState {
     pub app_data_dir: PathBuf,
-    pub settings: Mutex<Settings>,
+    pub settings: Arc<Mutex<Settings>>,
+    pub ledger: Arc<Ledger>,
+    pub types: Arc<Mutex<SupportedTypes>>,
+    pub watchers: Mutex<Watchers>,
 }
 
 impl AppState {
-    pub fn new(app_data_dir: PathBuf) -> Self {
+    pub fn new(app_data_dir: PathBuf) -> Result<(Self, UnboundedReceiver<WatchEvent>)> {
         let settings = config::load(&app_data_dir);
-        Self { app_data_dir, settings: Mutex::new(settings) }
+        let ledger = Ledger::open(&app_data_dir.join("ledger.sqlite"))?;
+        let (tx, rx): (UnboundedSender<WatchEvent>, _) = tokio::sync::mpsc::unbounded_channel();
+
+        Ok((
+            Self {
+                app_data_dir,
+                settings: Arc::new(Mutex::new(settings)),
+                ledger: Arc::new(ledger),
+                types: Arc::new(Mutex::new(SupportedTypes::default())),
+                watchers: Mutex::new(Watchers::new(tx)),
+            },
+            rx,
+        ))
     }
 
-    fn snapshot(&self) -> Settings {
+    pub fn snapshot(&self) -> Settings {
         self.settings.lock().expect("settings mutex poisoned").clone()
     }
 
@@ -31,7 +52,15 @@ impl AppState {
         Ok(())
     }
 
-    /// The URL and token to talk to the instance with, or a NotConnected error.
+    /// Bring watchers in line with the current folder list. Any folder that
+    /// could not be watched is reported rather than silently dropped — a folder
+    /// that looks active in the UI but is watching nothing is the worst outcome.
+    pub fn resync_watchers(&self) -> Vec<String> {
+        let folders = self.snapshot().folders;
+        let problems = self.watchers.lock().expect("watchers mutex").sync(&folders);
+        problems.into_iter().map(|(id, e)| format!("{id}: {e}")).collect()
+    }
+
     fn credentials(&self) -> Result<(String, String)> {
         let url = self
             .snapshot()
@@ -55,9 +84,6 @@ pub struct Connection {
 }
 
 /// Validate a URL and token, and keep them only if they actually work.
-///
-/// Storing first and validating later would leave a broken instance configured
-/// after a typo, and the person with no signal about which half was wrong.
 #[tauri::command]
 pub async fn connect(
     state: tauri::State<'_, AppState>,
@@ -72,6 +98,13 @@ pub async fn connect(
 
     let check = check_token(&base_url, &token).await?;
 
+    // The server's own allowlist replaces the compiled-in default, so the rules
+    // match what this instance would actually accept.
+    *state.types.lock().expect("types mutex") = SupportedTypes {
+        video: check.supported_video_types.clone(),
+        image: check.supported_image_types.clone(),
+    };
+
     secrets::store_token(&token)?;
     let mut next = state.snapshot();
     next.server_url = Some(base_url.clone());
@@ -80,8 +113,6 @@ pub async fn connect(
     Ok(Connection { server_url: base_url, check })
 }
 
-/// Re-check the stored credentials. `Ok(None)` means nothing is set up yet,
-/// which the UI shows as the first-run Connect screen rather than an error.
 #[tauri::command]
 pub async fn connection_status(state: tauri::State<'_, AppState>) -> Result<Option<Connection>> {
     let Some(server_url) = state.snapshot().server_url else {
@@ -92,6 +123,10 @@ pub async fn connection_status(state: tauri::State<'_, AppState>) -> Result<Opti
     };
 
     let check = check_token(&server_url, &token).await?;
+    *state.types.lock().expect("types mutex") = SupportedTypes {
+        video: check.supported_video_types.clone(),
+        image: check.supported_image_types.clone(),
+    };
     Ok(Some(Connection { server_url, check }))
 }
 
@@ -103,12 +138,179 @@ pub async fn disconnect(state: tauri::State<'_, AppState>) -> Result<()> {
     state.persist(next)
 }
 
-/// The folders and games a watched folder may name.
 #[tauri::command]
 pub async fn upload_options(state: tauri::State<'_, AppState>) -> Result<UploadOptions> {
     let (url, token) = state.credentials()?;
     fetch_options(&url, &token).await
 }
+
+// ---------------------------------------------------------------------------
+// Watched folders
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewFolder {
+    pub path: String,
+    #[serde(default)]
+    pub include_subfolders: bool,
+    #[serde(default)]
+    pub media: Vec<MediaKind>,
+    #[serde(default)]
+    pub dest_folder: Option<String>,
+    #[serde(default)]
+    pub game: Option<String>,
+    #[serde(default)]
+    pub min_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_size_bytes: Option<u64>,
+    /// Upload what is already there, instead of leaving it as baseline.
+    #[serde(default)]
+    pub upload_existing: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderSummary {
+    #[serde(flatten)]
+    pub folder: WatchedFolder,
+    /// state -> count, straight from the ledger.
+    pub counts: Vec<(String, i64)>,
+    /// How many files were already present when it was added.
+    pub baseline_count: i64,
+}
+
+#[tauri::command]
+pub async fn add_folder(
+    state: tauri::State<'_, AppState>,
+    folder: NewFolder,
+) -> Result<FolderSummary> {
+    let path = PathBuf::from(&folder.path);
+    if !path.is_dir() {
+        return Err(AppError::Storage(format!(
+            "{} is not a folder, or is not reachable from this machine.",
+            path.display()
+        )));
+    }
+    // Stored resolved, because that is the form the watcher reports paths in.
+    // Keeping the raw string would let the same folder be added twice under two
+    // names, and would file its files under two identities in the ledger.
+    let path = crate::watcher::canonical(&path);
+
+    let existing = state.snapshot().folders;
+    if existing.iter().any(|f| f.path == path) {
+        return Err(AppError::Storage("That folder is already being watched.".into()));
+    }
+    // A folder inside a folder already watched recursively would upload
+    // everything twice.
+    if let Some(parent) = existing
+        .iter()
+        .find(|f| f.include_subfolders && path.starts_with(&f.path))
+    {
+        return Err(AppError::Storage(format!(
+            "{} is already covered by the watch on {}, which includes subfolders.",
+            path.display(),
+            parent.path.display()
+        )));
+    }
+
+    let media = if folder.media.is_empty() { vec![MediaKind::Video] } else { folder.media };
+    let record = WatchedFolder {
+        id: uuid::Uuid::new_v4().to_string(),
+        path: path.clone(),
+        enabled: true,
+        include_subfolders: folder.include_subfolders,
+        media,
+        dest_folder: folder.dest_folder,
+        game: folder.game,
+        min_size_bytes: folder.min_size_bytes,
+        max_size_bytes: folder.max_size_bytes,
+    };
+
+    // Snapshot what is already here BEFORE watching, so nothing that predates
+    // the folder being added can be mistaken for something new.
+    let types = state.types.lock().expect("types mutex").clone();
+    let present = scan_existing(&record, &types);
+    let baseline_count = state.ledger.record_baseline(&record.id, &present)? as i64;
+
+    if folder.upload_existing {
+        let paths: Vec<String> = present.iter().map(|(p, _, _)| p.clone()).collect();
+        state.ledger.promote_baseline(&record.id, &paths)?;
+    }
+
+    let mut next = state.snapshot();
+    next.folders.push(record.clone());
+    state.persist(next)?;
+    state.resync_watchers();
+
+    let counts = state.ledger.counts(&record.id)?;
+    Ok(FolderSummary { folder: record, counts, baseline_count })
+}
+
+#[tauri::command]
+pub async fn remove_folder(state: tauri::State<'_, AppState>, id: String) -> Result<()> {
+    let mut next = state.snapshot();
+    next.folders.retain(|f| f.id != id);
+    state.persist(next)?;
+    state.ledger.forget_folder(&id)?;
+    state.resync_watchers();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_folder_enabled(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<()> {
+    let mut next = state.snapshot();
+    let Some(folder) = next.folders.iter_mut().find(|f| f.id == id) else {
+        return Err(AppError::Storage("That folder is not being watched.".into()));
+    };
+    folder.enabled = enabled;
+    state.persist(next)?;
+    state.resync_watchers();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_folders(state: tauri::State<'_, AppState>) -> Result<Vec<FolderSummary>> {
+    state
+        .snapshot()
+        .folders
+        .into_iter()
+        .map(|folder| {
+            let counts = state.ledger.counts(&folder.id)?;
+            let baseline_count =
+                counts.iter().find(|(s, _)| s == "baseline").map(|(_, n)| *n).unwrap_or(0);
+            Ok(FolderSummary { folder, counts, baseline_count })
+        })
+        .collect()
+}
+
+/// Queue files that were already in the folder when it was added.
+#[tauri::command]
+pub fn upload_existing(
+    state: tauri::State<'_, AppState>,
+    folder_id: String,
+    paths: Vec<String>,
+) -> Result<usize> {
+    state.ledger.promote_baseline(&folder_id, &paths)
+}
+
+#[tauri::command]
+pub fn recent_activity(state: tauri::State<'_, AppState>, limit: Option<i64>) -> Result<Vec<FileRow>> {
+    state.ledger.recent(limit.unwrap_or(200))
+}
+
+#[tauri::command]
+pub fn watcher_problems(state: tauri::State<'_, AppState>) -> Vec<String> {
+    state.resync_watchers()
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
 
 #[tauri::command]
 pub fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
@@ -117,10 +319,11 @@ pub fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
 
 #[tauri::command]
 pub fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<()> {
-    state.persist(settings)
+    state.persist(settings)?;
+    state.resync_watchers();
+    Ok(())
 }
 
-/// Where the config file lives, for the diagnostics view and for support.
 #[tauri::command]
 pub fn config_location(app: tauri::AppHandle) -> Result<String> {
     let dir = app
