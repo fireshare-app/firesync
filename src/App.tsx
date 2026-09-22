@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
+import logo from './assets/logo.png'
 import { Connect } from './views/Connect'
+import { Folders } from './views/Folders'
 import { api, asAppError, type Connection, type UploadOptions } from './lib/ipc'
 
 type Phase =
@@ -31,9 +33,7 @@ export default function App() {
       .catch((e) => console.warn('could not load upload options:', asAppError(e).message))
   }, [phase.status])
 
-  if (phase.status === 'loading') {
-    return <div className="shell" />
-  }
+  if (phase.status === 'loading') return <div className="shell" />
 
   if (phase.status === 'disconnected') {
     return <Connect onConnected={(connection) => setPhase({ status: 'connected', connection })} />
@@ -41,31 +41,37 @@ export default function App() {
 
   const { connection } = phase
   return (
-    <div className="shell">
-      <span className="shell__badge">
-        <span className="dot" />
-        Connected to <span className="mono">{new URL(connection.serverUrl).host}</span> as{' '}
-        {connection.check.username}
-      </span>
-      <p className="shell__note">
-        Watched folders, activity and settings land here next. Discovery is live —{' '}
-        {options ? (
-          <>
-            this instance offers {options.folders.video.length} video folder
-            {options.folders.video.length === 1 ? '' : 's'} and {options.games.length} game
-            {options.games.length === 1 ? '' : 's'}.
-          </>
-        ) : (
-          <>loading the folder and game lists…</>
-        )}
-      </p>
-      <button
-        type="button"
-        className="btn btn--ghost"
-        onClick={() => api.disconnect().then(() => setPhase({ status: 'disconnected' }))}
-      >
-        Disconnect
-      </button>
+    <div className="app">
+      <aside className="sidebar">
+        <div className="sidebar__brand">
+          <img src={logo} alt="" width={22} height={22} />
+          <span>Firesync</span>
+        </div>
+        <nav className="sidebar__nav">
+          <span className="sidebar__item sidebar__item--active">Watched folders</span>
+        </nav>
+        <span className="spacer" />
+        <div className="sidebar__conn">
+          <span className="sidebar__conn-head">
+            <span className="dot dot--ok" />
+            Connected
+          </span>
+          <span className="mono sidebar__host">{new URL(connection.serverUrl).host}</span>
+          <span className="sidebar__user">
+            as <strong>{connection.check.username}</strong>
+          </span>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            onClick={() => api.disconnect().then(() => setPhase({ status: 'disconnected' }))}
+          >
+            Disconnect
+          </button>
+        </div>
+      </aside>
+      <main className="main">
+        <Folders options={options} />
+      </main>
     </div>
   )
 }
