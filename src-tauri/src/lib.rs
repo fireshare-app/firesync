@@ -56,6 +56,19 @@ pub fn run() {
                 },
             );
 
+            // The upload queue reads the same ledger the watcher writes to, so
+            // a clip settles, becomes queued, and is picked up without either
+            // side knowing about the other.
+            let queue_handle = app.handle().clone();
+            queue::spawn(queue::QueueDeps {
+                ledger: state.ledger.clone(),
+                settings: state.settings.clone(),
+                control: state.queue.clone(),
+                on_event: std::sync::Arc::new(move |event| {
+                    let _ = queue_handle.emit("firesync://upload", event);
+                }),
+            });
+
             app.manage(state);
             let problems = app.state::<AppState>().resync_watchers();
             for problem in problems {
@@ -77,6 +90,10 @@ pub fn run() {
             commands::watcher_problems,
             commands::get_settings,
             commands::save_settings,
+            commands::queue_status,
+            commands::pause_queue,
+            commands::resume_queue,
+            commands::retry_failed,
             commands::config_location,
         ])
         .run(tauri::generate_context!())

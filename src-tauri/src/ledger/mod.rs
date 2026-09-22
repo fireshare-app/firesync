@@ -318,3 +318,155 @@ impl Ledger {
             .map_err(db_err)
     }
 }
+
+/// One queued file, with everything the uploader needs to send it.
+#[derive(Debug, Clone)]
+pub struct Claim {
+    pub id: i64,
+    pub folder_id: String,
+    pub path: String,
+    pub size: i64,
+    pub attempts: i64,
+}
+
+impl Ledger {
+    /// Take up to `limit` files that are due, marking them `uploading` in the
+    /// same transaction so two workers cannot claim the same row.
+    pub fn claim(&self, limit: i64, exclude_folders: &[String]) -> Result<Vec<Claim>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(db_err)?;
+        let ts = now();
+
+        let claims: Vec<Claim> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, folder_id, path, size, attempts FROM files
+                      WHERE state = 'queued'
+                        AND (next_try_at IS NULL OR next_try_at <= ?1)
+                      ORDER BY next_try_at IS NULL DESC, next_try_at ASC, id ASC
+                      LIMIT ?2",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![ts, limit + exclude_folders.len() as i64], |r| {
+                    Ok(Claim {
+                        id: r.get(0)?,
+                        folder_id: r.get(1)?,
+                        path: r.get(2)?,
+                        size: r.get(3)?,
+                        attempts: r.get(4)?,
+                    })
+                })
+                .map_err(db_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows.into_iter()
+                .filter(|c| !exclude_folders.contains(&c.folder_id))
+                .take(limit as usize)
+                .collect()
+        };
+
+        for claim in &claims {
+            tx.execute(
+                "UPDATE files SET state = 'uploading', updated_at = ?1 WHERE id = ?2",
+                params![ts, claim.id],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(claims)
+    }
+
+    pub fn mark_done(&self, id: i64, remote_url: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET state = 'done', reason = NULL, remote_url = ?1, updated_at = ?2
+              WHERE id = ?3",
+            params![remote_url, now(), id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn mark_duplicate(&self, id: i64, remote_url: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET state = 'duplicate', reason = 'Already in your library',
+                    remote_url = ?1, updated_at = ?2
+              WHERE id = ?3",
+            params![remote_url, now(), id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// A failure nothing will fix. It stays visible rather than being retried
+    /// forever against a server that has already given its answer.
+    pub fn mark_failed(&self, id: i64, reason: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET state = 'failed', reason = ?1, next_try_at = NULL, updated_at = ?2
+              WHERE id = ?3",
+            params![reason, now(), id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Back to the queue, due at `next_try_at`, with the attempt counted.
+    pub fn reschedule(&self, id: i64, reason: &str, next_try_at: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET state = 'queued', reason = ?1, attempts = attempts + 1,
+                    next_try_at = ?2, updated_at = ?3
+              WHERE id = ?4",
+            params![reason, next_try_at, now(), id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Put a claimed row back untouched — used when the whole queue pauses, so a
+    /// file in flight at that moment is not charged an attempt for it.
+    pub fn release(&self, id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET state = 'queued', updated_at = ?1 WHERE id = ?2 AND state = 'uploading'",
+            params![now(), id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Anything left `uploading` was interrupted by a crash or a quit, not by a
+    /// decision. Put it back so the next run picks it up.
+    pub fn requeue_interrupted(&self) -> Result<usize> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET state = 'queued', updated_at = ?1 WHERE state = 'uploading'",
+            params![now()],
+        )
+        .map_err(db_err)
+    }
+
+    /// Clear the backoff on everything that failed, so "Retry failed" means now.
+    pub fn retry_failed(&self) -> Result<usize> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET state = 'queued', attempts = 0, next_try_at = NULL, updated_at = ?1
+              WHERE state = 'failed'",
+            params![now()],
+        )
+        .map_err(db_err)
+    }
+
+    pub fn count_in_state(&self, state: FileState) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE state = ?1",
+            params![state.as_str()],
+            |r| r.get(0),
+        )
+        .map_err(db_err)
+    }
+}
