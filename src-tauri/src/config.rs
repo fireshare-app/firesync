@@ -16,6 +16,29 @@ pub enum MediaKind {
     Image,
 }
 
+/// What happens to the local file once the server has it.
+///
+/// A capture folder fills a drive faster than anything else on a gaming
+/// machine, so clearing it out is the point. `Trash` is the default of the two
+/// removing options because it is recoverable; `Delete` is for when the reason
+/// you turned this on was disk space, and a full trash does not give you any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AfterUpload {
+    /// Leave it where it is.
+    Keep,
+    /// Move it to the OS trash.
+    Trash,
+    /// Remove it outright.
+    Delete,
+}
+
+impl Default for AfterUpload {
+    fn default() -> Self {
+        AfterUpload::Keep
+    }
+}
+
 /// One watched folder and the rules applied to everything it sends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchedFolder {
@@ -42,6 +65,11 @@ pub struct WatchedFolder {
     pub min_size_bytes: Option<u64>,
     #[serde(default)]
     pub max_size_bytes: Option<u64>,
+    /// Only ever acted on after the server has confirmed it has the file — a
+    /// 201, meaning the bytes are written to its media directory, or a 409,
+    /// meaning it already had them.
+    #[serde(default)]
+    pub after_upload: AfterUpload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

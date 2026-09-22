@@ -8,6 +8,7 @@ import {
   queue as queueApi,
   type FileRow,
   type FolderSummary,
+  type AfterUpload,
   type MediaKind,
   type QueueStatus,
   type UploadEvent,
@@ -89,8 +90,9 @@ export function Folders({ options }: Props) {
   // the window was open would be a queue nobody could trust.
   useEffect(() => {
     const stop = listen<UploadEvent>('firesync://upload', (event) => {
-      const { path, landedAs } = event.payload
-      if (landedAs) setLandings((prev) => ({ ...prev, [path]: landedAs }))
+      const { path, landedAs, removedLocal } = event.payload
+      const note = [landedAs, removedLocal].filter(Boolean).join(' · ')
+      if (note) setLandings((prev) => ({ ...prev, [path]: note }))
       void refresh()
     })
     return () => {
@@ -298,6 +300,29 @@ export function Folders({ options }: Props) {
               {folder.include_subfolders && <span className="tag">Subfolders</span>}
             </div>
 
+            <div className="card__after">
+              <label htmlFor={`after-${folder.id}`}>After a successful upload</label>
+              <select
+                id={`after-${folder.id}`}
+                value={folder.after_upload}
+                onChange={(e) =>
+                  foldersApi
+                    .setAfterUpload(folder.id, e.target.value as AfterUpload)
+                    .then(refresh)
+                    .catch((err) => setError(asAppError(err).message))
+                }
+              >
+                <option value="keep">Keep the local file</option>
+                <option value="trash">Move it to the trash</option>
+                <option value="delete">Delete it</option>
+              </select>
+              {folder.after_upload !== 'keep' && (
+                <span className="card__after-note">
+                  Only once Fireshare confirms it has the file.
+                </span>
+              )}
+            </div>
+
             <div className="card__foot">
               <span>
                 <strong>{countOf(folder, 'done')}</strong> uploaded
@@ -314,7 +339,8 @@ export function Folders({ options }: Props) {
                 </span>
               )}
               <span>
-                <strong>{folder.baselineCount}</strong> already here
+                <strong>{folder.presentCount}</strong>{' '}
+                {folder.presentCount === 1 ? 'file here' : 'files here'}
               </span>
             </div>
           </article>

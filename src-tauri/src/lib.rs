@@ -85,6 +85,7 @@ pub fn run() {
             commands::add_folder,
             commands::remove_folder,
             commands::set_folder_enabled,
+            commands::set_folder_after_upload,
             commands::list_folders,
             commands::upload_existing,
             commands::recent_activity,

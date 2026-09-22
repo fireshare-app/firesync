@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::api::client::normalize_base_url;
 use crate::api::discovery::{check_token, fetch_options, TokenCheck, UploadOptions};
-use crate::config::{self, MediaKind, Settings, WatchedFolder};
+use crate::config::{self, AfterUpload, MediaKind, Settings, WatchedFolder};
 use crate::error::{AppError, Result};
 use crate::ledger::{FileRow, Ledger};
 use crate::queue::rules::SupportedTypes;
@@ -175,6 +175,8 @@ pub struct NewFolder {
     pub min_size_bytes: Option<u64>,
     #[serde(default)]
     pub max_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub after_upload: AfterUpload,
     /// Upload what is already there, instead of leaving it as baseline.
     #[serde(default)]
     pub upload_existing: bool,
@@ -187,8 +189,14 @@ pub struct FolderSummary {
     pub folder: WatchedFolder,
     /// state -> count, straight from the ledger.
     pub counts: Vec<(String, i64)>,
-    /// How many files were already present when it was added.
-    pub baseline_count: i64,
+    /// Media files sitting in the folder right now.
+    ///
+    /// Counted from disk rather than from the ledger, because the ledger keeps
+    /// a row for every file it has ever seen — including ones that have since
+    /// been moved out, or removed after being uploaded. Reporting those as
+    /// present would describe the folder as it was when it was added rather
+    /// than as it is.
+    pub present_count: i64,
 }
 
 #[tauri::command]
@@ -236,6 +244,7 @@ pub async fn add_folder(
         game: folder.game,
         min_size_bytes: folder.min_size_bytes,
         max_size_bytes: folder.max_size_bytes,
+        after_upload: folder.after_upload,
     };
 
     // Snapshot what is already here BEFORE watching, so nothing that predates
@@ -255,7 +264,8 @@ pub async fn add_folder(
     state.resync_watchers();
 
     let counts = state.ledger.counts(&record.id)?;
-    Ok(FolderSummary { folder: record, counts, baseline_count })
+    let present_count = baseline_count.max(present.len() as i64);
+    Ok(FolderSummary { folder: record, counts, present_count })
 }
 
 #[tauri::command]
@@ -284,6 +294,23 @@ pub async fn set_folder_enabled(
     Ok(())
 }
 
+/// Change what happens to a file after it uploads, without rebuilding the
+/// folder. Destructive enough that it should be visible and reversible on the
+/// card rather than buried in a config file.
+#[tauri::command]
+pub async fn set_folder_after_upload(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    after_upload: AfterUpload,
+) -> Result<()> {
+    let mut next = state.snapshot();
+    let Some(folder) = next.folders.iter_mut().find(|f| f.id == id) else {
+        return Err(AppError::Storage("That folder is not being watched.".into()));
+    };
+    folder.after_upload = after_upload;
+    state.persist(next)
+}
+
 #[tauri::command]
 pub fn list_folders(state: tauri::State<'_, AppState>) -> Result<Vec<FolderSummary>> {
     state
@@ -292,9 +319,9 @@ pub fn list_folders(state: tauri::State<'_, AppState>) -> Result<Vec<FolderSumma
         .into_iter()
         .map(|folder| {
             let counts = state.ledger.counts(&folder.id)?;
-            let baseline_count =
-                counts.iter().find(|(s, _)| s == "baseline").map(|(_, n)| *n).unwrap_or(0);
-            Ok(FolderSummary { folder, counts, baseline_count })
+            let types = state.types.lock().expect("types mutex").clone();
+            let present_count = scan_existing(&folder, &types).len() as i64;
+            Ok(FolderSummary { folder, counts, present_count })
         })
         .collect()
 }
