@@ -64,6 +64,7 @@ notify-debouncer-full = "0.4"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-updater = "2"
 
 # Asking Windows whether a game currently owns the screen. One call, but it is
 # the only correct way to ask.

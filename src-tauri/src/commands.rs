@@ -441,3 +441,24 @@ pub fn launch_at_login_state(app: tauri::AppHandle) -> bool {
     use tauri_plugin_autostart::ManagerExt;
     app.autolaunch().is_enabled().unwrap_or(false)
 }
+
+// ---------------------------------------------------------------------------
+// Updates
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn check_for_updates(app: tauri::AppHandle) -> Result<Option<crate::updater::UpdateInfo>> {
+    crate::updater::check(&app).await
+}
+
+#[tauri::command]
+pub async fn install_update(app: tauri::AppHandle) -> Result<()> {
+    crate::updater::install(app).await
+}
+
+/// Whether an install would interrupt something, so the UI can say "after this
+/// upload" instead of offering a button that refuses.
+#[tauri::command]
+pub fn update_blocked_by_upload(state: tauri::State<'_, AppState>) -> bool {
+    crate::updater::busy_uploading(&state)
+}

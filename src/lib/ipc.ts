@@ -194,3 +194,18 @@ export const queue = {
   resume: () => invoke<void>('resume_queue'),
   retryFailed: () => invoke<number>('retry_failed'),
 }
+
+// --- Phase 7: updates -----------------------------------------------------
+
+export interface UpdateInfo {
+  version: string
+  currentVersion: string
+  notes: string | null
+  date: string | null
+}
+
+export const updates = {
+  check: () => invoke<UpdateInfo | null>('check_for_updates'),
+  install: () => invoke<void>('install_update'),
+  blockedByUpload: () => invoke<boolean>('update_blocked_by_upload'),
+}
