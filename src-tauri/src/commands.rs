@@ -12,7 +12,7 @@ use crate::error::{AppError, Result};
 use crate::ledger::{FileRow, Ledger};
 use crate::queue::rules::SupportedTypes;
 use crate::queue::QueueControl;
-use crate::secrets;
+use crate::secrets::TokenCache;
 use crate::watcher::{scan_existing, Watchers};
 
 pub type WatchEvent = (String, PathBuf);
@@ -24,6 +24,7 @@ pub struct AppState {
     pub types: Arc<Mutex<SupportedTypes>>,
     pub watchers: Mutex<Watchers>,
     pub queue: Arc<QueueControl>,
+    pub token: Arc<TokenCache>,
 }
 
 impl AppState {
@@ -40,6 +41,9 @@ impl AppState {
                 types: Arc::new(Mutex::new(SupportedTypes::default())),
                 watchers: Mutex::new(Watchers::new(tx)),
                 queue: Arc::new(QueueControl::new()),
+                // Read from the keychain once, here, rather than on every pass
+                // of the upload loop.
+                token: Arc::new(TokenCache::load()),
             },
             rx,
         ))
@@ -69,7 +73,7 @@ impl AppState {
             .snapshot()
             .server_url
             .ok_or_else(|| AppError::NotConnected("No Fireshare instance is set up yet.".into()))?;
-        let token = secrets::load_token()?.ok_or_else(|| {
+        let token = self.token.get().ok_or_else(|| {
             AppError::NotConnected(
                 "The upload token is missing from the keychain. Reconnect to store it again."
                     .into(),
@@ -108,7 +112,7 @@ pub async fn connect(
         image: check.supported_image_types.clone(),
     };
 
-    secrets::store_token(&token)?;
+    state.token.set(&token)?;
     let mut next = state.snapshot();
     next.server_url = Some(base_url.clone());
     state.persist(next)?;
@@ -125,7 +129,7 @@ pub async fn connection_status(state: tauri::State<'_, AppState>) -> Result<Opti
     let Some(server_url) = state.snapshot().server_url else {
         return Ok(None);
     };
-    let Some(token) = secrets::load_token()? else {
+    let Some(token) = state.token.get() else {
         return Ok(None);
     };
 
@@ -139,7 +143,7 @@ pub async fn connection_status(state: tauri::State<'_, AppState>) -> Result<Opti
 
 #[tauri::command]
 pub async fn disconnect(state: tauri::State<'_, AppState>) -> Result<()> {
-    secrets::clear_token()?;
+    state.token.clear()?;
     let mut next = state.snapshot();
     next.server_url = None;
     state.persist(next)

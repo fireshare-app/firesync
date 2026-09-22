@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::api::upload::{upload_single, UploadError, UploadMeta, UploadResult};
 use crate::config::Settings;
 use crate::ledger::{Claim, Ledger};
-use crate::secrets;
+use crate::secrets::TokenCache;
 
 /// How long the loop waits when there is nothing due. Short enough that a clip
 /// finishing feels immediate, long enough to be free when idle.
@@ -75,6 +75,7 @@ pub struct QueueDeps<F: Fn(UploadEvent) + Send + Sync + 'static> {
     pub ledger: Arc<Ledger>,
     pub settings: Arc<Mutex<Settings>>,
     pub control: Arc<QueueControl>,
+    pub token: Arc<TokenCache>,
     pub on_event: Arc<F>,
 }
 
@@ -115,7 +116,10 @@ where
                 tokio::time::sleep(IDLE_POLL).await;
                 continue;
             };
-            let Ok(Some(token)) = secrets::load_token() else {
+            // From memory. This loop runs every couple of seconds; asking the
+            // OS credential store each time is what made macOS prompt for a
+            // password on repeat.
+            let Some(token) = deps.token.get() else {
                 tokio::time::sleep(IDLE_POLL).await;
                 continue;
             };
