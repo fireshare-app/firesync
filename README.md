@@ -58,6 +58,37 @@ src/               React + TypeScript
 The Rust core owns every piece of state. The webview is a view onto it and can be destroyed at any
 moment without interrupting an upload.
 
+## Releasing
+
+Pushing a tag is the whole process:
+
+```bash
+npm version 1.0.0 --no-git-tag-version   # also bump src-tauri/tauri.conf.json
+git commit -am "Release 1.0.0" && git tag v1.0.0 && git push --follow-tags
+```
+
+`.github/workflows/release.yml` builds Windows and Linux installers, signs them,
+writes `latest.json`, and opens a **draft** release. Publishing that draft is what
+makes every installed copy offer the update — so a release can be read before it
+becomes the thing everyone updates to.
+
+### Before the first release
+
+Three things, none of which can be done from a build:
+
+1. **The repository must be public.** The updater fetches `latest.json` from the
+   release assets with no credentials. A private repo answers 404 to that, and
+   every installed copy silently stops finding updates.
+2. **Add the signing key to repo secrets** as `TAURI_SIGNING_PRIVATE_KEY`. It was
+   generated to `~/.firesync-keys/firesync.key` and deliberately never entered the
+   repository. **Back it up somewhere that is not this machine** — losing it means
+   no existing install can ever update again, and the only remedy is asking
+   everybody to reinstall by hand.
+3. **Expect SmartScreen.** The installers are unsigned, so Windows will warn
+   until the binary builds reputation, and users have to click through
+   *More info → Run anyway*. An OV certificate is a few hundred a year and the
+   only real fix.
+
 ## Design notes
 
 [STACK.md](STACK.md) — why Tauri, what the upload-token API does and does not give a desktop client,

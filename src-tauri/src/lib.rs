@@ -7,6 +7,7 @@ mod notify;
 mod queue;
 mod secrets;
 mod tray;
+mod updater;
 mod watcher;
 
 use tauri::{Emitter, Manager};
@@ -41,9 +42,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
+            let first_run = config::is_first_run(&app_data_dir);
 
             let (state, rx) = AppState::new(app_data_dir)?;
             let ledger = state.ledger.clone();
@@ -95,6 +98,18 @@ pub fn run() {
 
             tray::build(app.handle())?;
             tray::spawn_status_loop(app.handle().clone());
+            updater::spawn_check_loop(app.handle().clone());
+
+            // Register the login item once, on the first run, so the default
+            // actually takes effect rather than only being written down. Never
+            // on later runs: by then the setting is a choice, and re-applying it
+            // would undo somebody turning it off.
+            if first_run {
+                use tauri_plugin_autostart::ManagerExt;
+                if let Err(e) = app.autolaunch().enable() {
+                    eprintln!("firesync: could not add the login item: {e}");
+                }
+            }
 
             // Hidden only when the OS started it, never when a person did.
             // Double-clicking an app and getting no window is hostile, and if
@@ -132,6 +147,9 @@ pub fn run() {
             commands::retry_failed,
             commands::set_launch_at_login,
             commands::launch_at_login_state,
+            commands::check_for_updates,
+            commands::install_update,
+            commands::update_blocked_by_upload,
             commands::config_location,
         ])
         .on_window_event(|window, event| {

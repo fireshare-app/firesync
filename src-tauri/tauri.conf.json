@@ -26,7 +26,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi", "deb", "rpm", "appimage"],
+    "targets": [
+      "nsis",
+      "msi",
+      "deb",
+      "rpm",
+      "appimage"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -34,5 +40,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ5MEVCM0QwNzVFOEE1RgpSV1JmaWw0SFBldVFCTXNuVnlPYmYxRElKMzVMdmE4WUd4V3BTS1NySXVkVm1LVURxenUyZlM4aQo=",
+      "endpoints": [
+        "https://github.com/fireshare-app/firesync/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

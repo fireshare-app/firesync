@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api, asAppError, type Settings } from '../lib/ipc'
+import { api, asAppError, updates, type Settings, type UpdateInfo } from '../lib/ipc'
 
 interface ToggleProps {
   id: string
@@ -33,6 +33,9 @@ export function SettingsView() {
   const [atLogin, setAtLogin] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [configPath, setConfigPath] = useState('')
+  const [update, setUpdate] = useState<UpdateInfo | null>(null)
+  const [checking, setChecking] = useState(false)
+  const [updateNote, setUpdateNote] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     try {
@@ -146,6 +149,70 @@ export function SettingsView() {
             patch({ ...settings, startup: { ...settings.startup, start_in_tray: v } })
           }
         />
+      </section>
+
+      <section className="panel">
+        <h2 className="panel__title">Updates</h2>
+        <Toggle
+          id="u-auto"
+          label="Install updates automatically"
+          hint="Applied once nothing is uploading — never in the middle of a transfer."
+          checked={settings.updates.auto_install}
+          onChange={(v) =>
+            patch({ ...settings, updates: { ...settings.updates, auto_install: v } })
+          }
+        />
+        <div className="setting">
+          <span className="setting__text">
+            <span className="setting__label">
+              {update ? `Version ${update.version} is available` : 'Check for updates'}
+            </span>
+            <span className="setting__hint">
+              {updateNote ?? `You are on ${update?.currentVersion ?? 'this build'}.`}
+            </span>
+          </span>
+          {update ? (
+            <button
+              type="button"
+              className="btn btn--primary btn--sm"
+              onClick={async () => {
+                setUpdateNote(null)
+                try {
+                  if (await updates.blockedByUpload()) {
+                    setUpdateNote('An upload is in progress. It will install once that finishes.')
+                    return
+                  }
+                  await updates.install()
+                } catch (e) {
+                  setUpdateNote(asAppError(e).message)
+                }
+              }}
+            >
+              Install and restart
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              disabled={checking}
+              onClick={async () => {
+                setChecking(true)
+                setUpdateNote(null)
+                try {
+                  const found = await updates.check()
+                  setUpdate(found)
+                  if (!found) setUpdateNote('You are on the latest version.')
+                } catch (e) {
+                  setUpdateNote(asAppError(e).message)
+                } finally {
+                  setChecking(false)
+                }
+              }}
+            >
+              {checking ? 'Checking…' : 'Check now'}
+            </button>
+          )}
+        </div>
       </section>
 
       <section className="panel">

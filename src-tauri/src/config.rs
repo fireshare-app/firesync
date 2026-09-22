@@ -153,7 +153,10 @@ impl Default for TransferSettings {
 
 impl Default for StartupSettings {
     fn default() -> Self {
-        Self { launch_at_login: false, start_in_tray: true }
+        // On by default: an uploader that only runs when you remember to start
+        // it is not doing the job. Registered with the OS on first run only, so
+        // turning it off afterwards stays off.
+        Self { launch_at_login: true, start_in_tray: true }
     }
 }
 
@@ -178,6 +181,15 @@ impl Default for Settings {
 
 pub fn config_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join(CONFIG_FILE)
+}
+
+/// Whether this machine has run Firesync before.
+///
+/// The first run is the only moment defaults may be acted on rather than merely
+/// stored — after that, the config is somebody's choices, and re-applying a
+/// default over the top would quietly undo them.
+pub fn is_first_run(app_data_dir: &Path) -> bool {
+    !config_path(app_data_dir).exists()
 }
 
 /// A missing or unreadable config is not fatal: the app starts with defaults and
