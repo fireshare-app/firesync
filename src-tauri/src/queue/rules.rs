@@ -140,6 +140,7 @@ mod tests {
             game: None,
             min_size_bytes: Some(5 * 1024 * 1024),
             max_size_bytes: Some(8 * 1024 * 1024 * 1024),
+            after_upload: crate::config::AfterUpload::Keep,
         }
     }
 

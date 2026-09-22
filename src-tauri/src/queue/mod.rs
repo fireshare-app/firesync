@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::api::upload::{upload_single, UploadError, UploadMeta, UploadResult};
-use crate::config::Settings;
+use crate::config::{AfterUpload, Settings};
 use crate::ledger::{Claim, Ledger};
 use crate::secrets::TokenCache;
 
@@ -28,6 +28,9 @@ pub struct UploadEvent {
     /// Where the server filed it, which is not always where we asked: it
     /// suffixes the name when something is already sitting on it.
     pub landed_as: Option<String>,
+    /// Set when the local copy was removed afterwards, so the UI can say so
+    /// rather than leaving somebody to notice their folder emptying by itself.
+    pub removed_local: Option<String>,
 }
 
 /// Shared run/stop control for the whole queue.
@@ -179,14 +182,17 @@ async fn run_one<F>(
         return;
     }
 
-    let meta = {
+    let (meta, after_upload) = {
         let settings = settings.lock().expect("settings mutex");
         match settings.folders.iter().find(|f| f.id == claim.folder_id) {
-            Some(folder) => UploadMeta {
-                folder: folder.dest_folder.clone(),
-                game: folder.game.clone(),
-                title: None,
-            },
+            Some(folder) => (
+                UploadMeta {
+                    folder: folder.dest_folder.clone(),
+                    game: folder.game.clone(),
+                    title: None,
+                },
+                folder.after_upload,
+            ),
             // The folder was removed while this file was in flight.
             None => {
                 let _ = ledger.release(claim.id);
@@ -203,6 +209,7 @@ async fn run_one<F>(
                 format!("{folder}/{filename}")
             };
             let _ = ledger.mark_done(claim.id, None);
+            let removed = reclaim_space(&path, after_upload).await;
             on_event(UploadEvent {
                 id: claim.id,
                 path: claim.path.clone(),
@@ -211,14 +218,28 @@ async fn run_one<F>(
                 reason: None,
                 url: None,
                 landed_as: Some(landed),
+                removed_local: removed,
             });
         }
 
         // Not a failure. The library already has it, so there is nothing to fix
         // and nothing to try again.
+        // The server already has these bytes, which is the same confirmation a
+        // 201 gives — so the local copy is just as safe to clear, and a folder
+        // being re-scanned after an earlier upload is exactly when it helps.
         Ok(UploadResult::Duplicate { url }) => {
             let _ = ledger.mark_duplicate(claim.id, url.as_deref());
-            emit(&on_event, &claim, "duplicate", Some("Already in your library"), url);
+            let removed = reclaim_space(&path, after_upload).await;
+            on_event(UploadEvent {
+                id: claim.id,
+                path: claim.path.clone(),
+                size: claim.size,
+                state: "duplicate".into(),
+                reason: Some("Already in your library".into()),
+                url,
+                landed_as: None,
+                removed_local: removed,
+            });
         }
 
         Err(UploadError::Unauthorized(message)) => {
@@ -259,6 +280,50 @@ async fn run_one<F>(
     }
 }
 
+/// Remove the local file, but only ever on the path where the server has said
+/// it holds the bytes.
+///
+/// A 201 is issued after the upload is written to the server's media directory,
+/// and a 409 means it was already there, so both are real confirmations rather
+/// than optimism. Nothing else in this function's callers reaches it: a
+/// retryable failure, a permanent one and a paused queue all leave the file
+/// alone, because the whole point of keeping it is that the upload might still
+/// need it.
+///
+/// A removal that fails is reported and otherwise ignored. The upload
+/// succeeded, which is what the person asked for; a file left behind is untidy,
+/// not lost.
+///
+/// Both removals run on a blocking thread. Trashing is not a quick unlink — it
+/// is a round trip through the OS, and on a volume that has no trash directory
+/// yet macOS has been measured taking nearly two minutes to make one. Doing
+/// that on an async worker would park a whole upload slot for the duration.
+async fn reclaim_space(path: &std::path::Path, action: AfterUpload) -> Option<String> {
+    if matches!(action, AfterUpload::Keep) {
+        return None;
+    }
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || match action {
+        AfterUpload::Keep => None,
+        AfterUpload::Trash => match trash::delete(&path) {
+            Ok(()) => Some("Moved to trash".to_string()),
+            Err(e) => {
+                eprintln!("firesync: could not trash {}: {e}", path.display());
+                None
+            }
+        },
+        AfterUpload::Delete => match std::fs::remove_file(&path) {
+            Ok(()) => Some("Deleted locally".to_string()),
+            Err(e) => {
+                eprintln!("firesync: could not delete {}: {e}", path.display());
+                None
+            }
+        },
+    })
+    .await
+    .unwrap_or(None)
+}
+
 fn emit<F>(on_event: &Arc<F>, claim: &Claim, state: &str, reason: Option<&str>, url: Option<String>)
 where
     F: Fn(UploadEvent) + Send + Sync + 'static,
@@ -271,6 +336,7 @@ where
         reason: reason.map(str::to_string),
         url,
         landed_as: None,
+        removed_local: None,
     });
 }
 
@@ -282,7 +348,7 @@ fn unix_now() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{MediaKind, WatchedFolder};
     use crate::ledger::FileState;
@@ -295,7 +361,7 @@ mod tests {
     /// Real sockets rather than a mocked client: the point of these tests is the
     /// status-to-disposition table, and that is only meaningful against a
     /// response that actually crossed a connection.
-    fn serve(status: u16, extra_headers: &str, body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    pub(crate) fn serve(status: u16, extra_headers: &str, body: &'static str) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let headers = extra_headers.to_string();
@@ -333,16 +399,32 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    struct Fixture {
-        dir: PathBuf,
-        ledger: Arc<Ledger>,
-        settings: Arc<Mutex<Settings>>,
-        claim: Claim,
-        events: Arc<Mutex<Vec<UploadEvent>>>,
+    pub(crate) struct Fixture {
+        pub dir: PathBuf,
+        pub ledger: Arc<Ledger>,
+        pub settings: Arc<Mutex<Settings>>,
+        pub claim: Claim,
+        pub events: Arc<Mutex<Vec<UploadEvent>>>,
     }
 
-    fn fixture() -> Fixture {
-        let dir = std::env::temp_dir().join(format!("firesync-q-{}", uuid::Uuid::new_v4()));
+    pub(crate) fn fixture() -> Fixture {
+        fixture_with(AfterUpload::Keep)
+    }
+
+    pub(crate) fn fixture_with(after_upload: AfterUpload) -> Fixture {
+        fixture_in(std::env::temp_dir(), after_upload)
+    }
+
+    /// A watched folder lives where a person keeps their clips, not on the
+    /// system temp volume — and for anything touching the trash that
+    /// distinction is the difference between 200ms and two minutes.
+    pub(crate) fn fixture_in_home(after_upload: AfterUpload) -> Fixture {
+        let home = std::path::PathBuf::from(std::env::var("HOME").expect("HOME"));
+        fixture_in(home, after_upload)
+    }
+
+    pub(crate) fn fixture_in(base: std::path::PathBuf, after_upload: AfterUpload) -> Fixture {
+        let dir = base.join(format!(".firesync-q-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("clip.mp4");
         std::fs::write(&clip, vec![0u8; 4096]).unwrap();
@@ -357,6 +439,7 @@ mod tests {
             game: Some("VALORANT".into()),
             min_size_bytes: None,
             max_size_bytes: None,
+            after_upload,
         };
 
         let ledger = Arc::new(Ledger::open(&dir.join("l.sqlite")).unwrap());
@@ -374,7 +457,7 @@ mod tests {
         }
     }
 
-    async fn run_against(f: &Fixture, url: &str, control: Arc<QueueControl>) {
+    pub(crate) async fn run_against(f: &Fixture, url: &str, control: Arc<QueueControl>) {
         let events = f.events.clone();
         run_one(
             f.claim.clone(),
@@ -388,7 +471,7 @@ mod tests {
         .await;
     }
 
-    fn state_of(f: &Fixture) -> FileState {
+    pub(crate) fn state_of(f: &Fixture) -> FileState {
         f.ledger.recent(10).unwrap().into_iter().find(|r| r.id == f.claim.id).unwrap().state
     }
 
@@ -548,6 +631,121 @@ mod tests {
         assert_eq!(state_of(&f), FileState::Uploading);
         assert_eq!(f.ledger.requeue_interrupted().unwrap(), 1);
         assert_eq!(state_of(&f), FileState::Queued);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::config::AfterUpload;
+    use crate::ledger::FileState;
+
+    /// The whole feature in one assertion: the bytes are on the server, so the
+    /// local copy can go.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_successful_upload_can_delete_the_local_file() {
+        let f = fixture_with(AfterUpload::Delete);
+        let path = std::path::PathBuf::from(&f.claim.path);
+        assert!(path.exists());
+
+        let (url, server) = serve(201, "", r#"{"filename":"clip.mp4","folder":"clips"}"#);
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert!(!path.exists(), "the local file should be gone after a confirmed upload");
+        assert_eq!(state_of(&f), FileState::Done);
+        assert_eq!(f.events.lock().unwrap()[0].removed_local.as_deref(), Some("Deleted locally"));
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The setting is off by default and stays off unless asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_is_the_default_and_leaves_the_file_alone() {
+        let f = fixture();
+        let path = std::path::PathBuf::from(&f.claim.path);
+
+        let (url, server) = serve(201, "", r#"{"filename":"clip.mp4","folder":"clips"}"#);
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert!(path.exists(), "nothing should be removed unless the folder asked for it");
+        assert_eq!(f.events.lock().unwrap()[0].removed_local, None);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The one that matters. A file that did not make it is the only copy there
+    /// is, and deleting it would be destroying the thing we were asked to send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permanent_failure_never_removes_the_local_file() {
+        let f = fixture_with(AfterUpload::Delete);
+        let path = std::path::PathBuf::from(&f.claim.path);
+
+        let (url, server) = serve(400, "", "Unsupported file type.");
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert_eq!(state_of(&f), FileState::Failed);
+        assert!(path.exists(), "a failed upload must leave the only copy where it is");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retryable_failure_never_removes_the_local_file() {
+        let f = fixture_with(AfterUpload::Delete);
+        let path = std::path::PathBuf::from(&f.claim.path);
+
+        let (url, server) = serve(500, "", "boom");
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert_eq!(state_of(&f), FileState::Queued);
+        assert!(path.exists(), "a file waiting to be retried still needs its bytes");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rejected_token_never_removes_the_local_file() {
+        let f = fixture_with(AfterUpload::Delete);
+        let path = std::path::PathBuf::from(&f.claim.path);
+
+        let (url, server) = serve(401, "", "unauthorized");
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert!(path.exists(), "a paused queue has uploaded nothing, so it may delete nothing");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A 409 means the server holds these bytes already, which is the same
+    /// confirmation a 201 gives — and re-scanning a folder that was uploaded
+    /// before is exactly when clearing it out is useful.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_duplicate_counts_as_the_server_having_it() {
+        let f = fixture_with(AfterUpload::Delete);
+        let path = std::path::PathBuf::from(&f.claim.path);
+
+        let (url, server) = serve(409, "", r#"{"error":"duplicate","url":"/w/abc"}"#);
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert_eq!(state_of(&f), FileState::Duplicate);
+        assert!(!path.exists(), "the library already has it, so the local copy can go");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trash_removes_it_from_the_folder_but_recoverably() {
+        let f = fixture_in_home(AfterUpload::Trash);
+        let path = std::path::PathBuf::from(&f.claim.path);
+
+        let (url, server) = serve(201, "", r#"{"filename":"clip.mp4","folder":"clips"}"#);
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert!(!path.exists(), "trashing should clear it out of the watched folder");
+        assert_eq!(f.events.lock().unwrap()[0].removed_local.as_deref(), Some("Moved to trash"));
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 }

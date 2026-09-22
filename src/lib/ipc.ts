@@ -53,6 +53,9 @@ export interface UploadOptions {
 
 export type MediaKind = 'video' | 'image'
 
+/** What happens to the local file once the server confirms it has it. */
+export type AfterUpload = 'keep' | 'trash' | 'delete'
+
 export interface WatchedFolder {
   id: string
   path: string
@@ -63,6 +66,7 @@ export interface WatchedFolder {
   game: string | null
   min_size_bytes: number | null
   max_size_bytes: number | null
+  after_upload: AfterUpload
 }
 
 export interface Settings {
@@ -115,7 +119,8 @@ export interface FileRow {
 
 export interface FolderSummary extends WatchedFolder {
   counts: [string, number][]
-  baselineCount: number
+  /** Media files in the folder right now, counted from disk. */
+  presentCount: number
 }
 
 export interface NewFolder {
@@ -126,6 +131,7 @@ export interface NewFolder {
   game?: string | null
   minSizeBytes?: number | null
   maxSizeBytes?: number | null
+  afterUpload?: AfterUpload
   uploadExisting?: boolean
 }
 
@@ -145,6 +151,8 @@ export const folders = {
   remove: (id: string) => invoke<void>('remove_folder', { id }),
   setEnabled: (id: string, enabled: boolean) =>
     invoke<void>('set_folder_enabled', { id, enabled }),
+  setAfterUpload: (id: string, afterUpload: AfterUpload) =>
+    invoke<void>('set_folder_after_upload', { id, afterUpload }),
   uploadExisting: (folderId: string, paths: string[]) =>
     invoke<number>('upload_existing', { folderId, paths }),
   problems: () => invoke<string[]>('watcher_problems'),
@@ -165,6 +173,7 @@ export interface UploadEvent {
   reason: string | null
   url: string | null
   landedAs: string | null
+  removedLocal: string | null
 }
 
 export interface QueueStatus {

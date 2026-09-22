@@ -34,6 +34,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", 
 # 3 GB clip must not become 3 GB of RSS.
 tokio-util = { version = "0.7", features = ["io"] }
 rand = "0.8"
+# Moving to the OS trash rather than unlinking, so "remove after upload" has an
+# undo for anyone who wants one.
+trash = "5"
 
 # The token belongs in the OS credential store, never in the config file.
 keyring = { version = "3", features = [
