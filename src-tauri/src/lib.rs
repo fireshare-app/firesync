@@ -3,8 +3,10 @@ mod commands;
 mod config;
 mod error;
 mod ledger;
+mod notify;
 mod queue;
 mod secrets;
+mod tray;
 mod watcher;
 
 use tauri::{Emitter, Manager};
@@ -20,6 +22,12 @@ pub fn run() {
     // watches the same folders and uploads everything twice.
     #[cfg(desktop)]
     {
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            // Launched by the OS, so it starts the way it will spend most of its
+            // life: in the tray, with no window.
+            Some(vec!["--tray"]),
+        ));
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -32,6 +40,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
@@ -44,6 +53,8 @@ pub fn run() {
             // Decisions are pushed rather than polled: a clip can settle minutes
             // after the event that started the wait, long after any request the
             // UI made would have returned.
+            let notifier = notify::Notifier::new(app.handle().clone(), state.settings.clone());
+
             let handle = app.handle().clone();
             watcher::spawn_event_loop(
                 rx,
@@ -60,12 +71,18 @@ pub fn run() {
             // a clip settles, becomes queued, and is picked up without either
             // side knowing about the other.
             let queue_handle = app.handle().clone();
+            let queue_notifier = notifier.clone();
             queue::spawn(queue::QueueDeps {
                 ledger: state.ledger.clone(),
                 settings: state.settings.clone(),
                 control: state.queue.clone(),
                 token: state.token.clone(),
-                on_event: std::sync::Arc::new(move |event| {
+                on_event: std::sync::Arc::new(move |event: queue::UploadEvent| {
+                    // Progress ticks are for the window only. A toast every half
+                    // second would be its own kind of failure.
+                    if let Some(note) = note_for(&event) {
+                        queue_notifier.post(note);
+                    }
                     let _ = queue_handle.emit("firesync://upload", event);
                 }),
             });
@@ -74,6 +91,23 @@ pub fn run() {
             let problems = app.state::<AppState>().resync_watchers();
             for problem in problems {
                 eprintln!("firesync: {problem}");
+            }
+
+            tray::build(app.handle())?;
+            tray::spawn_status_loop(app.handle().clone());
+
+            // Hidden only when the OS started it, never when a person did.
+            // Double-clicking an app and getting no window is hostile, and if
+            // the tray ever fails to appear it would leave no way in at all —
+            // so "start in the tray" governs the login launch, which is the
+            // only one it was ever about.
+            let launched_by_os = std::env::args().any(|a| a == "--tray");
+            let start_hidden =
+                launched_by_os && app.state::<AppState>().snapshot().startup.start_in_tray;
+            if start_hidden {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
             }
             Ok(())
         })
@@ -96,8 +130,56 @@ pub fn run() {
             commands::pause_queue,
             commands::resume_queue,
             commands::retry_failed,
+            commands::set_launch_at_login,
+            commands::launch_at_login_state,
             commands::config_location,
         ])
+        .on_window_event(|window, event| {
+            // Closing the window means "get out of my way", not "stop
+            // uploading". Quitting is the tray's Quit item, which is the only
+            // thing that should end a transfer in progress.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Which upload outcomes are worth interrupting somebody for.
+fn note_for(event: &queue::UploadEvent) -> Option<notify::Note> {
+    let name = std::path::Path::new(&event.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&event.path)
+        .to_string();
+
+    match event.state.as_str() {
+        "done" => Some(notify::Note {
+            title: "Upload complete".into(),
+            body: event
+                .landed_as
+                .clone()
+                .map(|landed| format!("{name} → {landed}"))
+                .unwrap_or(name),
+            needs_attention: false,
+        }),
+        "failed" | "paused" => Some(notify::Note {
+            title: if event.state == "paused" {
+                "Uploads paused".into()
+            } else {
+                "Upload needs your attention".into()
+            },
+            body: event
+                .reason
+                .clone()
+                .map(|r| format!("{name} — {r}"))
+                .unwrap_or(name),
+            needs_attention: true,
+        }),
+        // A duplicate is a success with nothing to say, and a retry is still in
+        // progress. Neither is worth a toast.
+        _ => None,
+    }
 }

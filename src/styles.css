@@ -424,3 +424,13 @@ select {
 .row__bar { width: 120px; height: 4px; border-radius: 3px; background: #12314e; overflow: hidden; flex-shrink: 0; }
 .row__bar-fill { display: block; height: 4px; background: linear-gradient(90deg, #007fff, #66b2ff); transition: width 0.4s ease; }
 .row__pct { width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.sidebar__item { background: transparent; border: 0; text-align: left; width: 100%; cursor: pointer; font-size: 13.5px; }
+.setting { display: flex; align-items: center; gap: 14px; padding: 9px 0; border-top: 1px solid var(--border-soft); }
+.setting:first-of-type { border-top: 0; }
+.setting__text { display: flex; flex-direction: column; gap: 3px; flex-grow: 1; cursor: pointer; }
+.setting__label { font-size: 13px; color: var(--text); }
+.setting__hint { font-size: 11.5px; color: var(--text-muted); line-height: 1.45; max-width: 60ch; }
+.setting__switch { width: 17px; height: 17px; accent-color: var(--accent); flex-shrink: 0; margin: 0; }
+.setting select { background: var(--panel-sunken); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12.5px; padding: 6px 10px; }
+.settings__path { font-size: 11px; color: var(--text-muted); }

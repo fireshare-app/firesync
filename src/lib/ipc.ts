@@ -91,6 +91,8 @@ export const api = {
   getSettings: () => invoke<Settings>('get_settings'),
   saveSettings: (settings: Settings) => invoke<void>('save_settings', { settings }),
   configLocation: () => invoke<string>('config_location'),
+  setLaunchAtLogin: (enabled: boolean) => invoke<boolean>('set_launch_at_login', { enabled }),
+  launchAtLoginState: () => invoke<boolean>('launch_at_login_state'),
 }
 
 // --- Phase 2: ledger + watcher -------------------------------------------

@@ -414,3 +414,30 @@ pub fn retry_failed(state: tauri::State<'_, AppState>) -> Result<usize> {
     state.queue.resume();
     Ok(n)
 }
+
+/// Launch at login, kept in step with the OS rather than only in our config.
+///
+/// The setting and the registration can disagree — somebody removes the login
+/// item themselves, or a reinstall drops it — so the OS is asked what it
+/// actually has rather than trusted to match what we wrote down.
+#[tauri::command]
+pub fn set_launch_at_login(app: tauri::AppHandle, state: tauri::State<'_, AppState>, enabled: bool) -> Result<bool> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let outcome = if enabled { manager.enable() } else { manager.disable() };
+    outcome.map_err(|e| {
+        AppError::Storage(format!("Could not change the login item: {e}"))
+    })?;
+
+    let actual = manager.is_enabled().unwrap_or(enabled);
+    let mut next = state.snapshot();
+    next.startup.launch_at_login = actual;
+    state.persist(next)?;
+    Ok(actual)
+}
+
+#[tauri::command]
+pub fn launch_at_login_state(app: tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
