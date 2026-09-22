@@ -64,6 +64,7 @@ pub fn run() {
                 ledger: state.ledger.clone(),
                 settings: state.settings.clone(),
                 control: state.queue.clone(),
+                token: state.token.clone(),
                 on_event: std::sync::Arc::new(move |event| {
                     let _ = queue_handle.emit("firesync://upload", event);
                 }),
