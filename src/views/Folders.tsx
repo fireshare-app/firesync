@@ -6,7 +6,6 @@ import {
   asAppError,
   folders as foldersApi,
   queue as queueApi,
-  type Decision,
   type FileRow,
   type FolderSummary,
   type MediaKind,
@@ -29,21 +28,34 @@ function countOf(folder: FolderSummary, state: string) {
   return folder.counts.find(([s]) => s === state)?.[1] ?? 0
 }
 
+function basename(path: string) {
+  return path.split(/[\\/]/).pop() ?? path
+}
+
 interface Props {
   options: UploadOptions | null
 }
 
 export function Folders({ options }: Props) {
   const [list, setList] = useState<FolderSummary[]>([])
-  const [decisions, setDecisions] = useState<Decision[]>([])
   const [recent, setRecent] = useState<FileRow[]>([])
   const [problems, setProblems] = useState<string[]>([])
   const [status, setStatus] = useState<QueueStatus | null>(null)
-  const [uploads, setUploads] = useState<UploadEvent[]>([])
+  const [landings, setLandings] = useState<Record<string, string>>({})
   const [error, setError] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
   const [composing, setComposing] = useState(false)
   const [draftPath, setDraftPath] = useState('')
+
+  // Same filename in two watched folders is ordinary — a move between them
+  // produces exactly that — so each row says which folder it belongs to.
+  const folderName = useCallback(
+    (id: string) => {
+      const folder = list.find((f) => f.id === id)
+      return folder ? basename(folder.path) : null
+    },
+    [list],
+  )
 
   const refresh = useCallback(async () => {
     try {
@@ -60,11 +72,12 @@ export function Folders({ options }: Props) {
     void refresh()
   }, [refresh])
 
-  // Decisions are pushed, not polled: a clip can settle minutes after the write
-  // that triggered the wait, long after any request the UI made would return.
+  // A decision can land minutes after the write that triggered the wait, long
+  // after any request the UI made would have returned — so it is pushed. The
+  // payload is not rendered directly; the ledger is the one source that knows a
+  // file's current state, and this just tells us to read it again.
   useEffect(() => {
-    const stop = listen<Decision>('firesync://decision', (event) => {
-      setDecisions((prev) => [event.payload, ...prev].slice(0, 50))
+    const stop = listen('firesync://decision', () => {
       void refresh()
     })
     return () => {
@@ -76,7 +89,8 @@ export function Folders({ options }: Props) {
   // the window was open would be a queue nobody could trust.
   useEffect(() => {
     const stop = listen<UploadEvent>('firesync://upload', (event) => {
-      setUploads((prev) => [event.payload, ...prev].slice(0, 50))
+      const { path, landedAs } = event.payload
+      if (landedAs) setLandings((prev) => ({ ...prev, [path]: landedAs }))
       void refresh()
     })
     return () => {
@@ -286,11 +300,19 @@ export function Folders({ options }: Props) {
 
             <div className="card__foot">
               <span>
+                <strong>{countOf(folder, 'done')}</strong> uploaded
+              </span>
+              <span>
                 <strong>{countOf(folder, 'queued')}</strong> queued
               </span>
               <span>
                 <strong>{countOf(folder, 'skipped')}</strong> skipped
               </span>
+              {countOf(folder, 'failed') > 0 && (
+                <span className="card__foot-bad">
+                  <strong>{countOf(folder, 'failed')}</strong> need attention
+                </span>
+              )}
               <span>
                 <strong>{folder.baselineCount}</strong> already here
               </span>
@@ -306,44 +328,28 @@ export function Folders({ options }: Props) {
             what the watcher settled on and what the server said — live
           </span>
         </h2>
-        {decisions.length === 0 && recent.length === 0 ? (
+        {recent.length === 0 ? (
           <p className="panel__empty">
             Nothing yet. Drop a file into a watched folder and it appears here once it stops being
             written.
           </p>
         ) : (
           <ul className="rows">
-            {uploads.map((u, i) => (
-              <li key={`up-${u.id}-${u.state}-${i}`} className="row">
-                <span className={`badge badge--${u.state}`}>{u.state}</span>
-                <span className="mono row__path">{u.path.split(/[\\/]/).pop()}</span>
+            {recent.slice(0, 25).map((r) => (
+              <li key={r.id} className="row">
+                <span className={`badge badge--${r.state}`}>{r.state}</span>
+                <span className="mono row__path">{basename(r.path)}</span>
+                {folderName(r.folderId) && (
+                  <span className="row__folder">{folderName(r.folderId)}</span>
+                )}
                 <span className="spacer" />
-                {u.landedAs && <span className="row__meta mono">{u.landedAs}</span>}
-                <span className="row__meta">{humanSize(u.size)}</span>
-                {u.reason && <span className="row__reason">{u.reason}</span>}
+                {landings[r.path] && (
+                  <span className="row__meta mono">{landings[r.path]}</span>
+                )}
+                <span className="row__meta">{humanSize(r.size)}</span>
+                {r.reason && <span className="row__reason">{r.reason}</span>}
               </li>
             ))}
-            {decisions.map((d, i) => (
-              <li key={`${d.path}-${d.at}-${i}`} className="row">
-                <span className={`badge badge--${d.outcome}`}>{d.outcome}</span>
-                <span className="mono row__path">{d.path.split(/[\\/]/).pop()}</span>
-                <span className="spacer" />
-                <span className="row__meta">{humanSize(d.size)}</span>
-                {d.reason && <span className="row__reason">{d.reason}</span>}
-              </li>
-            ))}
-            {recent
-              .filter((r) => !decisions.some((d) => d.path === r.path))
-              .slice(0, 20)
-              .map((r) => (
-                <li key={r.id} className="row row--dim">
-                  <span className={`badge badge--${r.state}`}>{r.state}</span>
-                  <span className="mono row__path">{r.path.split(/[\\/]/).pop()}</span>
-                  <span className="spacer" />
-                  <span className="row__meta">{humanSize(r.size)}</span>
-                  {r.reason && <span className="row__reason">{r.reason}</span>}
-                </li>
-              ))}
           </ul>
         )}
       </section>
