@@ -153,3 +153,31 @@ export const folders = {
 export const activity = {
   recent: (limit = 200) => invoke<FileRow[]>('recent_activity', { limit }),
 }
+
+// --- Phase 3: the upload queue -------------------------------------------
+
+/** Pushed from Rust as each upload resolves. */
+export interface UploadEvent {
+  id: number
+  path: string
+  size: number
+  state: 'done' | 'duplicate' | 'failed' | 'waiting' | 'paused'
+  reason: string | null
+  url: string | null
+  landedAs: string | null
+}
+
+export interface QueueStatus {
+  paused: boolean
+  pauseReason: string | null
+  queued: number
+  uploading: number
+  failed: number
+}
+
+export const queue = {
+  status: () => invoke<QueueStatus>('queue_status'),
+  pause: () => invoke<void>('pause_queue'),
+  resume: () => invoke<void>('resume_queue'),
+  retryFailed: () => invoke<number>('retry_failed'),
+}

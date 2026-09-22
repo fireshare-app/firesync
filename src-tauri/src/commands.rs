@@ -11,6 +11,7 @@ use crate::config::{self, MediaKind, Settings, WatchedFolder};
 use crate::error::{AppError, Result};
 use crate::ledger::{FileRow, Ledger};
 use crate::queue::rules::SupportedTypes;
+use crate::queue::QueueControl;
 use crate::secrets;
 use crate::watcher::{scan_existing, Watchers};
 
@@ -22,6 +23,7 @@ pub struct AppState {
     pub ledger: Arc<Ledger>,
     pub types: Arc<Mutex<SupportedTypes>>,
     pub watchers: Mutex<Watchers>,
+    pub queue: Arc<QueueControl>,
 }
 
 impl AppState {
@@ -37,6 +39,7 @@ impl AppState {
                 ledger: Arc::new(ledger),
                 types: Arc::new(Mutex::new(SupportedTypes::default())),
                 watchers: Mutex::new(Watchers::new(tx)),
+                queue: Arc::new(QueueControl::new()),
             },
             rx,
         ))
@@ -109,6 +112,10 @@ pub async fn connect(
     let mut next = state.snapshot();
     next.server_url = Some(base_url.clone());
     state.persist(next)?;
+
+    // A working token is exactly the signal that clears an auth pause: the
+    // queue stopped because the credential was bad, and it no longer is.
+    state.queue.resume();
 
     Ok(Connection { server_url: base_url, check })
 }
@@ -331,4 +338,48 @@ pub fn config_location(app: tauri::AppHandle) -> Result<String> {
         .app_data_dir()
         .map_err(|e| AppError::Storage(format!("Could not resolve the app data directory: {e}")))?;
     Ok(config::config_path(&dir).display().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Queue
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueStatus {
+    pub paused: bool,
+    pub pause_reason: Option<String>,
+    pub queued: i64,
+    pub uploading: i64,
+    pub failed: i64,
+}
+
+#[tauri::command]
+pub fn queue_status(state: tauri::State<'_, AppState>) -> Result<QueueStatus> {
+    use crate::ledger::FileState;
+    Ok(QueueStatus {
+        paused: state.queue.is_paused(),
+        pause_reason: state.queue.reason(),
+        queued: state.ledger.count_in_state(FileState::Queued)?,
+        uploading: state.ledger.count_in_state(FileState::Uploading)?,
+        failed: state.ledger.count_in_state(FileState::Failed)?,
+    })
+}
+
+#[tauri::command]
+pub fn pause_queue(state: tauri::State<'_, AppState>) {
+    state.queue.pause(None);
+}
+
+#[tauri::command]
+pub fn resume_queue(state: tauri::State<'_, AppState>) {
+    state.queue.resume();
+}
+
+/// Clear the backoff on everything that failed and try again now.
+#[tauri::command]
+pub fn retry_failed(state: tauri::State<'_, AppState>) -> Result<usize> {
+    let n = state.ledger.retry_failed()?;
+    state.queue.resume();
+    Ok(n)
 }

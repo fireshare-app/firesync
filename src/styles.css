@@ -397,3 +397,12 @@ select {
 .badge--baseline { color: var(--text-muted); }
 .badge--done { color: var(--ok); background: rgba(63, 214, 138, 0.12); }
 .badge--failed { color: var(--bad-text); background: rgba(255, 92, 87, 0.13); }
+
+.banner--row { display: flex; align-items: center; gap: 12px; }
+.statusbar { display: flex; align-items: center; gap: 16px; border: 1px solid var(--border); background: var(--panel); border-radius: 9px; padding: 10px 14px; font-size: 12.5px; color: var(--text-muted); }
+.statusbar strong { color: var(--text); }
+.statusbar__bad strong { color: var(--bad-text); }
+.badge--duplicate { color: var(--text-muted); }
+.badge--waiting { color: var(--warn); background: rgba(255, 181, 71, 0.13); }
+.badge--paused { color: var(--bad-text); background: rgba(255, 92, 87, 0.13); }
+.badge--uploading { color: var(--accent-light); background: rgba(102, 178, 255, 0.14); }

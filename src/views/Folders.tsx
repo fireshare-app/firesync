@@ -5,10 +5,13 @@ import {
   activity,
   asAppError,
   folders as foldersApi,
+  queue as queueApi,
   type Decision,
   type FileRow,
   type FolderSummary,
   type MediaKind,
+  type QueueStatus,
+  type UploadEvent,
   type UploadOptions,
 } from '../lib/ipc'
 
@@ -35,6 +38,8 @@ export function Folders({ options }: Props) {
   const [decisions, setDecisions] = useState<Decision[]>([])
   const [recent, setRecent] = useState<FileRow[]>([])
   const [problems, setProblems] = useState<string[]>([])
+  const [status, setStatus] = useState<QueueStatus | null>(null)
+  const [uploads, setUploads] = useState<UploadEvent[]>([])
   const [error, setError] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
 
@@ -43,6 +48,7 @@ export function Folders({ options }: Props) {
       setList(await foldersApi.list())
       setRecent(await activity.recent(40))
       setProblems(await foldersApi.problems())
+      setStatus(await queueApi.status())
     } catch (e) {
       setError(asAppError(e).message)
     }
@@ -62,6 +68,25 @@ export function Folders({ options }: Props) {
     return () => {
       void stop.then((fn) => fn())
     }
+  }, [refresh])
+
+  // Upload outcomes are pushed as they resolve; a queue that only updated when
+  // the window was open would be a queue nobody could trust.
+  useEffect(() => {
+    const stop = listen<UploadEvent>('firesync://upload', (event) => {
+      setUploads((prev) => [event.payload, ...prev].slice(0, 50))
+      void refresh()
+    })
+    return () => {
+      void stop.then((fn) => fn())
+    }
+  }, [refresh])
+
+  // A backoff resolves on a timer with no event behind it, so the counts need a
+  // slow tick to stay honest while files are waiting.
+  useEffect(() => {
+    const t = setInterval(() => void refresh(), 5000)
+    return () => clearInterval(t)
   }, [refresh])
 
   async function addFolder() {
@@ -100,6 +125,53 @@ export function Folders({ options }: Props) {
           {adding ? 'Adding…' : 'Add folder'}
         </button>
       </header>
+
+      {status?.paused && (
+        <div className="banner banner--bad banner--row">
+          <span>{status.pauseReason ?? 'Uploads are paused.'}</span>
+          <span className="spacer" />
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            onClick={() => queueApi.resume().then(refresh)}
+          >
+            Resume
+          </button>
+        </div>
+      )}
+
+      {status && !status.paused && (status.queued > 0 || status.uploading > 0 || status.failed > 0) && (
+        <div className="statusbar">
+          <span>
+            <strong>{status.uploading}</strong> uploading
+          </span>
+          <span>
+            <strong>{status.queued}</strong> queued
+          </span>
+          {status.failed > 0 && (
+            <span className="statusbar__bad">
+              <strong>{status.failed}</strong> need attention
+            </span>
+          )}
+          <span className="spacer" />
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            onClick={() => queueApi.pause().then(refresh)}
+          >
+            Pause all
+          </button>
+          {status.failed > 0 && (
+            <button
+              type="button"
+              className="btn btn--primary btn--sm"
+              onClick={() => queueApi.retryFailed().then(refresh)}
+            >
+              Retry failed
+            </button>
+          )}
+        </div>
+      )}
 
       {error && <div className="banner banner--bad">{error}</div>}
       {problems.map((p) => (
@@ -169,9 +241,9 @@ export function Folders({ options }: Props) {
 
       <section className="panel">
         <h2 className="panel__title">
-          Watcher decisions
+          Activity
           <span className="panel__hint">
-            what the watcher settled on, and why — live
+            what the watcher settled on and what the server said — live
           </span>
         </h2>
         {decisions.length === 0 && recent.length === 0 ? (
@@ -181,6 +253,16 @@ export function Folders({ options }: Props) {
           </p>
         ) : (
           <ul className="rows">
+            {uploads.map((u, i) => (
+              <li key={`up-${u.id}-${u.state}-${i}`} className="row">
+                <span className={`badge badge--${u.state}`}>{u.state}</span>
+                <span className="mono row__path">{u.path.split(/[\\/]/).pop()}</span>
+                <span className="spacer" />
+                {u.landedAs && <span className="row__meta mono">{u.landedAs}</span>}
+                <span className="row__meta">{humanSize(u.size)}</span>
+                {u.reason && <span className="row__reason">{u.reason}</span>}
+              </li>
+            ))}
             {decisions.map((d, i) => (
               <li key={`${d.path}-${d.at}-${i}`} className="row">
                 <span className={`badge badge--${d.outcome}`}>{d.outcome}</span>
