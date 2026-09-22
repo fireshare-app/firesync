@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import logo from './assets/logo.png'
 import { Connect } from './views/Connect'
 import { Folders } from './views/Folders'
+import { SettingsView } from './views/SettingsView'
 import { api, asAppError, type Connection, type UploadOptions } from './lib/ipc'
 
 type Phase =
@@ -9,8 +10,11 @@ type Phase =
   | { status: 'disconnected' }
   | { status: 'connected'; connection: Connection }
 
+type Tab = 'folders' | 'settings'
+
 export default function App() {
   const [phase, setPhase] = useState<Phase>({ status: 'loading' })
+  const [tab, setTab] = useState<Tab>('folders')
   const [options, setOptions] = useState<UploadOptions | null>(null)
 
   // A stored connection is re-checked on launch rather than trusted: the token
@@ -48,7 +52,20 @@ export default function App() {
           <span>Firesync</span>
         </div>
         <nav className="sidebar__nav">
-          <span className="sidebar__item sidebar__item--active">Watched folders</span>
+          <button
+            type="button"
+            className={`sidebar__item ${tab === 'folders' ? 'sidebar__item--active' : ''}`}
+            onClick={() => setTab('folders')}
+          >
+            Watched folders
+          </button>
+          <button
+            type="button"
+            className={`sidebar__item ${tab === 'settings' ? 'sidebar__item--active' : ''}`}
+            onClick={() => setTab('settings')}
+          >
+            Settings
+          </button>
         </nav>
         <span className="spacer" />
         <div className="sidebar__conn">
@@ -70,7 +87,7 @@ export default function App() {
         </div>
       </aside>
       <main className="main">
-        <Folders options={options} />
+        {tab === 'folders' ? <Folders options={options} /> : <SettingsView />}
       </main>
     </div>
   )
