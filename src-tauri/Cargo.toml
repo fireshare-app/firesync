@@ -1,0 +1,51 @@
+[package]
+name = "firesync"
+version = "0.1.0"
+description = "Watches folders and uploads new clips and screenshots to Fireshare"
+authors = ["Shane Israel"]
+edition = "2021"
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin name, which
+# otherwise collides on Windows. See rust-lang/cargo#8519.
+name = "firesync_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP lives in Rust rather than the webview: uploads have to keep running with
+# the window closed, and multipart bodies are streamed rather than buffered.
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "multipart",
+  "stream",
+  "rustls-tls",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
+
+# The token belongs in the OS credential store, never in the config file.
+keyring = { version = "3", features = [
+  "apple-native",
+  "windows-native",
+  "sync-secret-service",
+] }
+
+thiserror = "2"
+url = "2"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
