@@ -1,5 +1,9 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+use futures_util::StreamExt;
 
 use serde::Deserialize;
 
@@ -33,6 +37,14 @@ pub enum UploadError {
     Unauthorized(String),
 }
 
+/// Bytes handed to the socket so far.
+///
+/// A counter rather than a callback: the sender only ever adds to it, and
+/// whoever wants to report progress reads it on its own schedule. That keeps
+/// the reporting cadence out of the transfer path entirely — a 3 GB upload
+/// should not be deciding how often the UI redraws.
+pub type Progress = Arc<AtomicU64>;
+
 #[derive(Debug, Default)]
 pub struct UploadMeta {
     pub folder: Option<String>,
@@ -63,6 +75,7 @@ pub async fn upload_single(
     token: &str,
     path: &Path,
     meta: &UploadMeta,
+    progress: Progress,
 ) -> std::result::Result<UploadResult, UploadError> {
     let file = tokio::fs::File::open(path)
         .await
@@ -79,7 +92,12 @@ pub async fn upload_single(
         .unwrap_or("upload")
         .to_string();
 
-    let stream = tokio_util::io::ReaderStream::new(file);
+    let stream = tokio_util::io::ReaderStream::new(file).map(move |result| {
+        if let Ok(bytes) = &result {
+            progress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        result
+    });
     let part = reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(stream), size)
         .file_name(filename.clone())
         .mime_str("application/octet-stream")
@@ -305,6 +323,7 @@ pub async fn upload_chunk(
     total: i64,
     file_size: u64,
     chunk_size: u64,
+    progress: Progress,
 ) -> std::result::Result<ChunkOutcome, UploadError> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -326,8 +345,14 @@ pub async fn upload_chunk(
     // Streamed and length-limited rather than read into a buffer: the chunk is
     // 32 MB and there is no reason for it to also be 32 MB of memory.
     let slice = file.take(len);
+    let counted = tokio_util::io::ReaderStream::new(slice).map(move |result| {
+        if let Ok(bytes) = &result {
+            progress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        result
+    });
     let part = reqwest::multipart::Part::stream_with_length(
-        reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(slice)),
+        reqwest::Body::wrap_stream(counted),
         len,
     )
     .file_name("blob")

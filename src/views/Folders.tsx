@@ -43,6 +43,7 @@ export function Folders({ options }: Props) {
   const [problems, setProblems] = useState<string[]>([])
   const [status, setStatus] = useState<QueueStatus | null>(null)
   const [landings, setLandings] = useState<Record<string, string>>({})
+  const [sending, setSending] = useState<Record<string, number>>({})
   const [error, setError] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
   const [composing, setComposing] = useState(false)
@@ -90,7 +91,21 @@ export function Folders({ options }: Props) {
   // the window was open would be a queue nobody could trust.
   useEffect(() => {
     const stop = listen<UploadEvent>('firesync://upload', (event) => {
-      const { path, landedAs, removedLocal } = event.payload
+      const { path, landedAs, removedLocal, state, sent, size } = event.payload
+
+      // Progress arrives every half second while a file is in flight. It is
+      // deliberately not a refresh: re-reading the ledger at that rate would be
+      // pointless work, since the row does not change until the upload ends.
+      if (state === 'uploading') {
+        setSending((prev) => ({ ...prev, [path]: size > 0 ? sent / size : 0 }))
+        return
+      }
+
+      setSending((prev) => {
+        const next = { ...prev }
+        delete next[path]
+        return next
+      })
       const note = [landedAs, removedLocal].filter(Boolean).join(' · ')
       if (note) setLandings((prev) => ({ ...prev, [path]: note }))
       void refresh()
@@ -361,21 +376,39 @@ export function Folders({ options }: Props) {
           </p>
         ) : (
           <ul className="rows">
-            {recent.slice(0, 25).map((r) => (
-              <li key={r.id} className="row">
-                <span className={`badge badge--${r.state}`}>{r.state}</span>
-                <span className="mono row__path">{basename(r.path)}</span>
-                {folderName(r.folderId) && (
-                  <span className="row__folder">{folderName(r.folderId)}</span>
-                )}
-                <span className="spacer" />
-                {landings[r.path] && (
-                  <span className="row__meta mono">{landings[r.path]}</span>
-                )}
-                <span className="row__meta">{humanSize(r.size)}</span>
-                {r.reason && <span className="row__reason">{r.reason}</span>}
-              </li>
-            ))}
+            {recent.slice(0, 25).map((r) => {
+              const fraction = sending[r.path]
+              const inFlight = fraction !== undefined
+              return (
+                <li key={r.id} className="row">
+                  <span className={`badge badge--${inFlight ? 'uploading' : r.state}`}>
+                    {inFlight ? 'uploading' : r.state}
+                  </span>
+                  <span className="mono row__path">{basename(r.path)}</span>
+                  {folderName(r.folderId) && (
+                    <span className="row__folder">{folderName(r.folderId)}</span>
+                  )}
+                  <span className="spacer" />
+                  {inFlight ? (
+                    <>
+                      <span className="row__bar" aria-hidden="true">
+                        <span
+                          className="row__bar-fill"
+                          style={{ width: `${Math.min(100, Math.round(fraction * 100))}%` }}
+                        />
+                      </span>
+                      <span className="row__meta row__pct">
+                        {Math.min(100, Math.round(fraction * 100))}%
+                      </span>
+                    </>
+                  ) : (
+                    landings[r.path] && <span className="row__meta mono">{landings[r.path]}</span>
+                  )}
+                  <span className="row__meta">{humanSize(r.size)}</span>
+                  {!inFlight && r.reason && <span className="row__reason">{r.reason}</span>}
+                </li>
+              )
+            })}
           </ul>
         )}
       </section>

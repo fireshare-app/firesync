@@ -8,8 +8,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::api::upload::{
-    chunk_count, upload_chunk, upload_single, ChunkOutcome, ChunkPolicy, UploadError, UploadMeta,
-    UploadResult,
+    chunk_count, upload_chunk, upload_single, ChunkOutcome, ChunkPolicy, Progress, UploadError,
+    UploadMeta, UploadResult,
 };
 use crate::config::{AfterUpload, Settings};
 use crate::ledger::{Claim, Ledger};
@@ -28,6 +28,8 @@ pub struct UploadEvent {
     pub state: String,
     pub reason: Option<String>,
     pub url: Option<String>,
+    /// Bytes handed to the socket so far, on an `uploading` event.
+    pub sent: i64,
     /// Where the server filed it, which is not always where we asked: it
     /// suffixes the name when something is already sitting on it.
     pub landed_as: Option<String>,
@@ -198,6 +200,7 @@ async fn send_chunked(
     file_size: u64,
     ledger: &Arc<Ledger>,
     policy: ChunkPolicy,
+    progress: Progress,
 ) -> SendOutcome {
     let total = chunk_count(file_size, policy.size);
     let state = ledger.chunk_state(claim.id).unwrap_or_default();
@@ -221,7 +224,16 @@ async fn send_chunked(
 
     for index in (done + 1)..=total {
         match upload_chunk(
-            base_url, token, path, meta, &check_sum, index, total, file_size, policy.size,
+            base_url,
+            token,
+            path,
+            meta,
+            &check_sum,
+            index,
+            total,
+            file_size,
+            policy.size,
+            progress.clone(),
         )
         .await
         {
@@ -315,14 +327,48 @@ async fn run_one<F>(
 
     let file_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
 
+    // Reported from the side rather than from inside the transfer: the sender
+    // only adds to this counter, and a ticker reads it on its own schedule. A
+    // three gigabyte upload should not be deciding how often the UI redraws,
+    // and a small one should not be paying for progress it does not need.
+    let progress: Progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ticker = {
+        let progress = progress.clone();
+        let on_event = on_event.clone();
+        let path_str = claim.path.clone();
+        let id = claim.id;
+        let size = claim.size;
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                on_event(UploadEvent {
+                    id,
+                    path: path_str.clone(),
+                    size,
+                    sent: progress.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                    state: "uploading".into(),
+                    reason: None,
+                    url: None,
+                    landed_as: None,
+                    removed_local: None,
+                });
+            }
+        })
+    };
+
     let outcome = if file_size > policy.threshold {
-        send_chunked(&claim, base_url, token, &path, &meta, file_size, &ledger, policy).await
+        send_chunked(
+            &claim, base_url, token, &path, &meta, file_size, &ledger, policy, progress,
+        )
+        .await
     } else {
-        match upload_single(base_url, token, &path, &meta).await {
+        match upload_single(base_url, token, &path, &meta, progress).await {
             Ok(r) => SendOutcome::Ok(r),
             Err(e) => SendOutcome::Err(e),
         }
     };
+
+    ticker.abort();
 
     let result = match outcome {
         SendOutcome::Ok(r) => Ok(r),
@@ -364,6 +410,7 @@ async fn run_one<F>(
                 id: claim.id,
                 path: claim.path.clone(),
                 size: claim.size,
+                sent: claim.size,
                 state: "done".into(),
                 reason: None,
                 url: None,
@@ -384,6 +431,7 @@ async fn run_one<F>(
                 id: claim.id,
                 path: claim.path.clone(),
                 size: claim.size,
+                sent: claim.size,
                 state: "duplicate".into(),
                 reason: Some("Already in your library".into()),
                 url,
@@ -482,6 +530,7 @@ where
         id: claim.id,
         path: claim.path.clone(),
         size: claim.size,
+        sent: 0,
         state: state.to_string(),
         reason: reason.map(str::to_string),
         url,
