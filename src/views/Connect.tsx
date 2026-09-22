@@ -1,18 +1,6 @@
 import { useState } from 'react'
+import logo from '../assets/logo.png'
 import { api, asAppError, type AppError, type Connection } from '../lib/ipc'
-
-const FlameIcon = ({ size = 26 }: { size?: number }) => (
-  <svg width={size} height={size} viewBox="0 0 20 20" aria-hidden="true" style={{ color: '#FF3729' }}>
-    <path
-      d="M10 1.8s4.6 3.1 4.6 7.6a4.6 4.6 0 01-9.2 0C5.4 4.9 10 1.8 10 1.8z"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      fill="none"
-      strokeLinejoin="round"
-    />
-    <path d="M10 18.2v-4.4" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" />
-  </svg>
-)
 
 const CheckIcon = () => (
   <svg width="17" height="17" viewBox="0 0 18 18" aria-hidden="true" style={{ flexShrink: 0 }}>
@@ -79,7 +67,7 @@ export function Connect({ onConnected }: Props) {
     <form className="connect" onSubmit={test}>
       <div className="connect__rail">
         <div className="connect__brand">
-          <FlameIcon />
+          <img src={logo} alt="" width={28} height={28} />
           <span>Firesync</span>
         </div>
         <p className="connect__tagline">
