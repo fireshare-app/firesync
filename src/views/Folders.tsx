@@ -42,6 +42,8 @@ export function Folders({ options }: Props) {
   const [uploads, setUploads] = useState<UploadEvent[]>([])
   const [error, setError] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
+  const [composing, setComposing] = useState(false)
+  const [draftPath, setDraftPath] = useState('')
 
   const refresh = useCallback(async () => {
     try {
@@ -89,20 +91,37 @@ export function Folders({ options }: Props) {
     return () => clearInterval(t)
   }, [refresh])
 
-  async function addFolder() {
+  async function browse() {
     setError(null)
-    const picked = await open({ directory: true, multiple: false, title: 'Watch a folder' })
-    if (typeof picked !== 'string') return
+    try {
+      const picked = await open({ directory: true, multiple: false, title: 'Watch a folder' })
+      if (typeof picked === 'string') setDraftPath(picked)
+    } catch (e) {
+      // The picker can be unavailable or restricted — on macOS an unsigned dev
+      // build has no TCC identity, so protected folders are simply disabled.
+      // Typing a path still works, so say so rather than dead-ending.
+      setError(
+        `${asAppError(e).message} You can paste the folder path instead.`,
+      )
+    }
+  }
+
+  async function commit() {
+    const path = draftPath.trim()
+    if (!path) return
+    setError(null)
     setAdding(true)
     try {
       await foldersApi.add({
-        path: picked,
+        path,
         includeSubfolders: false,
         media: ['video'] as MediaKind[],
         destFolder: options?.default_folder ?? null,
         minSizeBytes: 5 * MB,
         uploadExisting: false,
       })
+      setDraftPath('')
+      setComposing(false)
       await refresh()
     } catch (e) {
       setError(asAppError(e).message)
@@ -121,10 +140,51 @@ export function Folders({ options }: Props) {
             put until you ask for them.
           </p>
         </div>
-        <button type="button" className="btn btn--primary" onClick={addFolder} disabled={adding}>
-          {adding ? 'Adding…' : 'Add folder'}
+        <button
+          type="button"
+          className="btn btn--primary"
+          onClick={() => setComposing((v) => !v)}
+          disabled={adding}
+        >
+          Add folder
         </button>
       </header>
+
+      {composing && (
+        <form
+          className="addbar"
+          onSubmit={(e) => {
+            e.preventDefault()
+            void commit()
+          }}
+        >
+          <label className="addbar__label" htmlFor="newpath">
+            Folder on this machine
+          </label>
+          <div className="addbar__row">
+            <input
+              id="newpath"
+              type="text"
+              className="addbar__input mono"
+              placeholder="/Users/you/Movies/clips"
+              spellCheck={false}
+              autoFocus
+              value={draftPath}
+              onChange={(e) => setDraftPath(e.target.value)}
+            />
+            <button type="button" className="btn btn--ghost" onClick={browse}>
+              Browse…
+            </button>
+            <button type="submit" className="btn btn--primary" disabled={adding || !draftPath.trim()}>
+              {adding ? 'Adding…' : 'Watch it'}
+            </button>
+          </div>
+          <span className="addbar__hint">
+            Paste a path if the picker will not let you reach the folder — a network share, or a
+            location macOS has not granted access to.
+          </span>
+        </form>
+      )}
 
       {status?.paused && (
         <div className="banner banner--bad banner--row">

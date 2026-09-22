@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Merged into the generated Info.plist for macOS builds.
+
+  Without these keys macOS does not prompt for access to the protected
+  locations — it denies silently, and the folder picker shows Desktop,
+  Documents, Downloads and any external volume greyed out with no explanation.
+  Since picking a folder to watch is the entire point of the app, that reads as
+  a broken dialog rather than a permission that was never asked for.
+-->
+<plist version="1.0">
+<dict>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Firesync watches the folders you choose so it can upload new clips and screenshots to your Fireshare instance.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Firesync watches the folders you choose so it can upload new clips and screenshots to your Fireshare instance.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Firesync watches the folders you choose so it can upload new clips and screenshots to your Fireshare instance.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>Firesync watches the folders you choose, including ones on external drives, so it can upload new clips and screenshots.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>Firesync watches the folders you choose, including ones on network shares, so it can upload new clips and screenshots.</string>
+</dict>
+</plist>
