@@ -470,3 +470,74 @@ impl Ledger {
         .map_err(db_err)
     }
 }
+
+/// Where a chunked upload got to, so a restart can pick it up rather than
+/// sending three gigabytes again.
+#[derive(Debug, Clone, Default)]
+pub struct ChunkState {
+    pub check_sum: Option<String>,
+    pub chunks_total: Option<i64>,
+    /// Consecutive chunks the server has acknowledged, counting from one.
+    pub chunks_done: i64,
+}
+
+impl Ledger {
+    pub fn chunk_state(&self, id: i64) -> Result<ChunkState> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT check_sum, chunks_total, chunks_done FROM files WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(ChunkState {
+                    check_sum: r.get(0)?,
+                    chunks_total: r.get(1)?,
+                    chunks_done: r
+                        .get::<_, Option<String>>(2)?
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                })
+            },
+        )
+        .map_err(db_err)
+    }
+
+    pub fn begin_chunks(&self, id: i64, check_sum: &str, total: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET check_sum = ?1, chunks_total = ?2, chunks_done = '0', updated_at = ?3
+              WHERE id = ?4",
+            params![check_sum, total, now(), id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Record that the server has acknowledged everything up to `done`.
+    ///
+    /// Written after each chunk rather than at the end: this row is the only
+    /// record of progress there is, because the server has no route that reports
+    /// which parts it is holding.
+    pub fn advance_chunks(&self, id: i64, done: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET chunks_done = ?1, updated_at = ?2 WHERE id = ?3",
+            params![done.to_string(), now(), id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Forget a set entirely. Used when the server has lost its parts and the
+    /// file has to start again under a new id.
+    pub fn clear_chunks(&self, id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET check_sum = NULL, chunks_total = NULL, chunks_done = NULL,
+                    updated_at = ?1
+              WHERE id = ?2",
+            params![now(), id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+}

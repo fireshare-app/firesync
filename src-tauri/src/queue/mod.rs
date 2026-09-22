@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::api::upload::{upload_single, UploadError, UploadMeta, UploadResult};
+use crate::api::upload::{
+    chunk_count, upload_chunk, upload_single, ChunkOutcome, ChunkPolicy, UploadError, UploadMeta,
+    UploadResult,
+};
 use crate::config::{AfterUpload, Settings};
 use crate::ledger::{Claim, Ledger};
 use crate::secrets::TokenCache;
@@ -151,7 +154,17 @@ where
                 let token = token.clone();
 
                 tasks.push(tauri::async_runtime::spawn(async move {
-                    run_one(claim, &base_url, &token, ledger, settings, control, on_event).await;
+                    run_one(
+                        claim,
+                        &base_url,
+                        &token,
+                        ledger,
+                        settings,
+                        control,
+                        on_event,
+                        ChunkPolicy::default(),
+                    )
+                    .await;
                 }));
             }
             for task in tasks {
@@ -159,6 +172,104 @@ where
             }
         }
     });
+}
+
+/// What sending a file came to. `Restart` is the chunked path's own case: the
+/// parts are gone from the server and there is nothing left to resume from, so
+/// the file has to begin again under a fresh id.
+enum SendOutcome {
+    Ok(UploadResult),
+    Err(UploadError),
+    Restart(String),
+}
+
+/// Send a large file in pieces, picking up wherever the last attempt stopped.
+///
+/// Chunks go one at a time. The server reassembles as soon as it sees a full
+/// set, so two requests that both observe one would both try — and the one that
+/// loses finds the parts already consumed and answers 500. Sending several
+/// *files* at once is fine; it is within a file that order matters.
+async fn send_chunked(
+    claim: &Claim,
+    base_url: &str,
+    token: &str,
+    path: &std::path::Path,
+    meta: &UploadMeta,
+    file_size: u64,
+    ledger: &Arc<Ledger>,
+    policy: ChunkPolicy,
+) -> SendOutcome {
+    let total = chunk_count(file_size, policy.size);
+    let state = ledger.chunk_state(claim.id).unwrap_or_default();
+
+    // Resume only onto a set that describes this same file. A clip re-recorded
+    // under the same name has a different length and therefore a different
+    // number of chunks, and pouring its bytes into the old set would assemble a
+    // file that never existed.
+    let (check_sum, mut done) = match (state.check_sum, state.chunks_total) {
+        (Some(cs), Some(t)) if t == total && state.chunks_done < total => (cs, state.chunks_done),
+        _ => {
+            let fresh = uuid::Uuid::new_v4().simple().to_string();
+            if let Err(e) = ledger.begin_chunks(claim.id, &fresh, total) {
+                return SendOutcome::Err(UploadError::Retryable(format!(
+                    "Could not record the upload's progress: {e}"
+                )));
+            }
+            (fresh, 0)
+        }
+    };
+
+    for index in (done + 1)..=total {
+        match upload_chunk(
+            base_url, token, path, meta, &check_sum, index, total, file_size, policy.size,
+        )
+        .await
+        {
+            Ok(ChunkOutcome::Complete(result)) => {
+                let _ = ledger.clear_chunks(claim.id);
+                return SendOutcome::Ok(result);
+            }
+
+            Ok(ChunkOutcome::Partial { received }) => {
+                // `received` is what the server is holding, which is not the
+                // same as what we have sent. Fewer means its parts were swept
+                // out from under us — a restart of Fireshare, or a media
+                // directory cleared — and every remaining chunk we send would
+                // answer 202 forever against a set that can never complete.
+                if received >= 0 && received < index {
+                    return SendOutcome::Restart(format!(
+                        "The server has {received} of the {index} parts sent so far, so the \
+                         earlier ones are gone."
+                    ));
+                }
+
+                done = index;
+                let _ = ledger.advance_chunks(claim.id, done);
+
+                // The same conclusion without needing the count, for a Fireshare
+                // old enough to answer 202 with an empty body: every chunk sent
+                // and still not complete can only mean parts are missing.
+                if index == total {
+                    return SendOutcome::Restart(
+                        "Every part was sent and the server still has not assembled the file."
+                            .into(),
+                    );
+                }
+            }
+
+            // A failure on the request that completes the set is not resumable.
+            // Reassembly consumes each part as it goes, so whatever it got
+            // through is already gone, and a size mismatch deletes the staged
+            // file too. There is nothing left to continue from.
+            Err(UploadError::Retryable(message)) if index == total => {
+                return SendOutcome::Restart(format!("{message} The assembled parts are gone."));
+            }
+
+            Err(e) => return SendOutcome::Err(e),
+        }
+    }
+
+    SendOutcome::Restart("Ran out of parts to send without the file completing.".into())
 }
 
 async fn run_one<F>(
@@ -169,6 +280,7 @@ async fn run_one<F>(
     settings: Arc<Mutex<Settings>>,
     control: Arc<QueueControl>,
     on_event: Arc<F>,
+    policy: ChunkPolicy,
 ) where
     F: Fn(UploadEvent) + Send + Sync + 'static,
 {
@@ -201,7 +313,45 @@ async fn run_one<F>(
         }
     };
 
-    match upload_single(base_url, token, &path, &meta).await {
+    let file_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+
+    let outcome = if file_size > policy.threshold {
+        send_chunked(&claim, base_url, token, &path, &meta, file_size, &ledger, policy).await
+    } else {
+        match upload_single(base_url, token, &path, &meta).await {
+            Ok(r) => SendOutcome::Ok(r),
+            Err(e) => SendOutcome::Err(e),
+        }
+    };
+
+    let result = match outcome {
+        SendOutcome::Ok(r) => Ok(r),
+        SendOutcome::Err(e) => Err(e),
+        SendOutcome::Restart(message) => {
+            // Start the file again from nothing: a new id, and no progress to
+            // resume onto. Counted as an attempt so a server that keeps losing
+            // sets cannot hold one file in a loop forever.
+            let _ = ledger.clear_chunks(claim.id);
+            if retry::should_retry(claim.attempts) {
+                let wait = retry::backoff(claim.attempts);
+                let reason = retry::waiting_reason(
+                    &format!("{message} Starting this file again."),
+                    claim.attempts,
+                    wait,
+                );
+                let due = unix_now() + wait.as_secs() as i64;
+                let _ = ledger.reschedule(claim.id, &reason, due);
+                emit(&on_event, &claim, "waiting", Some(&reason), None);
+            } else {
+                let reason = format!("{message} Gave up after {} attempts.", retry::MAX_ATTEMPTS);
+                let _ = ledger.mark_failed(claim.id, &reason);
+                emit(&on_event, &claim, "failed", Some(&reason), None);
+            }
+            return;
+        }
+    };
+
+    match result {
         Ok(UploadResult::Accepted { filename, folder }) => {
             let landed = if folder.is_empty() {
                 filename.clone()
@@ -388,8 +538,11 @@ pub(crate) mod tests {
                     503 => "SERVICE UNAVAILABLE",
                     _ => "ERROR",
                 };
+                // Connection: close, or reqwest can read the socket ending as a
+                // dropped connection — which classifies as retryable and turns
+                // a deterministic status test into a flaky one.
                 let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{headers}\r\n{body}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n{headers}\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -467,6 +620,7 @@ pub(crate) mod tests {
             f.settings.clone(),
             control,
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
+            ChunkPolicy::default(),
         )
         .await;
     }
@@ -746,6 +900,323 @@ mod removal_tests {
 
         assert!(!path.exists(), "trashing should clear it out of the watched folder");
         assert_eq!(f.events.lock().unwrap()[0].removed_local.as_deref(), Some("Moved to trash"));
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::api::upload::ChunkPolicy;
+    use crate::config::AfterUpload;
+    use crate::ledger::FileState;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// How a fake Fireshare behaves while a set is being assembled.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Behaviour {
+        /// Keeps every part and completes when it has them all.
+        Honest,
+        /// Forgets everything it holds after this many chunks, the way a
+        /// restart of Fireshare sweeps the part files.
+        LoseAfter(usize),
+        /// Answers 202 with no body, the way a Fireshare predating the
+        /// informative-202 change does. The client cannot see a shortfall and
+        /// has to notice it by running out of chunks.
+        Silent,
+    }
+
+    struct FakeServer {
+        url: String,
+        /// chunkPart values in the order they arrived.
+        seen: Arc<Mutex<Vec<i64>>>,
+        requests: Arc<AtomicUsize>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeServer {
+        fn start(behaviour: Behaviour) -> FakeServer {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let requests = Arc::new(AtomicUsize::new(0));
+
+            let seen_t = seen.clone();
+            let requests_t = requests.clone();
+            let handle = std::thread::spawn(move || {
+                // What the server is "holding". Cleared when it loses its parts.
+                let mut held: Vec<i64> = Vec::new();
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let Some(body) = read_request(&mut stream) else { break };
+                    requests_t.fetch_add(1, AtomicOrdering::Relaxed);
+
+                    let part = field(&body, "chunkPart").and_then(|v| v.parse::<i64>().ok());
+                    let total = field(&body, "totalChunks").and_then(|v| v.parse::<i64>().ok());
+                    let (Some(part), Some(total)) = (part, total) else {
+                        let _ = respond(&mut stream, 400, "not a chunk request");
+                        continue;
+                    };
+                    seen_t.lock().unwrap().push(part);
+
+                    if !held.contains(&part) {
+                        held.push(part);
+                    }
+
+                    if let Behaviour::LoseAfter(n) = behaviour {
+                        if held.len() > n {
+                            held.clear();
+                            held.push(part);
+                        }
+                    }
+
+                    if held.len() as i64 == total && behaviour != Behaviour::Silent {
+                        let _ = respond(
+                            &mut stream,
+                            201,
+                            r#"{"filename":"clip.mp4","folder":"clips"}"#,
+                        );
+                        break;
+                    }
+
+                    let body = if behaviour == Behaviour::Silent {
+                        String::new()
+                    } else {
+                        format!(
+                            r#"{{"status":"partial","received":{},"total":{}}}"#,
+                            held.len(),
+                            total
+                        )
+                    };
+                    let _ = respond(&mut stream, 202, &body);
+                }
+            });
+
+            FakeServer { url, seen, requests, handle: Some(handle) }
+        }
+
+        fn chunks_seen(&self) -> Vec<i64> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    impl Drop for FakeServer {
+        fn drop(&mut self) {
+            // The listener closes with the thread; nothing to join deterministically
+            // once a test has stopped sending.
+            if let Some(h) = self.handle.take() {
+                drop(h);
+            }
+        }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        // Headers, one byte at a time — slow but unambiguous, and these bodies
+        // are kilobytes.
+        while !buf.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).ok()? == 0 {
+                return None;
+            }
+            buf.push(byte[0]);
+        }
+        let headers = String::from_utf8_lossy(&buf).to_lowercase();
+        let len: usize = headers
+            .split("content-length:")
+            .nth(1)?
+            .split("\r\n")
+            .next()?
+            .trim()
+            .parse()
+            .ok()?;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).ok()?;
+        Some(body)
+    }
+
+    /// Pull a multipart text field out of a raw body. Crude, and enough: these
+    /// are fields this client wrote moments earlier.
+    fn field(body: &[u8], name: &str) -> Option<String> {
+        let text = String::from_utf8_lossy(body);
+        let marker = format!("name=\"{name}\"");
+        let start = text.find(&marker)? + marker.len();
+        let rest = &text[start..];
+        let value_start = rest.find("\r\n\r\n")? + 4;
+        let rest = &rest[value_start..];
+        let value_end = rest.find("\r\n")?;
+        Some(rest[..value_end].to_string())
+    }
+
+    fn respond(stream: &mut std::net::TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+        let reason = match status {
+            201 => "CREATED",
+            202 => "ACCEPTED",
+            _ => "ERROR",
+        };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes())?;
+        stream.flush()
+    }
+
+    /// 10 KB file, 1 KB chunks, threshold 1 KB: ten real chunk requests.
+    fn tiny_policy() -> ChunkPolicy {
+        ChunkPolicy { threshold: 1024, size: 1024 }
+    }
+
+    fn big_fixture() -> Fixture {
+        let f = fixture_with(AfterUpload::Keep);
+        std::fs::write(&f.claim.path, vec![7u8; 10 * 1024]).unwrap();
+        f
+    }
+
+    async fn run_chunked(f: &Fixture, url: &str, control: Arc<QueueControl>) {
+        let events = f.events.clone();
+        let mut claim = f.claim.clone();
+        claim.size = 10 * 1024;
+        run_one(
+            claim,
+            url,
+            "fsk_test",
+            f.ledger.clone(),
+            f.settings.clone(),
+            control,
+            Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
+            tiny_policy(),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_file_goes_up_in_order_and_completes() {
+        let f = big_fixture();
+        let server = FakeServer::start(Behaviour::Honest);
+        run_chunked(&f, &server.url, Arc::new(QueueControl::new())).await;
+
+        assert_eq!(server.chunks_seen(), (1..=10).collect::<Vec<_>>(), "chunks must go in order");
+        assert_eq!(
+            f.ledger.recent(10).unwrap().into_iter().find(|r| r.id == f.claim.id).unwrap().state,
+            FileState::Done
+        );
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The whole point of the endpoint: an interrupted upload does not start over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_resumes_from_where_it_stopped() {
+        let f = big_fixture();
+
+        // Stand in for a previous run that got four chunks in before dying.
+        f.ledger.begin_chunks(f.claim.id, "prevrun", 10).unwrap();
+        f.ledger.advance_chunks(f.claim.id, 4).unwrap();
+
+        let server = FakeServer::start(Behaviour::Honest);
+        run_chunked(&f, &server.url, Arc::new(QueueControl::new())).await;
+
+        let seen = server.chunks_seen();
+        assert_eq!(seen.first(), Some(&5), "should resume at chunk 5, not restart at 1");
+        assert!(!seen.contains(&1), "chunk 1 was already sent and must not go again");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// Fireshare restarting sweeps its part files. Every chunk we send after
+    /// that answers 202 against a set that can never complete, so the client has
+    /// to notice and begin again rather than hang.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_loses_its_parts_makes_the_file_start_again() {
+        let f = big_fixture();
+        let server = FakeServer::start(Behaviour::LoseAfter(3));
+        run_chunked(&f, &server.url, Arc::new(QueueControl::new())).await;
+
+        let row = f.ledger.recent(10).unwrap().into_iter().find(|r| r.id == f.claim.id).unwrap();
+        assert_eq!(row.state, FileState::Queued, "it should be waiting for another go");
+        assert_eq!(row.attempts, 1);
+        assert!(
+            row.reason.as_deref().unwrap().contains("Starting this file again"),
+            "{row:?}"
+        );
+
+        // And the progress is discarded, so the retry mints a fresh set.
+        let state = f.ledger.chunk_state(f.claim.id).unwrap();
+        assert_eq!(state.check_sum, None);
+        assert_eq!(state.chunks_done, 0);
+
+        // It gave up quickly rather than sending all ten into a lost set.
+        assert!(server.request_count() <= 5, "sent {} chunks before noticing", server.request_count());
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A Fireshare without the informative 202 gives no count to compare
+    /// against, so the only signal is running out of chunks with no completion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_old_server_with_a_bare_202_is_still_caught() {
+        let f = big_fixture();
+        let server = FakeServer::start(Behaviour::Silent);
+        run_chunked(&f, &server.url, Arc::new(QueueControl::new())).await;
+
+        assert_eq!(server.chunks_seen(), (1..=10).collect::<Vec<_>>(), "all ten get sent first");
+
+        let row = f.ledger.recent(10).unwrap().into_iter().find(|r| r.id == f.claim.id).unwrap();
+        assert_eq!(row.state, FileState::Queued);
+        assert!(row.reason.as_deref().unwrap().contains("Starting this file again"), "{row:?}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A re-recorded clip under the same name has a different length, so the
+    /// stored progress describes a file that no longer exists. Resuming onto it
+    /// would assemble something that never did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_from_a_differently_sized_file_is_not_resumed_onto() {
+        let f = big_fixture();
+        f.ledger.begin_chunks(f.claim.id, "stale", 3).unwrap();
+        f.ledger.advance_chunks(f.claim.id, 2).unwrap();
+
+        let server = FakeServer::start(Behaviour::Honest);
+        run_chunked(&f, &server.url, Arc::new(QueueControl::new())).await;
+
+        assert_eq!(
+            server.chunks_seen().first(),
+            Some(&1),
+            "a set recorded for a different chunk count must be abandoned, not resumed"
+        );
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_small_file_never_touches_the_chunked_route() {
+        let f = fixture_with(AfterUpload::Keep); // 4 KB, under the 1 KB... no, over it
+        std::fs::write(&f.claim.path, vec![1u8; 512]).unwrap();
+
+        let server = FakeServer::start(Behaviour::Honest);
+        let events = f.events.clone();
+        let mut claim = f.claim.clone();
+        claim.size = 512;
+        run_one(
+            claim,
+            &server.url,
+            "fsk_test",
+            f.ledger.clone(),
+            f.settings.clone(),
+            Arc::new(QueueControl::new()),
+            Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
+            tiny_policy(),
+        )
+        .await;
+
+        // The fake server only understands chunk requests, so a single-shot
+        // upload reaches it as a 400 — which is itself the proof that the
+        // chunked route was not used.
+        assert!(server.chunks_seen().is_empty(), "a file under the threshold must go in one request");
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 }

@@ -241,3 +241,184 @@ mod tests {
         assert_eq!(friendly_400("   "), "The server rejected the file.");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Chunked upload
+// ---------------------------------------------------------------------------
+
+/// Above this, send in pieces. Below it, one request is fewer moving parts than
+/// several and finishes in about the same time.
+pub const CHUNK_THRESHOLD: u64 = 200 * 1024 * 1024;
+
+/// The browser client uses 90 MB. On a home upstream that is a lot to lose to
+/// one dropped connection, and the server's ceiling of 20000 chunks leaves
+/// plenty of headroom at this size: 20000 x 32 MiB is 625 GiB, far past any
+/// clip anyone is going to record.
+pub const CHUNK_SIZE: u64 = 32 * 1024 * 1024;
+
+/// The sizes that decide whether and how a file is split.
+///
+/// A struct rather than two constants so a test can exercise the real chunking
+/// path with kilobytes instead of having to write out a 200 MB file to reach it.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkPolicy {
+    pub threshold: u64,
+    pub size: u64,
+}
+
+impl Default for ChunkPolicy {
+    fn default() -> Self {
+        Self { threshold: CHUNK_THRESHOLD, size: CHUNK_SIZE }
+    }
+}
+
+#[derive(Debug)]
+pub enum ChunkOutcome {
+    /// The set completed and the server answered as the single-shot route does.
+    Complete(UploadResult),
+    /// Still assembling. `received` is how many parts the server actually holds,
+    /// which is not the same as how many we have sent — see the queue.
+    Partial { received: i64 },
+}
+
+#[derive(Deserialize)]
+struct PartialBody {
+    #[serde(default)]
+    received: i64,
+}
+
+/// Send one chunk of a file.
+///
+/// Every chunk carries the full metadata, and it must: the server rebuilds its
+/// plan from each request, and derives the directory the parts are written into
+/// from `folder`. A chunk that named a different folder — or omitted it, and so
+/// landed in the default — would leave its part somewhere the completing
+/// request never looks, and the upload would sit at 202 forever.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_chunk(
+    base_url: &str,
+    token: &str,
+    path: &Path,
+    meta: &UploadMeta,
+    check_sum: &str,
+    index: i64,
+    total: i64,
+    file_size: u64,
+    chunk_size: u64,
+) -> std::result::Result<ChunkOutcome, UploadError> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let offset = (index as u64 - 1) * chunk_size;
+    let len = chunk_size.min(file_size.saturating_sub(offset));
+    if len == 0 {
+        return Err(UploadError::Permanent(
+            "Worked out a chunk with no bytes in it.".into(),
+        ));
+    }
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| UploadError::Permanent(format!("Could not read the file: {e}")))?;
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|e| UploadError::Permanent(format!("Could not seek the file: {e}")))?;
+
+    // Streamed and length-limited rather than read into a buffer: the chunk is
+    // 32 MB and there is no reason for it to also be 32 MB of memory.
+    let slice = file.take(len);
+    let part = reqwest::multipart::Part::stream_with_length(
+        reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(slice)),
+        len,
+    )
+    .file_name("blob")
+    .mime_str("application/octet-stream")
+    .map_err(|e| UploadError::Permanent(format!("Could not build the chunk: {e}")))?;
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("upload")
+        .to_string();
+
+    let mut form = reqwest::multipart::Form::new()
+        .part("blob", part)
+        .text("chunkPart", index.to_string())
+        .text("totalChunks", total.to_string())
+        .text("checkSum", check_sum.to_string())
+        .text("fileName", filename)
+        .text("fileSize", file_size.to_string());
+
+    if let Some(folder) = meta.folder.as_deref().filter(|s| !s.is_empty()) {
+        form = form.text("folder", folder.to_string());
+    }
+    if let Some(game) = meta.game.as_deref().filter(|s| !s.is_empty()) {
+        form = form.text("game", game.to_string());
+    }
+    if let Some(title) = meta.title.as_deref().filter(|s| !s.is_empty()) {
+        form = form.text("title", title.to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(UPLOAD_TIMEOUT)
+        .user_agent(concat!("Firesync/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| UploadError::Retryable(format!("Could not start the HTTP client: {e}")))?;
+
+    let response = client
+        .post(format!("{base_url}/api/upload/token/chunked"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| classify_transport(&e))?;
+
+    if response.status().as_u16() == 202 {
+        let received = response
+            .json::<PartialBody>()
+            .await
+            .map(|b| b.received)
+            .unwrap_or(-1);
+        return Ok(ChunkOutcome::Partial { received });
+    }
+
+    classify_response(response).await.map(ChunkOutcome::Complete)
+}
+
+/// How many chunks a file of this size takes.
+pub fn chunk_count(file_size: u64, chunk_size: u64) -> i64 {
+    file_size.div_ceil(chunk_size).max(1) as i64
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    #[test]
+    fn chunk_counts_round_up() {
+        assert_eq!(chunk_count(1, CHUNK_SIZE), 1);
+        assert_eq!(chunk_count(CHUNK_SIZE, CHUNK_SIZE), 1);
+        assert_eq!(chunk_count(CHUNK_SIZE + 1, CHUNK_SIZE), 2);
+        assert_eq!(chunk_count(CHUNK_SIZE * 3, CHUNK_SIZE), 3);
+        // A 3 GB clip, comfortably inside the server's 20000 ceiling.
+        assert_eq!(chunk_count(3 * 1024 * 1024 * 1024, CHUNK_SIZE), 96);
+    }
+
+    #[test]
+    fn a_zero_length_file_still_claims_one_chunk() {
+        assert_eq!(chunk_count(0, CHUNK_SIZE), 1);
+    }
+
+    #[test]
+    fn the_shipped_policy_splits_where_it_says_it_does() {
+        let p = ChunkPolicy::default();
+        assert_eq!(p.threshold, 200 * 1024 * 1024);
+        assert_eq!(p.size, 32 * 1024 * 1024);
+        // 20000 parts is the server's ceiling, which at this chunk size is a
+        // 625 GiB file exactly. Worth pinning: raising the chunk count or
+        // shrinking the chunk would quietly lower the largest file that can be
+        // sent at all.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(chunk_count(625 * GIB, p.size), 20000);
+        assert!(chunk_count(626 * GIB, p.size) > 20000);
+    }
+}
