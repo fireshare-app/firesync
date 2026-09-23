@@ -135,7 +135,7 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
                   id="fd-path"
                   type="text"
                   className="addbar__input mono"
-                  placeholder="/Users/you/Movies/clips"
+                  placeholder="C:\Users\you\Games\clips"
                   spellCheck={false}
                   autoFocus
                   value={path}
