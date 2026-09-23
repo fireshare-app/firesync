@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
-import logo from './assets/logo.png'
 import { ActivityIcon, FolderIcon, GearIcon } from './components/Icons'
 import { TitleBar } from './components/TitleBar'
 import { Connect } from './views/Connect'
@@ -158,12 +157,6 @@ export default function App() {
       )}
       <div className="app">
       <aside className="sidebar">
-        <div className="sidebar__brand">
-          <img src={logo} alt="" width={20} height={20} />
-          <span className="sidebar__name">Firesync</span>
-          <span className="sidebar__version mono">{VERSION}</span>
-        </div>
-
         <nav className="sidebar__nav">
           <button
             type="button"
@@ -205,6 +198,8 @@ export default function App() {
             signed in as <strong>{connection.check.username}</strong>
           </div>
         </div>
+
+        <div className="sidebar__foot mono">v{VERSION}</div>
       </aside>
 
       <main className="main">
