@@ -576,3 +576,19 @@ impl Ledger {
         Ok(rows)
     }
 }
+
+impl Ledger {
+    /// When this folder last had something land on the server, or None if it
+    /// never has. Duplicates count: the library gained nothing, but the folder
+    /// did do its job.
+    pub fn last_upload_at(&self, folder_id: &str) -> Result<Option<i64>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT MAX(updated_at) FROM files
+              WHERE folder_id = ?1 AND state IN ('done', 'duplicate')",
+            params![folder_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .map_err(db_err)
+    }
+}

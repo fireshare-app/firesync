@@ -190,6 +190,8 @@ pub struct FolderSummary {
     pub folder: WatchedFolder,
     /// state -> count, straight from the ledger.
     pub counts: Vec<(String, i64)>,
+    /// When something from this folder last reached the server.
+    pub last_upload_at: Option<i64>,
     /// Media files sitting in the folder right now.
     ///
     /// Counted from disk rather than from the ledger, because the ledger keeps
@@ -266,7 +268,7 @@ pub async fn add_folder(
 
     let counts = state.ledger.counts(&record.id)?;
     let present_count = baseline_count.max(present.len() as i64);
-    Ok(FolderSummary { folder: record, counts, present_count })
+    Ok(FolderSummary { folder: record, counts, present_count, last_upload_at: None })
 }
 
 #[tauri::command]
@@ -376,7 +378,8 @@ pub fn list_folders(state: tauri::State<'_, AppState>) -> Result<Vec<FolderSumma
             let counts = state.ledger.counts(&folder.id)?;
             let types = state.types.lock().expect("types mutex").clone();
             let present_count = scan_existing(&folder, &types).len() as i64;
-            Ok(FolderSummary { folder, counts, present_count })
+            let last_upload_at = state.ledger.last_upload_at(&folder.id)?;
+            Ok(FolderSummary { folder, counts, present_count, last_upload_at })
         })
         .collect()
 }

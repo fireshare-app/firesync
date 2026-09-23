@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Backlog } from './Backlog'
-import { FolderDialog } from './FolderDialog'
 import { listen } from '@tauri-apps/api/event'
 import {
-  activity,
+  PauseIcon,
+  PencilIcon,
+  PlayIcon,
+  PlusIcon,
+  TrashIcon,
+  UploadIcon,
+  WarningTriangleIcon,
+} from '../components/Icons'
+import { Backlog } from './Backlog'
+import { FolderDialog } from './FolderDialog'
+import {
   asAppError,
   folders as foldersApi,
-  queue as queueApi,
-  type FileRow,
   type FolderSummary,
-  type QueueStatus,
   type UploadEvent,
   type UploadOptions,
 } from '../lib/ipc'
@@ -24,163 +29,117 @@ function humanSize(bytes: number) {
   return `${bytes} bytes`
 }
 
+function ago(unixSeconds: number) {
+  if (!unixSeconds) return null
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds)
+  if (seconds < 90) return 'just now'
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} minutes ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`
+  return `${Math.floor(hours / 24)} days ago`
+}
+
 function countOf(folder: FolderSummary, state: string) {
   return folder.counts.find(([s]) => s === state)?.[1] ?? 0
 }
 
-function basename(path: string) {
-  return path.split(/[\\/]/).pop() ?? path
+function sizeRule(folder: FolderSummary) {
+  const min = folder.min_size_bytes
+  const max = folder.max_size_bytes
+  if (min && max) return `${humanSize(min)} – ${humanSize(max)}`
+  if (min) return `Over ${humanSize(min)}`
+  if (max) return `Under ${humanSize(max)}`
+  return null
 }
 
 interface Props {
   options: UploadOptions | null
+  onChanged?: () => void
 }
 
-export function Folders({ options }: Props) {
+/** An upload in flight, keyed by the folder it belongs to. */
+interface InFlight {
+  name: string
+  fraction: number
+}
+
+export function Folders({ options, onChanged }: Props) {
   const [list, setList] = useState<FolderSummary[]>([])
-  const [recent, setRecent] = useState<FileRow[]>([])
   const [problems, setProblems] = useState<string[]>([])
-  const [status, setStatus] = useState<QueueStatus | null>(null)
-  const [landings, setLandings] = useState<Record<string, string>>({})
-  const [sending, setSending] = useState<Record<string, number>>({})
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState<FolderSummary | 'new' | null>(null)
   const [backlogFor, setBacklogFor] = useState<FolderSummary | null>(null)
-
-  // Same filename in two watched folders is ordinary — a move between them
-  // produces exactly that — so each row says which folder it belongs to.
-  const folderName = useCallback(
-    (id: string) => {
-      const folder = list.find((f) => f.id === id)
-      return folder ? basename(folder.path) : null
-    },
-    [list],
-  )
+  const [inFlight, setInFlight] = useState<Record<string, InFlight>>({})
 
   const refresh = useCallback(async () => {
     try {
       setList(await foldersApi.list())
-      setRecent(await activity.recent(40))
       setProblems(await foldersApi.problems())
-      setStatus(await queueApi.status())
+      onChanged?.()
     } catch (e) {
       setError(asAppError(e).message)
     }
-  }, [])
+  }, [onChanged])
 
   useEffect(() => {
     void refresh()
   }, [refresh])
 
-  // A decision can land minutes after the write that triggered the wait, long
-  // after any request the UI made would have returned — so it is pushed. The
-  // payload is not rendered directly; the ledger is the one source that knows a
-  // file's current state, and this just tells us to read it again.
-  useEffect(() => {
-    const stop = listen('firesync://decision', () => {
-      void refresh()
-    })
-    return () => {
-      void stop.then((fn) => fn())
-    }
-  }, [refresh])
-
-  // Upload outcomes are pushed as they resolve; a queue that only updated when
-  // the window was open would be a queue nobody could trust.
+  // The design shows the file being sent on the card it came from, so progress
+  // is tracked per folder here rather than only in the activity feed.
   useEffect(() => {
     const stop = listen<UploadEvent>('firesync://upload', (event) => {
-      const { path, landedAs, removedLocal, state, sent, size } = event.payload
-
-      // Progress arrives every half second while a file is in flight. It is
-      // deliberately not a refresh: re-reading the ledger at that rate would be
-      // pointless work, since the row does not change until the upload ends.
+      const { path, state, sent, size } = event.payload
+      const folder = list.find((f) => path.startsWith(f.path))
+      if (!folder) return
       if (state === 'uploading') {
-        setSending((prev) => ({ ...prev, [path]: size > 0 ? sent / size : 0 }))
+        setInFlight((prev) => ({
+          ...prev,
+          [folder.id]: {
+            name: path.split(/[\\/]/).pop() ?? path,
+            fraction: size > 0 ? sent / size : 0,
+          },
+        }))
         return
       }
-
-      setSending((prev) => {
+      setInFlight((prev) => {
         const next = { ...prev }
-        delete next[path]
+        delete next[folder.id]
         return next
       })
-      const note = [landedAs, removedLocal].filter(Boolean).join(' · ')
-      if (note) setLandings((prev) => ({ ...prev, [path]: note }))
       void refresh()
     })
     return () => {
       void stop.then((fn) => fn())
     }
-  }, [refresh])
+  }, [list, refresh])
 
-  // A backoff resolves on a timer with no event behind it, so the counts need a
-  // slow tick to stay honest while files are waiting.
   useEffect(() => {
-    const t = setInterval(() => void refresh(), 5000)
-    return () => clearInterval(t)
+    const stop = listen('firesync://decision', () => void refresh())
+    return () => {
+      void stop.then((fn) => fn())
+    }
   }, [refresh])
 
   return (
     <div className="page">
       <header className="page__head">
-        <div>
+        <div className="page__headtext">
           <h1 className="page__title">Watched folders</h1>
           <p className="page__sub">
-            New clips dropped in these folders are picked up on their own. Files already there stay
-            put until you ask for them.
+            New clips and screenshots dropped in these folders get uploaded on their own.
           </p>
         </div>
-        <button type="button" className="btn btn--primary" onClick={() => setEditing('new')}>
+        <button
+          type="button"
+          className="btn btn--primary btn--icon"
+          onClick={() => setEditing('new')}
+        >
+          <PlusIcon />
           Add folder
         </button>
       </header>
-
-      {status?.paused && (
-        <div className="banner banner--bad banner--row">
-          <span>{status.pauseReason ?? 'Uploads are paused.'}</span>
-          <span className="spacer" />
-          <button
-            type="button"
-            className="btn btn--ghost btn--sm"
-            onClick={() => queueApi.resume().then(refresh)}
-          >
-            Resume
-          </button>
-        </div>
-      )}
-
-      {status && !status.paused && (status.queued > 0 || status.uploading > 0 || status.failed > 0) && (
-        <div className="statusbar">
-          <span>
-            <strong>{status.uploading}</strong> uploading
-          </span>
-          <span>
-            <strong>{status.queued}</strong> queued
-          </span>
-          {status.failed > 0 && (
-            <span className="statusbar__bad">
-              <strong>{status.failed}</strong> need attention
-            </span>
-          )}
-          <span className="spacer" />
-          <button
-            type="button"
-            className="btn btn--ghost btn--sm"
-            onClick={() => queueApi.pause().then(refresh)}
-          >
-            Pause all
-          </button>
-          {status.failed > 0 && (
-            <button
-              type="button"
-              className="btn btn--primary btn--sm"
-              onClick={() => queueApi.retryFailed().then(refresh)}
-            >
-              Retry failed
-            </button>
-          )}
-        </div>
-      )}
 
       {error && <div className="banner banner--bad">{error}</div>}
       {problems.map((p) => (
@@ -196,133 +155,121 @@ export function Folders({ options }: Props) {
       )}
 
       <div className="cards">
-        {list.map((folder) => (
-          <article key={folder.id} className="card">
-            <div className="card__head">
-              <span className={`dot ${folder.enabled ? 'dot--ok' : 'dot--off'}`} />
-              <span className="mono card__path">{folder.path}</span>
-              <span className={`pill ${folder.enabled ? 'pill--ok' : ''}`}>
-                {folder.enabled ? 'Watching' : 'Paused'}
-              </span>
-              <span className="spacer" />
-              <button
-                type="button"
-                className="btn btn--ghost btn--sm"
-                onClick={() =>
-                  foldersApi.setEnabled(folder.id, !folder.enabled).then(refresh).catch(() => {})
-                }
-              >
-                {folder.enabled ? 'Pause' : 'Resume'}
-              </button>
-              <button
-                type="button"
-                className="btn btn--ghost btn--sm"
-                onClick={() => setEditing(folder)}
-              >
-                Edit
-              </button>
-              {folder.presentCount > 0 && (
+        {list.map((folder) => {
+          const flight = inFlight[folder.id]
+          const failed = countOf(folder, 'failed')
+          const lastUpload = ago(folder.lastUploadAt ?? 0)
+          return (
+            <article key={folder.id} className={`fcard ${flight ? 'fcard--live' : ''}`}>
+              <div className="fcard__head">
+                <span
+                  className={`dot ${!folder.enabled ? 'dot--off' : flight ? 'dot--live' : 'dot--ok'}`}
+                />
+                <span className="mono fcard__path">{folder.path}</span>
+                <span className={`pill ${!folder.enabled ? '' : flight ? 'pill--live' : 'pill--ok'}`}>
+                  {!folder.enabled ? 'Paused' : flight ? 'Uploading' : 'Watching'}
+                </span>
+                <span className="spacer" />
                 <button
                   type="button"
-                  className="btn btn--ghost btn--sm"
-                  onClick={() => setBacklogFor(folder)}
+                  className="iconbtn"
+                  aria-label={folder.enabled ? 'Pause this folder' : 'Resume this folder'}
+                  onClick={() =>
+                    foldersApi.setEnabled(folder.id, !folder.enabled).then(refresh).catch(() => {})
+                  }
                 >
-                  Upload existing…
+                  {folder.enabled ? <PauseIcon /> : <PlayIcon />}
                 </button>
-              )}
-              <button
-                type="button"
-                className="btn btn--ghost btn--sm"
-                onClick={() => foldersApi.remove(folder.id).then(refresh).catch(() => {})}
-              >
-                Remove
-              </button>
-            </div>
+                <button
+                  type="button"
+                  className="iconbtn"
+                  aria-label="Folder settings"
+                  onClick={() => setEditing(folder)}
+                >
+                  <PencilIcon />
+                </button>
+                {folder.presentCount > 0 && (
+                  <button
+                    type="button"
+                    className="iconbtn"
+                    aria-label="Upload files already in this folder"
+                    onClick={() => setBacklogFor(folder)}
+                  >
+                    <UploadIcon />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="iconbtn"
+                  aria-label="Stop watching this folder"
+                  onClick={() => foldersApi.remove(folder.id).then(refresh).catch(() => {})}
+                >
+                  <TrashIcon />
+                </button>
+              </div>
 
-            <div className="chips chips--tight">
-              {folder.dest_folder && <span className="tag mono">{folder.dest_folder}</span>}
-              {folder.game && <span className="tag tag--game">{folder.game}</span>}
-              <span className="tag">{folder.media.includes('image') ? 'Video + images' : 'Video only'}</span>
-              {folder.min_size_bytes && (
-                <span className="tag">Over {humanSize(folder.min_size_bytes)}</span>
-              )}
-              {folder.include_subfolders && <span className="tag">Subfolders</span>}
-            </div>
-
-            <div className="card__foot">
-              <span>
-                <strong>{countOf(folder, 'done')}</strong> uploaded
-              </span>
-              <span>
-                <strong>{countOf(folder, 'queued')}</strong> queued
-              </span>
-              <span>
-                <strong>{countOf(folder, 'skipped')}</strong> skipped
-              </span>
-              {countOf(folder, 'failed') > 0 && (
-                <span className="card__foot-bad">
-                  <strong>{countOf(folder, 'failed')}</strong> need attention
+              <div className="chips chips--tight">
+                {folder.dest_folder && <span className="tag mono">{folder.dest_folder}</span>}
+                {folder.game && <span className="tag tag--game">{folder.game}</span>}
+                <span className="tag">
+                  {folder.media.includes('image') && folder.media.includes('video')
+                    ? 'Video + images'
+                    : folder.media.includes('image')
+                      ? 'Images only'
+                      : 'Video only'}
                 </span>
-              )}
-              <span>
-                <strong>{folder.presentCount}</strong>{' '}
-                {folder.presentCount === 1 ? 'file here' : 'files here'}
-              </span>
-            </div>
-          </article>
-        ))}
-      </div>
-
-      <section className="panel">
-        <h2 className="panel__title">
-          Activity
-          <span className="panel__hint">
-            what the watcher settled on and what the server said — live
-          </span>
-        </h2>
-        {recent.length === 0 ? (
-          <p className="panel__empty">
-            Nothing yet. Drop a file into a watched folder and it appears here once it stops being
-            written.
-          </p>
-        ) : (
-          <ul className="rows">
-            {recent.slice(0, 25).map((r) => {
-              const fraction = sending[r.path]
-              const inFlight = fraction !== undefined
-              return (
-                <li key={r.id} className="row">
-                  <span className={`badge badge--${inFlight ? 'uploading' : r.state}`}>
-                    {inFlight ? 'uploading' : r.state}
+                {sizeRule(folder) && <span className="tag">{sizeRule(folder)}</span>}
+                {folder.include_subfolders && <span className="tag">Subfolders</span>}
+                {folder.after_upload !== 'keep' && (
+                  <span className="tag">
+                    {folder.after_upload === 'trash' ? 'Trash after upload' : 'Delete after upload'}
                   </span>
-                  <span className="mono row__path">{basename(r.path)}</span>
-                  {folderName(r.folderId) && (
-                    <span className="row__folder">{folderName(r.folderId)}</span>
-                  )}
-                  <span className="spacer" />
-                  {inFlight ? (
-                    <>
-                      <span className="row__bar" aria-hidden="true">
-                        <span
-                          className="row__bar-fill"
-                          style={{ width: `${Math.min(100, Math.round(fraction * 100))}%` }}
-                        />
-                      </span>
-                      <span className="row__meta row__pct">
-                        {Math.min(100, Math.round(fraction * 100))}%
-                      </span>
-                    </>
-                  ) : (
-                    landings[r.path] && <span className="row__meta mono">{landings[r.path]}</span>
-                  )}
-                  <span className="row__meta">{humanSize(r.size)}</span>
-                  {!inFlight && r.reason && <span className="row__reason">{r.reason}</span>}
-                </li>
-              )
-            })}
-          </ul>
-        )}
-      </section>
+                )}
+              </div>
+
+              {flight ? (
+                <div className="fcard__progress">
+                  <div className="fcard__progresshead">
+                    <span className="mono">{flight.name}</span>
+                    <span className="spacer" />
+                    <span>{Math.min(100, Math.round(flight.fraction * 100))}%</span>
+                  </div>
+                  <div className="fcard__bar">
+                    <div
+                      className="fcard__bar-fill"
+                      style={{ width: `${Math.min(100, Math.round(flight.fraction * 100))}%` }}
+                    />
+                  </div>
+                </div>
+              ) : failed > 0 ? (
+                <div className="fcard__warn">
+                  <WarningTriangleIcon />
+                  <span>
+                    {failed} upload{failed === 1 ? '' : 's'} need{failed === 1 ? 's' : ''} attention.
+                  </span>
+                </div>
+              ) : null}
+
+              <div className="fcard__foot">
+                <span>
+                  <strong>{countOf(folder, 'done')}</strong> uploaded
+                </span>
+                <span>
+                  <strong>{countOf(folder, 'queued')}</strong> queued
+                </span>
+                <span>
+                  <strong>{countOf(folder, 'skipped')}</strong> skipped
+                </span>
+                <span>
+                  <strong>{folder.presentCount}</strong> here now
+                </span>
+                <span className="spacer" />
+                {lastUpload && <span>Last upload {lastUpload}</span>}
+              </div>
+            </article>
+          )
+        })}
+      </div>
 
       {editing && (
         <FolderDialog
@@ -334,11 +281,7 @@ export function Folders({ options }: Props) {
       )}
 
       {backlogFor && (
-        <Backlog
-          folder={backlogFor}
-          onClose={() => setBacklogFor(null)}
-          onQueued={refresh}
-        />
+        <Backlog folder={backlogFor} onClose={() => setBacklogFor(null)} onQueued={refresh} />
       )}
     </div>
   )

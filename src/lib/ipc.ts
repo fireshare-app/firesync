@@ -123,6 +123,8 @@ export interface FolderSummary extends WatchedFolder {
   counts: [string, number][]
   /** Media files in the folder right now, counted from disk. */
   presentCount: number
+  /** Unix seconds when something from this folder last reached the server. */
+  lastUploadAt: number | null
 }
 
 export interface FolderRules {
