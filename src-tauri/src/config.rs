@@ -125,6 +125,14 @@ pub struct Settings {
     /// Normalised base URL. The token that goes with it lives in the keychain.
     #[serde(default)]
     pub server_url: Option<String>,
+    /// What the server last said about this token.
+    ///
+    /// Kept so a launch that cannot reach the server can still open the app
+    /// somebody has already set up. Being unable to re-check a token is not the
+    /// same as the token being wrong, and treating it as such asked people to
+    /// enter credentials that were never lost.
+    #[serde(default)]
+    pub last_check: Option<crate::api::discovery::TokenCheck>,
     #[serde(default)]
     pub folders: Vec<WatchedFolder>,
     #[serde(default)]
@@ -181,6 +189,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             server_url: None,
+            last_check: None,
             folders: Vec::new(),
             notifications: NotificationSettings::default(),
             transfers: TransferSettings::default(),

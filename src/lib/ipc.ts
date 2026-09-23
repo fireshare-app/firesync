@@ -37,6 +37,10 @@ export interface TokenCheck {
 export interface Connection {
   serverUrl: string
   check: TokenCheck
+  /** False when these are the server's last answers rather than fresh ones. */
+  verified: boolean
+  /** Why the server could not be re-checked, when it could not. */
+  problem: string | null
 }
 
 export interface Game {

@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import App from './App'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { TrayPanel } from './views/TrayPanel'
 import './styles.css'
 
@@ -10,5 +11,7 @@ const isTray = getCurrentWindow().label === 'tray'
 if (isTray) document.documentElement.classList.add('is-tray')
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
-  <React.StrictMode>{isTray ? <TrayPanel /> : <App />}</React.StrictMode>,
+  <React.StrictMode>
+    <ErrorBoundary>{isTray ? <TrayPanel /> : <App />}</ErrorBoundary>
+  </React.StrictMode>,
 )

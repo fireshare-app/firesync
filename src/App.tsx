@@ -38,14 +38,27 @@ export default function App() {
   // A stored connection is re-checked on launch rather than trusted: the token
   // may have been revoked, or the account may have lost its upload permission,
   // since the last run. Either way the server decides, not the config file.
-  useEffect(() => {
+  const [connectError, setConnectError] = useState<string | null>(null)
+
+  const checkConnection = useCallback(() => {
+    setConnectError(null)
     api
       .connectionStatus()
       .then((connection) =>
         setPhase(connection ? { status: 'connected', connection } : { status: 'disconnected' }),
       )
-      .catch(() => setPhase({ status: 'disconnected' }))
+      // Only a server that actually answered "no" reaches here now, so this is
+      // a real reconnect — but say which one it was rather than presenting an
+      // empty form and letting somebody assume they lost their token.
+      .catch((e) => {
+        setConnectError(asAppError(e).message)
+        setPhase({ status: 'disconnected' })
+      })
   }, [])
+
+  useEffect(() => {
+    checkConnection()
+  }, [checkConnection])
 
   useEffect(() => {
     if (phase.status !== 'connected') return
@@ -105,6 +118,15 @@ export default function App() {
     return (
       <div className="frame">
         <TitleBar />
+        {connectError && (
+          <div className="banner banner--bad banner--top">
+            {connectError}
+            <span className="spacer" />
+            <button type="button" className="btn btn--ghost" onClick={checkConnection}>
+              Try again
+            </button>
+          </div>
+        )}
         <Connect onConnected={(connection) => setPhase({ status: 'connected', connection })} />
       </div>
     )
@@ -115,6 +137,16 @@ export default function App() {
   return (
     <div className="frame">
       <TitleBar />
+      {!connection.verified && (
+        <div className="banner banner--warn banner--top">
+          Showing what {connection.serverUrl} last told us — it could not be reached just now
+          {connection.problem ? `: ${connection.problem}` : '.'} Uploads carry on regardless.
+          <span className="spacer" />
+          <button type="button" className="btn btn--ghost" onClick={checkConnection}>
+            Try again
+          </button>
+        </div>
+      )}
       <div className="app">
       <aside className="sidebar">
         <div className="sidebar__brand">
