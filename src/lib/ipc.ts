@@ -125,8 +125,7 @@ export interface FolderSummary extends WatchedFolder {
   presentCount: number
 }
 
-export interface NewFolder {
-  path: string
+export interface FolderRules {
   includeSubfolders?: boolean
   media?: MediaKind[]
   destFolder?: string | null
@@ -134,6 +133,10 @@ export interface NewFolder {
   minSizeBytes?: number | null
   maxSizeBytes?: number | null
   afterUpload?: AfterUpload
+}
+
+export interface NewFolder extends FolderRules {
+  path: string
   uploadExisting?: boolean
 }
 
@@ -155,6 +158,7 @@ export const folders = {
     invoke<void>('set_folder_enabled', { id, enabled }),
   setAfterUpload: (id: string, afterUpload: AfterUpload) =>
     invoke<void>('set_folder_after_upload', { id, afterUpload }),
+  update: (id: string, rules: FolderRules) => invoke<void>('update_folder', { id, rules }),
   uploadExisting: (folderId: string, paths: string[]) =>
     invoke<number>('upload_existing', { folderId, paths }),
   problems: () => invoke<string[]>('watcher_problems'),

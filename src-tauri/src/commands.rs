@@ -295,6 +295,60 @@ pub async fn set_folder_enabled(
     Ok(())
 }
 
+/// The rules for a folder, as the dialog edits them.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderRules {
+    #[serde(default)]
+    pub include_subfolders: bool,
+    #[serde(default)]
+    pub media: Vec<MediaKind>,
+    #[serde(default)]
+    pub dest_folder: Option<String>,
+    #[serde(default)]
+    pub game: Option<String>,
+    #[serde(default)]
+    pub min_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub after_upload: AfterUpload,
+}
+
+/// Change a folder's rules in place.
+///
+/// The path is not editable: it is the folder's identity, and the ledger keys
+/// every file it has seen against it. Pointing an existing folder somewhere else
+/// would inherit another directory's history, so that is a new folder.
+///
+/// Rules apply from now on. Files already decided keep their verdict — a floor
+/// lowered after the fact does not retroactively un-skip anything, which is
+/// what the backlog picker is for.
+#[tauri::command]
+pub async fn update_folder(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    rules: FolderRules,
+) -> Result<()> {
+    let mut next = state.snapshot();
+    let Some(folder) = next.folders.iter_mut().find(|f| f.id == id) else {
+        return Err(AppError::Storage("That folder is not being watched.".into()));
+    };
+
+    folder.include_subfolders = rules.include_subfolders;
+    folder.media = if rules.media.is_empty() { vec![MediaKind::Video] } else { rules.media };
+    folder.dest_folder = rules.dest_folder.filter(|s| !s.trim().is_empty());
+    folder.game = rules.game.filter(|s| !s.trim().is_empty());
+    folder.min_size_bytes = rules.min_size_bytes.filter(|n| *n > 0);
+    folder.max_size_bytes = rules.max_size_bytes.filter(|n| *n > 0);
+    folder.after_upload = rules.after_upload;
+
+    state.persist(next)?;
+    // Recursion may have been turned on or off, which changes what is watched.
+    state.resync_watchers();
+    Ok(())
+}
+
 /// Change what happens to a file after it uploads, without rebuilding the
 /// folder. Destructive enough that it should be visible and reversible on the
 /// card rather than buried in a config file.

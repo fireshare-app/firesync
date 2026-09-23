@@ -459,3 +459,31 @@ select {
 .pick__when { width: 120px; text-align: right; color: var(--text-muted); font-size: 11.5px; }
 .pick__status { width: 132px; text-align: right; font-size: 11.5px; color: var(--text-muted); }
 .pick--on .pick__status { color: var(--accent-light); font-weight: 600; }
+
+/* Folder dialog -------------------------------------------------------- */
+
+.modal__box--narrow { max-width: 660px; }
+.modal__body { flex-grow: 1; overflow-y: auto; padding: 18px 22px; display: flex; flex-direction: column; gap: 18px; }
+.modal__body .field { margin-top: 0; }
+.field__fixed { margin: 0; font-size: 12.5px; color: var(--text-dim); background: var(--panel-sunken); border: 1px solid var(--border-soft); border-radius: 7px; padding: 10px 12px; overflow-wrap: anywhere; }
+.field__optional { font-weight: 400; color: var(--text-muted); }
+.field__warn { font-size: 11.5px; color: var(--warn); line-height: 1.45; }
+.field select,
+.field input[type='text'] { background: var(--panel-sunken); border: 1px solid var(--border); border-radius: 7px; color: var(--text); font-size: 12.5px; padding: 9px 11px; }
+.field select:focus, .field input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.inline-check { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-dim); cursor: pointer; margin-top: 4px; }
+.inline-check input { width: 15px; height: 15px; accent-color: var(--accent); margin: 0; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+.choice { display: flex; align-items: flex-start; gap: 9px; border: 1px solid var(--border); background: var(--panel-sunken); border-radius: 8px; padding: 11px 13px; cursor: pointer; }
+.choice--on { border-color: #265d97; background: #10314f; }
+.choice input { width: 15px; height: 15px; accent-color: var(--accent); margin: 2px 0 0; flex-shrink: 0; }
+.choice > span { display: flex; flex-direction: column; gap: 3px; }
+.choice__name { font-size: 13px; font-weight: 600; color: var(--text); }
+.choice__types { font-size: 11px; color: var(--text-muted); line-height: 1.45; }
+
+.limit { display: flex; flex-direction: column; gap: 6px; }
+.limit > label { font-size: 12px; color: var(--text-dim); }
+.limit__input { display: flex; align-items: center; gap: 8px; }
+.limit__input input { width: 84px; background: var(--panel-sunken); border: 1px solid var(--border); border-radius: 7px; color: var(--text); font-family: var(--mono); font-size: 13px; padding: 9px 11px; text-align: right; }
+.limit__input span { font-size: 12.5px; color: var(--text-dim); }

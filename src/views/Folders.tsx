@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { open } from '@tauri-apps/plugin-dialog'
 import { Backlog } from './Backlog'
+import { FolderDialog } from './FolderDialog'
 import { listen } from '@tauri-apps/api/event'
 import {
   activity,
@@ -9,8 +9,6 @@ import {
   queue as queueApi,
   type FileRow,
   type FolderSummary,
-  type AfterUpload,
-  type MediaKind,
   type QueueStatus,
   type UploadEvent,
   type UploadOptions,
@@ -46,9 +44,7 @@ export function Folders({ options }: Props) {
   const [landings, setLandings] = useState<Record<string, string>>({})
   const [sending, setSending] = useState<Record<string, number>>({})
   const [error, setError] = useState<string | null>(null)
-  const [adding, setAdding] = useState(false)
-  const [composing, setComposing] = useState(false)
-  const [draftPath, setDraftPath] = useState('')
+  const [editing, setEditing] = useState<FolderSummary | 'new' | null>(null)
   const [backlogFor, setBacklogFor] = useState<FolderSummary | null>(null)
 
   // Same filename in two watched folders is ordinary — a move between them
@@ -124,45 +120,6 @@ export function Folders({ options }: Props) {
     return () => clearInterval(t)
   }, [refresh])
 
-  async function browse() {
-    setError(null)
-    try {
-      const picked = await open({ directory: true, multiple: false, title: 'Watch a folder' })
-      if (typeof picked === 'string') setDraftPath(picked)
-    } catch (e) {
-      // The picker can be unavailable or restricted — on macOS an unsigned dev
-      // build has no TCC identity, so protected folders are simply disabled.
-      // Typing a path still works, so say so rather than dead-ending.
-      setError(
-        `${asAppError(e).message} You can paste the folder path instead.`,
-      )
-    }
-  }
-
-  async function commit() {
-    const path = draftPath.trim()
-    if (!path) return
-    setError(null)
-    setAdding(true)
-    try {
-      await foldersApi.add({
-        path,
-        includeSubfolders: false,
-        media: ['video'] as MediaKind[],
-        destFolder: options?.default_folder ?? null,
-        minSizeBytes: 5 * MB,
-        uploadExisting: false,
-      })
-      setDraftPath('')
-      setComposing(false)
-      await refresh()
-    } catch (e) {
-      setError(asAppError(e).message)
-    } finally {
-      setAdding(false)
-    }
-  }
-
   return (
     <div className="page">
       <header className="page__head">
@@ -173,51 +130,10 @@ export function Folders({ options }: Props) {
             put until you ask for them.
           </p>
         </div>
-        <button
-          type="button"
-          className="btn btn--primary"
-          onClick={() => setComposing((v) => !v)}
-          disabled={adding}
-        >
+        <button type="button" className="btn btn--primary" onClick={() => setEditing('new')}>
           Add folder
         </button>
       </header>
-
-      {composing && (
-        <form
-          className="addbar"
-          onSubmit={(e) => {
-            e.preventDefault()
-            void commit()
-          }}
-        >
-          <label className="addbar__label" htmlFor="newpath">
-            Folder on this machine
-          </label>
-          <div className="addbar__row">
-            <input
-              id="newpath"
-              type="text"
-              className="addbar__input mono"
-              placeholder="/Users/you/Movies/clips"
-              spellCheck={false}
-              autoFocus
-              value={draftPath}
-              onChange={(e) => setDraftPath(e.target.value)}
-            />
-            <button type="button" className="btn btn--ghost" onClick={browse}>
-              Browse…
-            </button>
-            <button type="submit" className="btn btn--primary" disabled={adding || !draftPath.trim()}>
-              {adding ? 'Adding…' : 'Watch it'}
-            </button>
-          </div>
-          <span className="addbar__hint">
-            Paste a path if the picker will not let you reach the folder — a network share, or a
-            location macOS has not granted access to.
-          </span>
-        </form>
-      )}
 
       {status?.paused && (
         <div className="banner banner--bad banner--row">
@@ -298,6 +214,13 @@ export function Folders({ options }: Props) {
               >
                 {folder.enabled ? 'Pause' : 'Resume'}
               </button>
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm"
+                onClick={() => setEditing(folder)}
+              >
+                Edit
+              </button>
               {folder.presentCount > 0 && (
                 <button
                   type="button"
@@ -324,29 +247,6 @@ export function Folders({ options }: Props) {
                 <span className="tag">Over {humanSize(folder.min_size_bytes)}</span>
               )}
               {folder.include_subfolders && <span className="tag">Subfolders</span>}
-            </div>
-
-            <div className="card__after">
-              <label htmlFor={`after-${folder.id}`}>After a successful upload</label>
-              <select
-                id={`after-${folder.id}`}
-                value={folder.after_upload}
-                onChange={(e) =>
-                  foldersApi
-                    .setAfterUpload(folder.id, e.target.value as AfterUpload)
-                    .then(refresh)
-                    .catch((err) => setError(asAppError(err).message))
-                }
-              >
-                <option value="keep">Keep the local file</option>
-                <option value="trash">Move it to the trash</option>
-                <option value="delete">Delete it</option>
-              </select>
-              {folder.after_upload !== 'keep' && (
-                <span className="card__after-note">
-                  Only once Fireshare confirms it has the file.
-                </span>
-              )}
             </div>
 
             <div className="card__foot">
@@ -423,6 +323,15 @@ export function Folders({ options }: Props) {
           </ul>
         )}
       </section>
+
+      {editing && (
+        <FolderDialog
+          folder={editing === 'new' ? undefined : editing}
+          options={options}
+          onClose={() => setEditing(null)}
+          onSaved={refresh}
+        />
+      )}
 
       {backlogFor && (
         <Backlog

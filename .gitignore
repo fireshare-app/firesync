@@ -26,3 +26,7 @@ dist-ssr
 # Planning and design notes, kept out of the published repository
 PLAN.md
 STACK.md
+
+# UI harness, local only
+harness
+vite.harness.config.ts

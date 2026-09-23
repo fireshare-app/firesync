@@ -135,6 +135,7 @@ pub fn run() {
             commands::remove_folder,
             commands::set_folder_enabled,
             commands::set_folder_after_upload,
+            commands::update_folder,
             commands::list_folders,
             commands::upload_existing,
             commands::list_backlog,
