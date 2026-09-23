@@ -1,2 +1,2 @@
-- Settings has a "What's new" button next to the version. It opens the full release history, newest first, so you can read what changed in this version and catch up on any you skipped
-- Each entry links out to its page on GitHub if you want the full detail
+- First stable release. Firesync has been running against a live instance through five preview builds, and everything it advertises now works end to end
+- Nothing to do if you are already on 0.1.5 — this is the same app with a version number that means something, plus a README that explains it to people who have not met it yet
