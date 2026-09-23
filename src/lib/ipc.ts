@@ -219,6 +219,8 @@ export interface UploadEvent {
   url: string | null
   landedAs: string | null
   removedLocal: string | null
+  /** Current upload speed in bytes per second, on an `uploading` event. */
+  bytesPerSecond: number | null
 }
 
 export interface QueueStatus {

@@ -9,6 +9,7 @@ import {
   UploadIcon,
   WarningTriangleIcon,
 } from '../components/Icons'
+import { humanRate } from '../lib/format'
 import { Backlog } from './Backlog'
 import { FolderDialog } from './FolderDialog'
 import {
@@ -69,6 +70,8 @@ interface InFlight {
   folderId: string
   name: string
   fraction: number
+  /** Bytes per second, as measured by the queue. */
+  rate: number | null
 }
 
 export function Folders({ options, onChanged }: Props) {
@@ -97,7 +100,7 @@ export function Folders({ options, onChanged }: Props) {
   // is tracked per folder here rather than only in the activity feed.
   useEffect(() => {
     const stop = listen<UploadEvent>('firesync://upload', (event) => {
-      const { path, state, sent, size } = event.payload
+      const { path, state, sent, size, bytesPerSecond } = event.payload
       const folder = list.find((f) => path.startsWith(f.path))
       if (!folder) return
       if (state === 'uploading') {
@@ -107,6 +110,7 @@ export function Folders({ options, onChanged }: Props) {
             folderId: folder.id,
             name: path.split(/[\\/]/).pop() ?? path,
             fraction: size > 0 ? sent / size : 0,
+            rate: bytesPerSecond,
           },
         }))
         return
@@ -245,8 +249,13 @@ export function Folders({ options, onChanged }: Props) {
                     return (
                       <div key={path} className="fcard__progress">
                         <div className="fcard__progresshead">
-                          <span className="mono">{flight.name}</span>
+                          <span className="mono fcard__flightname" title={flight.name}>
+                            {flight.name}
+                          </span>
                           <span className="spacer" />
+                          {flight.rate !== null && flight.rate > 0 && (
+                            <span className="mono fcard__rate">{humanRate(flight.rate)}</span>
+                          )}
                           <span>{pct}%</span>
                         </div>
                         <div className="fcard__bar">

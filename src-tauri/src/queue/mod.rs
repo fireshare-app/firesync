@@ -37,6 +37,12 @@ pub struct UploadEvent {
     /// Set when the local copy was removed afterwards, so the UI can say so
     /// rather than leaving somebody to notice their folder emptying by itself.
     pub removed_local: Option<String>,
+    /// How fast this file is currently going up, on an `uploading` event.
+    ///
+    /// Measured here rather than in the webview because two views show it and
+    /// both should agree, and because the raw figure needs smoothing before it
+    /// is fit to read.
+    pub bytes_per_second: Option<i64>,
 }
 
 /// Shared run/stop control for the whole queue.
@@ -425,6 +431,7 @@ async fn run_one<F>(
                         url: answer.url,
                         landed_as: None,
                         removed_local: removed,
+                        bytes_per_second: None,
                     });
                     return;
                 }
@@ -444,18 +451,42 @@ async fn run_one<F>(
         let id = claim.id;
         let size = claim.size;
         tauri::async_runtime::spawn(async move {
+            let mut last_sent = 0u64;
+            let mut last_at = std::time::Instant::now();
+            // Half a second of a real network is far too noisy to put in front
+            // of somebody: a chunk boundary or a stalled window would have the
+            // number leaping about. Smoothed towards the latest reading rather
+            // than averaged over the whole upload, so it still follows a genuine
+            // change in speed within a second or two.
+            let mut smoothed: Option<f64> = None;
+
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let sent = progress.load(std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(last_at).as_secs_f64();
+                if elapsed > 0.0 {
+                    let rate = sent.saturating_sub(last_sent) as f64 / elapsed;
+                    smoothed = Some(match smoothed {
+                        Some(previous) => previous * 0.7 + rate * 0.3,
+                        None => rate,
+                    });
+                }
+                last_sent = sent;
+                last_at = now;
+
                 on_event(UploadEvent {
                     id,
                     path: path_str.clone(),
                     size,
-                    sent: progress.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                    sent: sent as i64,
                     state: "uploading".into(),
                     reason: None,
                     url: None,
                     landed_as: None,
                     removed_local: None,
+                    bytes_per_second: smoothed.map(|r| r.round() as i64),
                 });
             }
         })
@@ -534,6 +565,7 @@ async fn run_one<F>(
                 url: None,
                 landed_as: Some(landed),
                 removed_local: removed,
+                bytes_per_second: None,
             });
         }
 
@@ -555,6 +587,7 @@ async fn run_one<F>(
                 url,
                 landed_as: None,
                 removed_local: removed,
+                bytes_per_second: None,
             });
         }
 
@@ -661,6 +694,7 @@ where
         url,
         landed_as: None,
         removed_local: None,
+        bytes_per_second: None,
     });
 }
 

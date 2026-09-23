@@ -1,0 +1,8 @@
+- Files already in your library are found before uploading rather than after, so a clip you have already sent is no longer transferred in full just to be told it was a duplicate
+- Images are checked the same way, which was never possible before — it needs a Fireshare instance running the matching server update
+- Uploads waiting to retry now actually retry. They were being starved behind everything else in the queue, so a file that hit a hiccup could wait hours for its next attempt
+- A file the server will not accept in one request is now sent in chunks instead of failing, which also fixes uploads that were refused as "too large" despite being well within what Fireshare allows
+- A server restarting mid-upload no longer fails the file permanently, and no longer blames it on images being disabled
+- Finished uploads have buttons to copy their link or open them in Fireshare
+- Every upload in flight now shows on its folder card, instead of one entry flickering between them
+- Long filenames are trimmed with the full name on hover, scrollbars are thinner, and Settings has a "Send a test notification" button

@@ -54,6 +54,24 @@ jobs:
 
       - run: npm ci
 
+      # The in-app update dialog reads its "what changed" list from latest.json,
+      # which tauri-action fills from releaseBody — not from the GitHub release
+      # page. A hardcoded string here meant everyone updating saw nothing, so
+      # the notes live in a file that changes with the release.
+      - name: Read the release notes
+        id: notes
+        shell: bash
+        run: |
+          {
+            echo 'body<<FIRESYNC_NOTES_EOF'
+            if [ -s RELEASE_NOTES.md ]; then
+              cat RELEASE_NOTES.md
+            else
+              echo 'See the assets below to download and install.'
+            fi
+            echo 'FIRESYNC_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +82,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Firesync ${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download and install.'
+          releaseBody: ${{ steps.notes.outputs.body }}
           # Published as a draft so a release can be read before it becomes the
           # thing every installed copy updates itself to.
           releaseDraft: true
