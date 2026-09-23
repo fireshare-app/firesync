@@ -65,6 +65,13 @@ impl AppState {
         self.persist(next)
     }
 
+    /// Change one part of the settings and write them back.
+    fn mutate(&self, edit: impl FnOnce(&mut Settings)) -> Result<()> {
+        let mut next = self.snapshot();
+        edit(&mut next);
+        self.persist(next)
+    }
+
     fn persist(&self, next: Settings) -> Result<()> {
         config::save(&self.app_data_dir, &next)?;
         *self.settings.lock().expect("settings mutex poisoned") = next;
@@ -136,6 +143,11 @@ impl AppState {
 pub struct Connection {
     pub server_url: String,
     pub check: TokenCheck,
+    /// Whether the server confirmed this just now, or whether these are the last
+    /// answers it gave and could not be re-checked.
+    pub verified: bool,
+    /// Why it could not be re-checked, when it could not.
+    pub problem: Option<String>,
 }
 
 /// Validate a URL and token, and keep them only if they actually work.
@@ -163,30 +175,72 @@ pub async fn connect(
     state.token.set(&token)?;
     let mut next = state.snapshot();
     next.server_url = Some(base_url.clone());
+    next.last_check = Some(check.clone());
     state.persist(next)?;
 
     // A working token is exactly the signal that clears an auth pause: the
     // queue stopped because the credential was bad, and it no longer is.
     state.queue.resume();
 
-    Ok(Connection { server_url: base_url, check })
+    Ok(Connection { server_url: base_url, check, verified: true, problem: None })
+}
+
+/// Whether this failure means somebody has to reconnect, or only that we could
+/// not ask right now.
+///
+/// The three that qualify are all the server having answered: the token was
+/// refused, the address is not usable, or whatever is there is not Fireshare.
+/// A timeout, a gateway error or a dropped connection say nothing about the
+/// credentials, and must not be allowed to look as though they do.
+fn needs_reconnect(e: &AppError) -> bool {
+    matches!(e, AppError::TokenRejected(_) | AppError::BadUrl(_) | AppError::NotFireshare(_))
 }
 
 #[tauri::command]
+/// What we know about the configured server, without throwing away a working
+/// setup over one failed request.
+///
+/// The distinction this draws is the whole point. "The server says this token is
+/// no longer valid" means somebody has to reconnect. "I could not reach the
+/// server" means nothing about the token at all — and collapsing the two asked
+/// people to re-enter credentials that were still perfectly good, while the
+/// queue behind the window carried on uploading with them.
 pub async fn connection_status(state: tauri::State<'_, AppState>) -> Result<Option<Connection>> {
-    let Some(server_url) = state.snapshot().server_url else {
+    let settings = state.snapshot();
+    let Some(server_url) = settings.server_url else {
         return Ok(None);
     };
     let Some(token) = state.token.get() else {
         return Ok(None);
     };
 
-    let check = check_token(&server_url, &token).await?;
-    *state.types.lock().expect("types mutex") = SupportedTypes {
-        video: check.supported_video_types.clone(),
-        image: check.supported_image_types.clone(),
-    };
-    Ok(Some(Connection { server_url, check }))
+    match check_token(&server_url, &token).await {
+        Ok(check) => {
+            *state.types.lock().expect("types mutex") = SupportedTypes {
+                video: check.supported_video_types.clone(),
+                image: check.supported_image_types.clone(),
+            };
+            // Remembered so the next launch has something to fall back on.
+            state.mutate(|s| s.last_check = Some(check.clone()))?;
+            Ok(Some(Connection { server_url, check, verified: true, problem: None }))
+        }
+
+        Err(e) if needs_reconnect(&e) => Err(e),
+
+        // Everything else is about reaching the server, not about the token.
+        // Carry on with what it told us last time, and say plainly at the top of
+        // the window that this is what we are doing.
+        Err(e) => match settings.last_check {
+            Some(check) => Ok(Some(Connection {
+                server_url,
+                check,
+                verified: false,
+                problem: Some(e.to_string()),
+            })),
+            // Never successfully connected, so there is nothing to fall back to.
+            None => Err(e),
+        },
+    }
 }
 
 #[tauri::command]
@@ -769,4 +823,25 @@ pub fn open_main_at(app: tauri::AppHandle, tab: String) {
 #[tauri::command]
 pub fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    /// Being unable to reach the server says nothing about the token, and the
+    /// version that treated it as though it did asked people to re-enter
+    /// credentials that were still working — while the queue behind the window
+    /// carried on uploading with them.
+    #[test]
+    fn only_a_real_refusal_asks_somebody_to_reconnect() {
+        assert!(needs_reconnect(&AppError::TokenRejected("gone".into())));
+        assert!(needs_reconnect(&AppError::BadUrl("nope".into())));
+        assert!(needs_reconnect(&AppError::NotFireshare("something else".into())));
+
+        assert!(!needs_reconnect(&AppError::Unreachable("timed out".into())));
+        assert!(!needs_reconnect(&AppError::Server("502".into())));
+        assert!(!needs_reconnect(&AppError::Throttled("slow down".into())));
+        assert!(!needs_reconnect(&AppError::Keychain("locked".into())));
+    }
 }
