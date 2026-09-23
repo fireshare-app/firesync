@@ -50,15 +50,38 @@ pub fn run() {
             let first_run = config::is_first_run(&app_data_dir);
 
             let (state, rx) = AppState::new(app_data_dir)?;
+
+            // Managing the state is the very first thing done with it, because
+            // the window is already up by the time setup runs and its first IPC
+            // call was arriving before this line. Everything below took long
+            // enough — opening the ledger, reading the keychain, starting two
+            // loops — that `connection_status` could land in the gap and come
+            // back "state not managed", which the window then had no choice but
+            // to read as a connection that no longer worked.
+            //
+            // `manage` takes ownership, so the handles the loops need are taken
+            // first. They are all Arcs; these are clones of the handle, not of
+            // anything behind it.
             let ledger = state.ledger.clone();
             let settings = state.settings.clone();
             let types = state.types.clone();
+            let queue_ledger = state.ledger.clone();
+            let queue_settings = state.settings.clone();
+            let queue_control = state.queue.clone();
+            let queue_token = state.token.clone();
+            let queue_rules = state.folder_rules.clone();
+            let queue_types = state.types.clone();
+
+            let notifier = notify::Notifier::new(app.handle().clone(), settings.clone());
+            app.manage(notifier.clone());
+            app.manage(state);
+
+            // Before anything watches or scans, so both see the same spelling.
+            app.state::<AppState>().tidy_stored_paths();
 
             // Decisions are pushed rather than polled: a clip can settle minutes
             // after the event that started the wait, long after any request the
             // UI made would have returned.
-            let notifier = notify::Notifier::new(app.handle().clone(), state.settings.clone());
-
             let handle = app.handle().clone();
             watcher::spawn_event_loop(
                 rx,
@@ -77,12 +100,12 @@ pub fn run() {
             let queue_handle = app.handle().clone();
             let queue_notifier = notifier.clone();
             queue::spawn(queue::QueueDeps {
-                ledger: state.ledger.clone(),
-                settings: state.settings.clone(),
-                control: state.queue.clone(),
-                token: state.token.clone(),
-                folder_rules: state.folder_rules.clone(),
-                types: state.types.clone(),
+                ledger: queue_ledger,
+                settings: queue_settings,
+                control: queue_control,
+                token: queue_token,
+                folder_rules: queue_rules,
+                types: queue_types,
                 on_event: std::sync::Arc::new(move |event: queue::UploadEvent| {
                     // Progress ticks are for the window only. A toast every half
                     // second would be its own kind of failure.
@@ -93,12 +116,6 @@ pub fn run() {
                 }),
             });
 
-            app.manage(state);
-            // So the "send a test notification" button can reach the same
-            // notifier the queue uses, rather than testing a different one.
-            app.manage(notifier.clone());
-            // Before anything watches or scans, so both see the same spelling.
-            app.state::<AppState>().tidy_stored_paths();
             let problems = app.state::<AppState>().resync_watchers();
             for problem in problems {
                 eprintln!("firesync: {problem}");

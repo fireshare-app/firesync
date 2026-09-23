@@ -1,4 +1,3 @@
-- Firesync no longer asks you to reconnect your server when it simply could not reach it for a moment. Your token was never lost in that case, which is why uploads kept running in the background while the window asked for it back
-- When the server cannot be reached, the window now says so at the top and carries on with what the server last told it, rather than sending you back to the setup screen
-- If a reconnect really is needed, it now tells you why instead of showing an empty form
-- If something in the window breaks it now says so and offers to reload, instead of going blank with nothing clickable
+- Fixes the setup screen appearing on launch with "state not managed for field state on command connection_status". Your server and token were never lost — the window was asking about them before Firesync had finished starting, and a single early failure was enough to send you to the setup form
+- This was also behind 0.1.2 asking to reconnect while the tray still showed the connection and uploads carried on. The same failure was happening then, silently
+- The first check is now retried for a couple of seconds before anything is concluded, so a slow start cannot cost you your setup

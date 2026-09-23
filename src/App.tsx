@@ -40,24 +40,33 @@ export default function App() {
   // since the last run. Either way the server decides, not the config file.
   const [connectError, setConnectError] = useState<string | null>(null)
 
-  const checkConnection = useCallback(() => {
+  // Asked more than once before being believed.
+  //
+  // The window is up before the backend has finished standing up, so the first
+  // call can fail for reasons that have nothing to do with the connection —
+  // and a single failure used to land somebody straight on the setup form.
+  // Only a server that actually answered "no" gets this far at all now, but a
+  // few hundred milliseconds of patience costs nothing and covers the rest.
+  const checkConnection = useCallback(async () => {
     setConnectError(null)
-    api
-      .connectionStatus()
-      .then((connection) =>
-        setPhase(connection ? { status: 'connected', connection } : { status: 'disconnected' }),
-      )
-      // Only a server that actually answered "no" reaches here now, so this is
-      // a real reconnect — but say which one it was rather than presenting an
-      // empty form and letting somebody assume they lost their token.
-      .catch((e) => {
-        setConnectError(asAppError(e).message)
-        setPhase({ status: 'disconnected' })
-      })
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const connection = await api.connectionStatus()
+        setPhase(connection ? { status: 'connected', connection } : { status: 'disconnected' })
+        return
+      } catch (e) {
+        if (attempt >= 4) {
+          setConnectError(asAppError(e).message)
+          setPhase({ status: 'disconnected' })
+          return
+        }
+        await new Promise((done) => setTimeout(done, 250 * (attempt + 1)))
+      }
+    }
   }, [])
 
   useEffect(() => {
-    checkConnection()
+    void checkConnection()
   }, [checkConnection])
 
   useEffect(() => {
@@ -122,7 +131,7 @@ export default function App() {
           <div className="banner banner--bad banner--top">
             {connectError}
             <span className="spacer" />
-            <button type="button" className="btn btn--ghost" onClick={checkConnection}>
+            <button type="button" className="btn btn--ghost" onClick={() => void checkConnection()}>
               Try again
             </button>
           </div>
@@ -142,7 +151,7 @@ export default function App() {
           Showing what {connection.serverUrl} last told us — it could not be reached just now
           {connection.problem ? `: ${connection.problem}` : '.'} Uploads carry on regardless.
           <span className="spacer" />
-          <button type="button" className="btn btn--ghost" onClick={checkConnection}>
+          <button type="button" className="btn btn--ghost" onClick={() => void checkConnection()}>
             Try again
           </button>
         </div>
