@@ -161,7 +161,7 @@ export function SettingsView({ connection, onDisconnected }: Props) {
           Updates
           <span className="spacer" />
           <span className="panel__hint mono">
-            v{update?.currentVersion ?? '0.1.0'}
+            v{update?.currentVersion ?? __APP_VERSION__}
             {update ? ` · ${update.version} available` : ''}
           </span>
         </h2>

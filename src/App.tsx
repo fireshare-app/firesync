@@ -25,7 +25,7 @@ type Phase =
 
 type Tab = 'folders' | 'activity' | 'settings'
 
-const VERSION = '0.1.0'
+const VERSION = __APP_VERSION__
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>({ status: 'loading' })
