@@ -26,6 +26,7 @@
     "core:window:allow-outer-position",
     "core:window:allow-inner-size",
     "core:window:allow-current-monitor",
-    "core:app:allow-default-window-icon"
+    "core:app:allow-default-window-icon",
+    "core:window:allow-set-size"
   ]
 }

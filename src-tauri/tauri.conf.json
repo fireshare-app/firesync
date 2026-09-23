@@ -32,12 +32,14 @@
         "skipTaskbar": true,
         "visible": false,
         "focus": false,
-        "shadow": true
+        "shadow": true,
+        "transparent": true
       }
     ],
     "security": {
       "csp": null
-    }
+    },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,

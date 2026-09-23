@@ -639,10 +639,10 @@ select {
 
 /* Tray panel ------------------------------------------------------------- */
 
-.is-tray, .is-tray body, .is-tray #root { height: 100%; background: transparent; }
+.is-tray, .is-tray body, .is-tray #root { background: transparent; }
 
 .tp {
-  height: 100%; box-sizing: border-box;
+  box-sizing: border-box;
   background: #0d2438; border: 1px solid var(--border); border-radius: 10px;
   padding: 6px; display: flex; flex-direction: column; gap: 1px;
   font-size: 13px; overflow: hidden;

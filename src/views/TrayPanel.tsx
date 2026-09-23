@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react'
-import { getCurrentWindow } from '@tauri-apps/api/window'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window'
 import { listen } from '@tauri-apps/api/event'
 import logo from '../assets/logo.png'
 import {
@@ -32,6 +32,7 @@ export function TrayPanel() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [sending, setSending] = useState<{ fraction: number; name: string } | null>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -62,6 +63,22 @@ export function TrayPanel() {
     return () => {
       void stop.then((fn) => fn())
     }
+  }, [])
+
+  // The window is sized to its contents rather than to a guess. A menu is
+  // exactly as tall as what is in it, and this one's height changes with the
+  // progress bar appearing and going away.
+  useEffect(() => {
+    const el = panelRef.current
+    if (!el) return
+    const fit = () => {
+      const height = Math.ceil(el.getBoundingClientRect().height)
+      if (height > 0) void getCurrentWindow().setSize(new LogicalSize(320, height))
+    }
+    fit()
+    const observer = new ResizeObserver(fit)
+    observer.observe(el)
+    return () => observer.disconnect()
   }, [])
 
   // Closing on blur is what makes it behave like a menu rather than a window
@@ -103,7 +120,7 @@ export function TrayPanel() {
   }
 
   return (
-    <div className="tp">
+    <div className="tp" ref={panelRef}>
       <div className="tp__head">
         <img src={logo} alt="" width={22} height={22} className="tp__logo" />
         <div className="tp__headtext">
