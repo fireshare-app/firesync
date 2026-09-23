@@ -1,2 +1,1 @@
-- First stable release. Firesync has been running against a live instance through five preview builds, and everything it advertises now works end to end
-- Nothing to do if you are already on 0.1.5 — this is the same app with a version number that means something, plus a README that explains it to people who have not met it yet
+- Right-clicking the tray icon now opens the same panel a left click does, instead of a plain system menu. Windows only — on Linux the tray cannot report clicks at all, so it keeps its system menu
