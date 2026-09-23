@@ -27,6 +27,38 @@ pub struct UploadOptions {
     pub folders: FolderLists,
     #[serde(default)]
     pub games: Vec<Game>,
+    /// Which folder each game's media belongs in, as Fireshare's scanner reads
+    /// it. Absent on an instance that predates the field.
+    #[serde(default)]
+    pub folder_rules: FolderRules,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FolderRules {
+    #[serde(default)]
+    pub video: Vec<FolderRule>,
+    #[serde(default)]
+    pub image: Vec<FolderRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderRule {
+    pub folder: String,
+    #[serde(default)]
+    pub game_id: Option<i64>,
+    #[serde(default)]
+    pub game: Option<String>,
+}
+
+impl FolderRules {
+    /// The folder Fireshare associates with this game, matched the way the
+    /// server matches game names elsewhere: case-insensitively.
+    pub fn folder_for(&self, game: &str, images: bool) -> Option<String> {
+        let list = if images { &self.image } else { &self.video };
+        list.iter()
+            .find(|r| r.game.as_deref().is_some_and(|g| g.eq_ignore_ascii_case(game)))
+            .map(|r| r.folder.clone())
+    }
 }
 
 /// Video and image folders are listed separately because they are separate

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
+import { Select } from '../components/Select'
 import {
   asAppError,
   folders as foldersApi,
@@ -46,6 +47,7 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
   const [minMb, setMinMb] = useState(formatLimit(folder?.min_size_bytes, MB) || (editing ? '' : '5'))
   const [maxGb, setMaxGb] = useState(formatLimit(folder?.max_size_bytes, GB))
   const [after, setAfter] = useState<AfterUpload>(folder?.after_upload ?? 'keep')
+  const [autoSort, setAutoSort] = useState(folder?.auto_sort_by_game ?? true)
   const [uploadExisting, setUploadExisting] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -55,6 +57,11 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
   // necessarily valid for the other.
   const folderChoices = images && !video ? options?.folders.image : options?.folders.video
   const imagesUnavailable = images && (options?.folders.image.length ?? 0) === 0
+
+  const ruleList = images && !video ? options?.folder_rules?.image : options?.folder_rules?.video
+  const sortedInto = game
+    ? ruleList?.find((r) => r.game?.toLowerCase() === game.toLowerCase())?.folder
+    : undefined
 
   async function browse() {
     setError(null)
@@ -83,6 +90,7 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
       minSizeBytes: parseLimit(minMb, MB),
       maxSizeBytes: parseLimit(maxGb, GB),
       afterUpload: after,
+      autoSortByGame: autoSort,
     }
 
     try {
@@ -160,21 +168,29 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
               <label className="field__label" htmlFor="fd-dest">
                 Fireshare folder
               </label>
-              <input
-                id="fd-dest"
-                className="mono"
-                list="fd-dest-options"
-                value={dest}
-                onChange={(e) => setDest(e.target.value)}
-                placeholder={options?.default_folder ?? 'uploads'}
-              />
-              <datalist id="fd-dest-options">
-                {folderChoices?.map((f) => (
-                  <option key={f} value={f} />
-                ))}
-              </datalist>
+              {autoSort ? (
+                <p className="field__fixed mono">
+                  {sortedInto ?? options?.default_folder ?? 'uploads'}
+                </p>
+              ) : (
+                <Select
+                  id="fd-dest"
+                  mono
+                  value={dest}
+                  placeholder={options?.default_folder ?? 'uploads'}
+                  options={(folderChoices ?? []).map((f) => ({ value: f, label: f }))}
+                  onChange={setDest}
+                  customLabel="Use a folder that does not exist yet…"
+                />
+              )}
               <span className="field__hint">
-                One level only — a slash becomes a dash on the server.
+                {autoSort
+                  ? sortedInto
+                    ? `Chosen by the game. Fireshare keeps ${game} here.`
+                    : game
+                      ? `${game} has no folder of its own yet, so uploads use the default.`
+                      : 'Pick a game, or turn auto-sort off to choose a folder.'
+                  : 'One level only — a slash becomes a dash on the server.'}
               </span>
             </div>
 
@@ -182,19 +198,30 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
               <label className="field__label" htmlFor="fd-game">
                 Game <span className="field__optional">(optional)</span>
               </label>
-              <select id="fd-game" value={game} onChange={(e) => setGame(e.target.value)}>
-                <option value="">No game</option>
-                {options?.games.map((g) => (
-                  <option key={g.id} value={g.name}>
-                    {g.name}
-                  </option>
-                ))}
-              </select>
+              <Select
+                id="fd-game"
+                value={game}
+                placeholder="No game"
+                options={[
+                  { value: '', label: 'No game' },
+                  ...(options?.games ?? []).map((g) => ({ value: g.name, label: g.name })),
+                ]}
+                onChange={setGame}
+              />
               <span className="field__hint">
                 {options
                   ? 'Every game in your library. Firesync never creates new ones.'
                   : 'Connect to load your library’s games.'}
               </span>
+              <label className="inline-check" htmlFor="fd-autosort">
+                <input
+                  id="fd-autosort"
+                  type="checkbox"
+                  checked={autoSort}
+                  onChange={(e) => setAutoSort(e.target.checked)}
+                />
+                Auto-sort into game folder
+              </label>
             </div>
           </div>
 
@@ -274,15 +301,16 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
             <label className="field__label" htmlFor="fd-after">
               After a successful upload
             </label>
-            <select
+            <Select
               id="fd-after"
               value={after}
-              onChange={(e) => setAfter(e.target.value as AfterUpload)}
-            >
-              <option value="keep">Keep the local file</option>
-              <option value="trash">Move it to the trash</option>
-              <option value="delete">Delete it</option>
-            </select>
+              options={[
+                { value: 'keep', label: 'Keep the local file' },
+                { value: 'trash', label: 'Move it to the trash' },
+                { value: 'delete', label: 'Delete it' },
+              ]}
+              onChange={(v) => setAfter(v as AfterUpload)}
+            />
             {after !== 'keep' && (
               <span className="field__hint">
                 Only once Fireshare confirms it has the file. Nothing is removed after a failure.

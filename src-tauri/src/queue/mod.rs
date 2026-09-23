@@ -11,7 +11,8 @@ use crate::api::upload::{
     chunk_count, upload_chunk, upload_single, ChunkOutcome, ChunkPolicy, Progress, UploadError,
     UploadMeta, UploadResult,
 };
-use crate::config::{AfterUpload, Settings};
+use crate::api::discovery::FolderRules;
+use crate::config::{AfterUpload, MediaKind, Settings};
 use crate::ledger::{Claim, Ledger};
 use crate::secrets::TokenCache;
 
@@ -84,6 +85,7 @@ pub struct QueueDeps<F: Fn(UploadEvent) + Send + Sync + 'static> {
     pub settings: Arc<Mutex<Settings>>,
     pub control: Arc<QueueControl>,
     pub token: Arc<TokenCache>,
+    pub folder_rules: Arc<Mutex<FolderRules>>,
     pub on_event: Arc<F>,
 }
 
@@ -150,6 +152,7 @@ where
             for claim in claims {
                 let ledger = deps.ledger.clone();
                 let settings = deps.settings.clone();
+                let folder_rules = deps.folder_rules.clone();
                 let control = deps.control.clone();
                 let on_event = deps.on_event.clone();
                 let base_url = base_url.clone();
@@ -165,6 +168,7 @@ where
                         control,
                         on_event,
                         ChunkPolicy::default(),
+                        folder_rules,
                     )
                     .await;
                 }));
@@ -174,6 +178,52 @@ where
             }
         }
     });
+}
+
+/// Where an upload goes, and what it says about itself.
+///
+/// With auto-sort on, the file is filed in whichever folder Fireshare already
+/// associates with this folder's game, and the game is *not* sent: the server
+/// tags anything scanned there with that folder's game anyway, so naming it
+/// again adds nothing and reintroduces the one failure a name can cause — a
+/// game the library does not have, which fails every upload from the folder
+/// until somebody notices.
+///
+/// When the game has no folder of its own, the explicit destination is used and
+/// the game name is sent as before. A guess would be worse than the choice
+/// somebody already made.
+fn destination_for(
+    folder: &crate::config::WatchedFolder,
+    rules: &FolderRules,
+    path: &std::path::Path,
+) -> UploadMeta {
+    if folder.auto_sort_by_game {
+        if let Some(game) = folder.game.as_deref().filter(|g| !g.trim().is_empty()) {
+            let is_image = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    let e = e.to_ascii_lowercase();
+                    crate::queue::rules::SupportedTypes::default()
+                        .image
+                        .iter()
+                        .any(|t| *t == e)
+                })
+                .unwrap_or(false)
+                || (folder.media.contains(&MediaKind::Image)
+                    && !folder.media.contains(&MediaKind::Video));
+
+            if let Some(sorted) = rules.folder_for(game, is_image) {
+                return UploadMeta { folder: Some(sorted), game: None, title: None };
+            }
+        }
+    }
+
+    UploadMeta {
+        folder: folder.dest_folder.clone(),
+        game: folder.game.clone(),
+        title: None,
+    }
 }
 
 /// What sending a file came to. `Restart` is the chunked path's own case: the
@@ -293,6 +343,7 @@ async fn run_one<F>(
     control: Arc<QueueControl>,
     on_event: Arc<F>,
     policy: ChunkPolicy,
+    folder_rules: Arc<Mutex<FolderRules>>,
 ) where
     F: Fn(UploadEvent) + Send + Sync + 'static,
 {
@@ -310,11 +361,7 @@ async fn run_one<F>(
         let settings = settings.lock().expect("settings mutex");
         match settings.folders.iter().find(|f| f.id == claim.folder_id) {
             Some(folder) => (
-                UploadMeta {
-                    folder: folder.dest_folder.clone(),
-                    game: folder.game.clone(),
-                    title: None,
-                },
+                destination_for(folder, &folder_rules.lock().expect("folder rules mutex"), &path),
                 folder.after_upload,
             ),
             // The folder was removed while this file was in flight.
@@ -681,6 +728,7 @@ pub(crate) mod tests {
             min_size_bytes: None,
             max_size_bytes: None,
             after_upload,
+            auto_sort_by_game: false,
         };
 
         let ledger = Arc::new(Ledger::open(&dir.join("l.sqlite")).unwrap());
@@ -709,6 +757,7 @@ pub(crate) mod tests {
             control,
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             ChunkPolicy::default(),
+            Arc::new(Mutex::new(Default::default())),
         )
         .await;
     }
@@ -1156,6 +1205,7 @@ mod chunked_tests {
             control,
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             tiny_policy(),
+            Arc::new(Mutex::new(Default::default())),
         )
         .await;
     }
@@ -1273,6 +1323,7 @@ mod chunked_tests {
             Arc::new(QueueControl::new()),
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             tiny_policy(),
+            Arc::new(Mutex::new(Default::default())),
         )
         .await;
 
@@ -1281,5 +1332,125 @@ mod chunked_tests {
         // chunked route was not used.
         assert!(server.chunks_seen().is_empty(), "a file under the threshold must go in one request");
         let _ = std::fs::remove_dir_all(&f.dir);
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use crate::api::discovery::{FolderRule, FolderRules};
+    use crate::config::{MediaKind, WatchedFolder};
+    use std::path::{Path, PathBuf};
+
+    fn rules() -> FolderRules {
+        FolderRules {
+            video: vec![
+                FolderRule { folder: "valorant".into(), game_id: Some(1), game: Some("VALORANT".into()) },
+                FolderRule { folder: "ow2".into(), game_id: Some(2), game: Some("Overwatch 2".into()) },
+            ],
+            image: vec![FolderRule {
+                folder: "shots-valorant".into(),
+                game_id: Some(1),
+                game: Some("VALORANT".into()),
+            }],
+        }
+    }
+
+    fn folder(game: Option<&str>, auto: bool, media: Vec<MediaKind>) -> WatchedFolder {
+        WatchedFolder {
+            id: "f".into(),
+            path: PathBuf::from("/tmp/w"),
+            enabled: true,
+            include_subfolders: false,
+            media,
+            dest_folder: Some("uploads".into()),
+            game: game.map(str::to_string),
+            min_size_bytes: None,
+            max_size_bytes: None,
+            after_upload: AfterUpload::Keep,
+            auto_sort_by_game: auto,
+        }
+    }
+
+    /// The point of the feature: the clip goes where the game already lives, and
+    /// the game is not named — the server tags it from the folder.
+    #[test]
+    fn auto_sort_files_a_clip_in_its_game_s_folder() {
+        let meta = destination_for(
+            &folder(Some("VALORANT"), true, vec![MediaKind::Video]),
+            &rules(),
+            Path::new("/tmp/w/clip.mp4"),
+        );
+        assert_eq!(meta.folder.as_deref(), Some("valorant"));
+        assert_eq!(meta.game, None, "the folder does the tagging, so naming the game adds nothing");
+    }
+
+    /// Game names are matched the way the server matches them elsewhere.
+    #[test]
+    fn game_names_match_without_regard_to_case() {
+        let meta = destination_for(
+            &folder(Some("valorant"), true, vec![MediaKind::Video]),
+            &rules(),
+            Path::new("/tmp/w/clip.mp4"),
+        );
+        assert_eq!(meta.folder.as_deref(), Some("valorant"));
+    }
+
+    /// Images live in a different tree, so they follow the image rule.
+    #[test]
+    fn an_image_follows_the_image_rule_not_the_video_one() {
+        let meta = destination_for(
+            &folder(Some("VALORANT"), true, vec![MediaKind::Video, MediaKind::Image]),
+            &rules(),
+            Path::new("/tmp/w/shot.png"),
+        );
+        assert_eq!(meta.folder.as_deref(), Some("shots-valorant"));
+    }
+
+    /// A guess would be worse than the choice somebody already made.
+    #[test]
+    fn a_game_with_no_folder_falls_back_to_the_explicit_one() {
+        let meta = destination_for(
+            &folder(Some("Helldivers 2"), true, vec![MediaKind::Video]),
+            &rules(),
+            Path::new("/tmp/w/clip.mp4"),
+        );
+        assert_eq!(meta.folder.as_deref(), Some("uploads"));
+        assert_eq!(meta.game.as_deref(), Some("Helldivers 2"), "the name is still worth sending");
+    }
+
+    #[test]
+    fn no_game_means_there_is_nothing_to_sort_by() {
+        let meta = destination_for(
+            &folder(None, true, vec![MediaKind::Video]),
+            &rules(),
+            Path::new("/tmp/w/clip.mp4"),
+        );
+        assert_eq!(meta.folder.as_deref(), Some("uploads"));
+        assert_eq!(meta.game, None);
+    }
+
+    /// Turning it off means the explicit destination wins, game name included.
+    #[test]
+    fn switching_it_off_restores_the_manual_choice() {
+        let meta = destination_for(
+            &folder(Some("VALORANT"), false, vec![MediaKind::Video]),
+            &rules(),
+            Path::new("/tmp/w/clip.mp4"),
+        );
+        assert_eq!(meta.folder.as_deref(), Some("uploads"));
+        assert_eq!(meta.game.as_deref(), Some("VALORANT"));
+    }
+
+    /// An instance without the folder-rules field behaves as it did before.
+    #[test]
+    fn an_instance_with_no_rules_is_not_broken_by_the_setting() {
+        let meta = destination_for(
+            &folder(Some("VALORANT"), true, vec![MediaKind::Video]),
+            &FolderRules::default(),
+            Path::new("/tmp/w/clip.mp4"),
+        );
+        assert_eq!(meta.folder.as_deref(), Some("uploads"));
+        assert_eq!(meta.game.as_deref(), Some("VALORANT"));
     }
 }

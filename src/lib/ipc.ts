@@ -45,10 +45,18 @@ export interface Game {
   steamgriddb_id: number | null
 }
 
+export interface FolderRule {
+  folder: string
+  game_id: number | null
+  game: string | null
+}
+
 export interface UploadOptions {
   default_folder: string | null
   folders: { video: string[]; image: string[] }
   games: Game[]
+  /** Which folder each game's media belongs in, as Fireshare's scanner reads it. */
+  folder_rules: { video: FolderRule[]; image: FolderRule[] }
 }
 
 export type MediaKind = 'video' | 'image'
@@ -67,6 +75,7 @@ export interface WatchedFolder {
   min_size_bytes: number | null
   max_size_bytes: number | null
   after_upload: AfterUpload
+  auto_sort_by_game: boolean
 }
 
 export interface Settings {
@@ -135,6 +144,7 @@ export interface FolderRules {
   minSizeBytes?: number | null
   maxSizeBytes?: number | null
   afterUpload?: AfterUpload
+  autoSortByGame?: boolean
 }
 
 export interface NewFolder extends FolderRules {

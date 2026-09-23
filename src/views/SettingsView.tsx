@@ -7,6 +7,7 @@ import {
   type Settings,
   type UpdateInfo,
 } from '../lib/ipc'
+import { Select } from '../components/Select'
 
 interface ToggleProps {
   id: string
@@ -232,22 +233,17 @@ export function SettingsView({ connection, onDisconnected }: Props) {
                 Files, not chunks — one file's chunks always go in order.
               </span>
             </label>
-            <select
+            <Select
               id="t-conc"
-              value={settings.transfers.max_concurrent}
-              onChange={(e) =>
+              value={String(settings.transfers.max_concurrent)}
+              options={[1, 2, 3, 4].map((v) => ({ value: String(v), label: String(v) }))}
+              onChange={(v) =>
                 patch({
                   ...settings,
-                  transfers: { ...settings.transfers, max_concurrent: Number(e.target.value) },
+                  transfers: { ...settings.transfers, max_concurrent: Number(v) },
                 })
               }
-            >
-              {[1, 2, 3, 4].map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
-              ))}
-            </select>
+            />
           </div>
         </section>
 

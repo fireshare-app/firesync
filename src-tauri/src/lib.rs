@@ -80,6 +80,7 @@ pub fn run() {
                 settings: state.settings.clone(),
                 control: state.queue.clone(),
                 token: state.token.clone(),
+                folder_rules: state.folder_rules.clone(),
                 on_event: std::sync::Arc::new(move |event: queue::UploadEvent| {
                     // Progress ticks are for the window only. A toast every half
                     // second would be its own kind of failure.

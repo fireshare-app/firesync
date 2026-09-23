@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useState } from 'react'
+import { listen } from '@tauri-apps/api/event'
 import logo from './assets/logo.png'
 import { ActivityIcon, FolderIcon, GearIcon } from './components/Icons'
+import { TitleBar } from './components/TitleBar'
 import { Connect } from './views/Connect'
 import { Folders } from './views/Folders'
 import { Activity } from './views/Activity'
 import { SettingsView } from './views/SettingsView'
+import { UpdateDialog } from './views/UpdateDialog'
 import {
   api,
   asAppError,
   folders as foldersApi,
   queue as queueApi,
   type Connection,
+  type UpdateInfo,
   type UploadOptions,
 } from './lib/ipc'
 
@@ -29,6 +33,7 @@ export default function App() {
   const [options, setOptions] = useState<UploadOptions | null>(null)
   const [folderCount, setFolderCount] = useState(0)
   const [attention, setAttention] = useState(0)
+  const [update, setUpdate] = useState<UpdateInfo | null>(null)
 
   // A stored connection is re-checked on launch rather than trusted: the token
   // may have been revoked, or the account may have lost its upload permission,
@@ -69,16 +74,48 @@ export default function App() {
     return () => clearInterval(t)
   }, [phase.status, refreshCounts])
 
-  if (phase.status === 'loading') return <div className="boot" />
+  // The tray opens the window at the place that does the thing, rather than
+  // dropping somebody on the front page to go and find it.
+  useEffect(() => {
+    const stop = listen<string>('firesync://navigate', (event) => {
+      const to = event.payload
+      if (to === 'folders' || to === 'activity' || to === 'settings') setTab(to)
+    })
+    return () => {
+      void stop.then((fn) => fn())
+    }
+  }, [])
+
+  useEffect(() => {
+    const stop = listen<UpdateInfo>('firesync://update', (event) => setUpdate(event.payload))
+    return () => {
+      void stop.then((fn) => fn())
+    }
+  }, [])
+
+  if (phase.status === 'loading')
+    return (
+      <div className="frame">
+        <TitleBar />
+        <div className="boot" />
+      </div>
+    )
 
   if (phase.status === 'disconnected') {
-    return <Connect onConnected={(connection) => setPhase({ status: 'connected', connection })} />
+    return (
+      <div className="frame">
+        <TitleBar />
+        <Connect onConnected={(connection) => setPhase({ status: 'connected', connection })} />
+      </div>
+    )
   }
 
   const { connection } = phase
 
   return (
-    <div className="app">
+    <div className="frame">
+      <TitleBar />
+      <div className="app">
       <aside className="sidebar">
         <div className="sidebar__brand">
           <img src={logo} alt="" width={20} height={20} />
@@ -139,6 +176,9 @@ export default function App() {
           />
         )}
       </main>
+
+        {update && <UpdateDialog update={update} onClose={() => setUpdate(null)} />}
+      </div>
     </div>
   )
 }

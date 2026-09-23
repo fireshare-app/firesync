@@ -329,6 +329,7 @@ mod tests {
             min_size_bytes: Some(5 << 20),
             max_size_bytes: None,
             after_upload: crate::config::AfterUpload::Keep,
+            auto_sort_by_game: false,
         };
 
         let types = SupportedTypes::default();
@@ -479,6 +480,7 @@ mod tests {
             min_size_bytes: Some(5 << 20),
             max_size_bytes: None,
             after_upload: crate::config::AfterUpload::Keep,
+            auto_sort_by_game: false,
         };
         let present = scan_existing(&folder, &SupportedTypes::default());
         reopened.record_baseline(&folder.id, &present).unwrap();

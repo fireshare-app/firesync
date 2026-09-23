@@ -106,6 +106,9 @@ pub fn spawn_check_loop(app: AppHandle) {
 
             match found {
                 Ok(Some(info)) => {
+                    // The tray carries the version too, so a waiting update is
+                    // visible without opening the window.
+                    crate::tray::note_update(&app, &info.version);
                     let _ = app.emit("firesync://update", &info);
 
                     let auto = app

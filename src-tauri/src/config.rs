@@ -70,6 +70,17 @@ pub struct WatchedFolder {
     /// meaning it already had them.
     #[serde(default)]
     pub after_upload: AfterUpload,
+    /// Put uploads in whichever folder Fireshare already associates with this
+    /// folder's game, rather than in `dest_folder`.
+    ///
+    /// On by default, because it is what somebody almost always means: the
+    /// server tags anything scanned in a game's folder with that game, so
+    /// filing a clip there gets it sorted and tagged without the upload naming
+    /// a game at all — and without the `unknown_game` failure that naming one
+    /// can cause. Falls back to `dest_folder` when the game has no folder of
+    /// its own, since a guess would be worse than the explicit choice.
+    #[serde(default = "default_true")]
+    pub auto_sort_by_game: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

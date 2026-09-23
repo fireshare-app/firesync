@@ -23,6 +23,10 @@ pub struct AppState {
     pub settings: Arc<Mutex<Settings>>,
     pub ledger: Arc<Ledger>,
     pub types: Arc<Mutex<SupportedTypes>>,
+    /// The server's folder-to-game mapping, refreshed whenever options are
+    /// fetched. Cached because the queue needs it per upload and it changes
+    /// about as often as somebody reorganises their library.
+    pub folder_rules: Arc<Mutex<crate::api::discovery::FolderRules>>,
     pub watchers: Mutex<Watchers>,
     pub queue: Arc<QueueControl>,
     pub token: Arc<TokenCache>,
@@ -40,6 +44,7 @@ impl AppState {
                 settings: Arc::new(Mutex::new(settings)),
                 ledger: Arc::new(ledger),
                 types: Arc::new(Mutex::new(SupportedTypes::default())),
+                folder_rules: Arc::new(Mutex::new(Default::default())),
                 watchers: Mutex::new(Watchers::new(tx)),
                 queue: Arc::new(QueueControl::new()),
                 // Read from the keychain once, here, rather than on every pass
@@ -52,6 +57,12 @@ impl AppState {
 
     pub fn snapshot(&self) -> Settings {
         self.settings.lock().expect("settings mutex poisoned").clone()
+    }
+
+    /// Public face of `persist`, for callers outside the command layer such as
+    /// the tray's notification toggle.
+    pub fn save(&self, next: Settings) -> Result<()> {
+        self.persist(next)
     }
 
     fn persist(&self, next: Settings) -> Result<()> {
@@ -153,7 +164,9 @@ pub async fn disconnect(state: tauri::State<'_, AppState>) -> Result<()> {
 #[tauri::command]
 pub async fn upload_options(state: tauri::State<'_, AppState>) -> Result<UploadOptions> {
     let (url, token) = state.credentials()?;
-    fetch_options(&url, &token).await
+    let options = fetch_options(&url, &token).await?;
+    *state.folder_rules.lock().expect("folder rules mutex") = options.folder_rules.clone();
+    Ok(options)
 }
 
 // ---------------------------------------------------------------------------
@@ -178,9 +191,15 @@ pub struct NewFolder {
     pub max_size_bytes: Option<u64>,
     #[serde(default)]
     pub after_upload: AfterUpload,
+    #[serde(default = "default_true")]
+    pub auto_sort_by_game: bool,
     /// Upload what is already there, instead of leaving it as baseline.
     #[serde(default)]
     pub upload_existing: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize)]
@@ -248,6 +267,7 @@ pub async fn add_folder(
         min_size_bytes: folder.min_size_bytes,
         max_size_bytes: folder.max_size_bytes,
         after_upload: folder.after_upload,
+        auto_sort_by_game: folder.auto_sort_by_game,
     };
 
     // Snapshot what is already here BEFORE watching, so nothing that predates
@@ -315,6 +335,8 @@ pub struct FolderRules {
     pub max_size_bytes: Option<u64>,
     #[serde(default)]
     pub after_upload: AfterUpload,
+    #[serde(default = "default_true")]
+    pub auto_sort_by_game: bool,
 }
 
 /// Change a folder's rules in place.
@@ -344,6 +366,7 @@ pub async fn update_folder(
     folder.min_size_bytes = rules.min_size_bytes.filter(|n| *n > 0);
     folder.max_size_bytes = rules.max_size_bytes.filter(|n| *n > 0);
     folder.after_upload = rules.after_upload;
+    folder.auto_sort_by_game = rules.auto_sort_by_game;
 
     state.persist(next)?;
     // Recursion may have been turned on or off, which changes what is watched.
