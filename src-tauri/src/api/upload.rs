@@ -28,6 +28,10 @@ pub enum UploadResult {
 pub enum UploadError {
     /// The server has given its answer and it will not change.
     Permanent(String),
+    /// Something between here and Fireshare will not take a body this size in
+    /// one request. Kept apart from `Permanent` because it is not the end of the
+    /// road: the same bytes sent in chunks are each small enough to pass.
+    TooLarge(String),
     /// Worth trying again later.
     Retryable(String),
     /// The server asked for a specific wait — honour it exactly rather than
@@ -189,8 +193,8 @@ pub async fn classify_response(
             Err(UploadError::Permanent(friendly_400(&detail)))
         }
 
-        413 => Err(UploadError::Permanent(
-            "The server refused the file as too large.".into(),
+        413 => Err(UploadError::TooLarge(
+            "The server would not take the file in one request.".into(),
         )),
 
         429 => Err(UploadError::RetryAfter {
@@ -198,9 +202,24 @@ pub async fn classify_response(
             seconds: retry_after.unwrap_or(60),
         }),
 
-        503 => Err(UploadError::Permanent(
-            "Images are not enabled on this Fireshare instance.".into(),
-        )),
+        // 503 is two completely different things wearing one number. Fireshare
+        // says it when the instance has no image directory, which is permanent
+        // and worth explaining. Everything in front of Fireshare says it while
+        // the service is restarting or overloaded, which is the opposite — and
+        // reading that as "images are not enabled" both failed the file forever
+        // and blamed the wrong thing.
+        503 => {
+            let detail = response.text().await.unwrap_or_default();
+            if mentions_images_disabled(&detail) {
+                Err(UploadError::Permanent(
+                    "Images are not enabled on this Fireshare instance.".into(),
+                ))
+            } else {
+                Err(UploadError::Retryable(
+                    "The server is unavailable (503).".into(),
+                ))
+            }
+        }
 
         s if (500..600).contains(&s) => {
             Err(UploadError::Retryable(format!("The server answered {s}.")))
@@ -208,6 +227,17 @@ pub async fn classify_response(
 
         s => Err(UploadError::Permanent(format!("The server answered {s}."))),
     }
+}
+
+/// Whether a 503 came from Fireshare turning images off, rather than from a
+/// proxy while the service was down.
+///
+/// Fireshare answers with `IMAGE_DIRECTORY is not configured.` on the upload
+/// route and an `images_disabled` error elsewhere. A gateway answers with an
+/// HTML page about the service being unavailable, which matches neither.
+fn mentions_images_disabled(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("image_directory") || body.contains("images_disabled")
 }
 
 /// A 400 body is either JSON with an `unknown_game` error or a plain sentence.
@@ -234,7 +264,9 @@ impl From<UploadError> for AppError {
         match e {
             UploadError::Unauthorized(m) => AppError::TokenRejected(m),
             UploadError::RetryAfter { message, .. } => AppError::Throttled(message),
-            UploadError::Permanent(m) | UploadError::Retryable(m) => AppError::Server(m),
+            UploadError::Permanent(m) | UploadError::Retryable(m) | UploadError::TooLarge(m) => {
+                AppError::Server(m)
+            }
         }
     }
 }

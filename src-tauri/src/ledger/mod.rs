@@ -348,10 +348,19 @@ impl Ledger {
         let claims: Vec<Claim> = {
             let mut stmt = tx
                 .prepare(
+                    // Work already started finishes before new work begins.
+                    //
+                    // The previous order put never-tried rows first, which meant
+                    // a file part-way through its retries sat behind the entire
+                    // backlog — two at a time and a few hundred megabytes each,
+                    // that is hours, so "Retrying in 2s" was a promise the queue
+                    // could not keep. A retry also has a bounded budget where a
+                    // fresh file has made no progress at all, and backoff already
+                    // limits how often a failing file can come back round.
                     "SELECT id, folder_id, path, size, attempts, content_hash FROM files
                       WHERE state = 'queued'
                         AND (next_try_at IS NULL OR next_try_at <= ?1)
-                      ORDER BY next_try_at IS NULL DESC, next_try_at ASC, id ASC
+                      ORDER BY attempts = 0 ASC, COALESCE(next_try_at, 0) ASC, id ASC
                       LIMIT ?2",
                 )
                 .map_err(db_err)?;
@@ -696,6 +705,65 @@ mod path_migration_tests {
         let (l, dir) = ledger();
         l.record_baseline("f1", &[(r"D:\other\file.mp4".to_string(), 1, 1)]).unwrap();
         assert_eq!(l.rewrite_path_prefix("f1", r"\\?\E:\Clips", r"E:\Clips").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod claim_order_tests {
+    use super::*;
+
+    fn ledger() -> (Ledger, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("firesync-claim-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Ledger::open(&dir.join("l.sqlite")).unwrap(), dir)
+    }
+
+    /// A file part-way through its retries must not wait behind the whole
+    /// backlog.
+    ///
+    /// The queue tells the person "Retrying in 2s (attempt 1 of 8)", and with a
+    /// folder of clips still to send that promise was being broken by the
+    /// ordering: never-tried rows sorted first, so a retry sat behind every one
+    /// of them. Two at a time and a few hundred megabytes each, that is hours —
+    /// long enough that the retry looked like it had simply never fired.
+    #[test]
+    fn a_due_retry_is_claimed_before_the_untried_backlog() {
+        let (l, dir) = ledger();
+
+        // One file that has already been attempted and is due again.
+        l.observe("f1", "/w/first.mp4", 10, 1, None).unwrap();
+        let first = l.claim(1, &[]).unwrap().pop().unwrap();
+        l.reschedule(first.id, "The server answered 502.", now() - 1).unwrap();
+
+        // Then a backlog arrives behind it.
+        for i in 0..50 {
+            l.observe("f1", &format!("/w/backlog{i}.mp4"), 10, 1, None).unwrap();
+        }
+
+        let next = l.claim(1, &[]).unwrap();
+        assert_eq!(
+            next.first().map(|c| c.path.as_str()),
+            Some("/w/first.mp4"),
+            "the retry that was already due should go before files never tried"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A retry that is not due yet must not be claimed early, backlog or not.
+    #[test]
+    fn a_retry_that_is_not_due_yet_waits() {
+        let (l, dir) = ledger();
+
+        l.observe("f1", "/w/first.mp4", 10, 1, None).unwrap();
+        let first = l.claim(1, &[]).unwrap().pop().unwrap();
+        l.reschedule(first.id, "backing off", now() + 3600).unwrap();
+
+        l.observe("f1", "/w/fresh.mp4", 10, 1, None).unwrap();
+
+        let next = l.claim(2, &[]).unwrap();
+        let paths: Vec<&str> = next.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["/w/fresh.mp4"], "a retry due in an hour is not due now");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

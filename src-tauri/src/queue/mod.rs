@@ -467,8 +467,21 @@ async fn run_one<F>(
         )
         .await
     } else {
-        match upload_single(base_url, token, &path, &meta, progress).await {
+        match upload_single(base_url, token, &path, &meta, progress.clone()).await {
             Ok(r) => SendOutcome::Ok(r),
+            // Under the threshold but still refused for its size: something
+            // between here and Fireshare caps how big one request may be, and
+            // it is lower than we assumed. The same bytes in 32 MiB pieces are
+            // each well under any such cap, so send it that way rather than
+            // failing a file that the library would have been happy to take.
+            Err(UploadError::TooLarge(_)) => {
+                // The abandoned attempt already counted its bytes.
+                progress.store(0, Ordering::Relaxed);
+                send_chunked(
+                    &claim, base_url, token, &path, &meta, file_size, &ledger, policy, progress,
+                )
+                .await
+            }
             Err(e) => SendOutcome::Err(e),
         }
     };
@@ -551,6 +564,13 @@ async fn run_one<F>(
             let _ = ledger.release(claim.id);
             control.pause(Some(message.clone()));
             emit(&on_event, &claim, "paused", Some(&message), None);
+        }
+
+        // Chunking was the way out of a 413 and it did not help, so the cap is
+        // below the chunk size or the refusal was never about size.
+        Err(UploadError::TooLarge(message)) => {
+            let _ = ledger.mark_failed(claim.id, &message);
+            emit(&on_event, &claim, "failed", Some(&message), None);
         }
 
         Err(UploadError::Permanent(message)) => {
@@ -1018,16 +1038,26 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 
+    /// A gateway saying 503 while Fireshare restarts is the opposite of a
+    /// permanent answer, and must not be read as one — nor blamed on images.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_413_is_permanent() {
+    async fn a_gateway_503_is_retryable_and_says_nothing_about_images() {
         let f = fixture();
-        let (url, server) = serve(413, "", "too large");
+        let (url, server) = serve(
+            503,
+            "",
+            "<html><head><title>503 Service Temporarily Unavailable</title></head></html>",
+        );
         run_against(&f, &url, Arc::new(QueueControl::new())).await;
         server.join().unwrap();
 
-        assert_eq!(state_of(&f), FileState::Failed);
+        assert_eq!(state_of(&f), FileState::Queued, "a restarting server is worth waiting for");
+        let ev = f.events.lock().unwrap();
+        let reason = ev[0].reason.clone().unwrap_or_default();
+        assert!(!reason.to_lowercase().contains("image"), "blamed images: {reason}");
         let _ = std::fs::remove_dir_all(&f.dir);
     }
+
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_429_waits_exactly_as_long_as_the_server_asked() {
@@ -1239,6 +1269,12 @@ mod chunked_tests {
         /// informative-202 change does. The client cannot see a shortfall and
         /// has to notice it by running out of chunks.
         Silent,
+        /// Refuses a whole-file upload as too large but takes chunks happily,
+        /// the way a proxy with a request-body cap in front of Fireshare does.
+        RefuseWholeFile,
+        /// Refuses everything as too large, including chunks. Nothing the client
+        /// can do differently will help.
+        RefuseEverything,
     }
 
     struct FakeServer {
@@ -1266,10 +1302,17 @@ mod chunked_tests {
                     let Some(body) = read_request(&mut stream) else { break };
                     requests_t.fetch_add(1, AtomicOrdering::Relaxed);
 
+                    if behaviour == Behaviour::RefuseEverything {
+                        let _ = respond(&mut stream, 413, "too large");
+                        continue;
+                    }
+
                     let part = field(&body, "chunkPart").and_then(|v| v.parse::<i64>().ok());
                     let total = field(&body, "totalChunks").and_then(|v| v.parse::<i64>().ok());
                     let (Some(part), Some(total)) = (part, total) else {
-                        let _ = respond(&mut stream, 400, "not a chunk request");
+                        let status =
+                            if behaviour == Behaviour::RefuseWholeFile { 413 } else { 400 };
+                        let _ = respond(&mut stream, status, "not a chunk request");
                         continue;
                     };
                     seen_t.lock().unwrap().push(part);
@@ -1512,6 +1555,72 @@ mod chunked_tests {
         // upload reaches it as a 400 — which is itself the proof that the
         // chunked route was not used.
         assert!(server.chunks_seen().is_empty(), "a file under the threshold must go in one request");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// When chunking is no escape either, the file has genuinely been refused
+    /// and saying so beats retrying forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_that_survives_chunking_is_permanent() {
+        let f = fixture_with(AfterUpload::Keep);
+        std::fs::write(&f.claim.path, vec![1u8; 2048]).unwrap();
+
+        let server = FakeServer::start(Behaviour::RefuseEverything);
+        let events = f.events.clone();
+        let mut claim = f.claim.clone();
+        claim.size = 2048;
+        run_one(
+            claim,
+            &server.url,
+            "fsk_test",
+            f.ledger.clone(),
+            f.settings.clone(),
+            Arc::new(QueueControl::new()),
+            Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
+            ChunkPolicy { threshold: 4096, size: 1024 },
+            Arc::new(Mutex::new(Default::default())),
+            Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
+        )
+        .await;
+
+        assert_eq!(state_of(&f), FileState::Failed);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A body cap lower than our chunk threshold must not fail the file.
+    ///
+    /// Whatever sits in front of Fireshare gets to decide how big one request
+    /// may be, and it does not tell us in advance. Finding out the hard way is
+    /// fine as long as the answer is "send it differently" rather than "this
+    /// file can never be uploaded" — the same bytes in chunks are each far
+    /// below any such cap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_whole_file_refused_as_too_large_goes_up_in_chunks_instead() {
+        let f = fixture_with(AfterUpload::Keep);
+        std::fs::write(&f.claim.path, vec![1u8; 2048]).unwrap();
+
+        let server = FakeServer::start(Behaviour::RefuseWholeFile);
+        let events = f.events.clone();
+        let mut claim = f.claim.clone();
+        claim.size = 2048;
+        run_one(
+            claim,
+            &server.url,
+            "fsk_test",
+            f.ledger.clone(),
+            f.settings.clone(),
+            Arc::new(QueueControl::new()),
+            Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
+            // Threshold above the file, so it starts as a single request and
+            // only reaches the chunked route by being refused.
+            ChunkPolicy { threshold: 4096, size: 1024 },
+            Arc::new(Mutex::new(Default::default())),
+            Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
+        )
+        .await;
+
+        assert_eq!(state_of(&f), FileState::Done, "the fallback should have landed it");
+        assert!(!server.chunks_seen().is_empty(), "it should have fallen back to chunks");
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 }
