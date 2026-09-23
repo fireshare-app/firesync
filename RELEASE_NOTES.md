@@ -1,8 +1,4 @@
-- Files already in your library are found before uploading rather than after, so a clip you have already sent is no longer transferred in full just to be told it was a duplicate
-- Images are checked the same way, which was never possible before — it needs a Fireshare instance running the matching server update
-- Uploads waiting to retry now actually retry. They were being starved behind everything else in the queue, so a file that hit a hiccup could wait hours for its next attempt
-- A file the server will not accept in one request is now sent in chunks instead of failing, which also fixes uploads that were refused as "too large" despite being well within what Fireshare allows
-- A server restarting mid-upload no longer fails the file permanently, and no longer blames it on images being disabled
-- Finished uploads have buttons to copy their link or open them in Fireshare
-- Every upload in flight now shows on its folder card, instead of one entry flickering between them
-- Long filenames are trimmed with the full name on hover, scrollbars are thinner, and Settings has a "Send a test notification" button
+- Firesync no longer asks you to reconnect your server when it simply could not reach it for a moment. Your token was never lost in that case, which is why uploads kept running in the background while the window asked for it back
+- When the server cannot be reached, the window now says so at the top and carries on with what the server last told it, rather than sending you back to the setup screen
+- If a reconnect really is needed, it now tells you why instead of showing an empty form
+- If something in the window breaks it now says so and offers to reload, instead of going blank with nothing clickable
