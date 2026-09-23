@@ -636,3 +636,37 @@ select {
   flex-grow: 1; min-width: 0; background: var(--panel-sunken); border: 1px solid var(--border);
   border-radius: 6px; color: var(--text); font-size: 12.5px; padding: 7px 9px;
 }
+
+/* Tray panel ------------------------------------------------------------- */
+
+.is-tray, .is-tray body, .is-tray #root { height: 100%; background: transparent; }
+
+.tp {
+  height: 100%; box-sizing: border-box;
+  background: #0d2438; border: 1px solid var(--border); border-radius: 10px;
+  padding: 6px; display: flex; flex-direction: column; gap: 1px;
+  font-size: 13px; overflow: hidden;
+}
+.tp__head { display: flex; align-items: center; gap: 10px; padding: 9px 10px 10px; }
+.tp__logo { border-radius: 6px; flex-shrink: 0; }
+.tp__headtext { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tp__name { font-size: 13px; font-weight: 600; color: var(--text); }
+.tp__status { font-size: 11.5px; color: var(--ok); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tp__status--bad { color: var(--warn); }
+.tp__bar { height: 3px; border-radius: 2px; background: #12314e; margin: 1px 10px 6px; overflow: hidden; }
+.tp__bar-fill { height: 3px; background: var(--accent-light); transition: width 0.4s ease; }
+.tp__error { margin: 0 10px 6px; font-size: 11px; color: var(--bad-text); }
+.tp__sep { height: 1px; background: var(--border-soft); margin: 4px 8px; }
+
+.tp__item {
+  display: flex; align-items: center; gap: 11px; width: 100%; box-sizing: border-box;
+  background: transparent; border: 0; border-radius: 6px; padding: 9px 11px;
+  color: var(--text); font-size: 13px; text-align: left; cursor: pointer;
+}
+.tp__item:hover:not(:disabled) { background: #12395e; }
+.tp__item:disabled { opacity: 0.45; cursor: default; }
+.tp__item--primary { background: #12314e; }
+.tp__item--quit:hover { background: #4a1f1f; color: #ff8a86; }
+.tp__icon { display: inline-flex; flex-shrink: 0; color: var(--text-dim); }
+.tp__value { margin-left: auto; font-size: 12px; color: var(--text-muted); }
+.tp__count { margin-left: auto; font-size: 11px; font-weight: 600; color: #071320; background: var(--warn); border-radius: 9px; padding: 1px 7px; }

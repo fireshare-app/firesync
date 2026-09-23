@@ -246,3 +246,9 @@ export const backlog = {
   queue: (folderId: string, paths: string[]) =>
     invoke<number>('queue_backlog', { folderId, paths }),
 }
+
+export const tray = {
+  openMain: () => invoke<void>('open_main_window'),
+  openSettings: () => invoke<void>('open_main_at', { tab: 'settings' }),
+  quit: () => invoke<void>('quit_app'),
+}

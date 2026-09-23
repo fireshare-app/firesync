@@ -155,6 +155,9 @@ pub fn run() {
             commands::check_for_updates,
             commands::install_update,
             commands::update_blocked_by_upload,
+            commands::open_main_window,
+            commands::open_main_at,
+            commands::quit_app,
             commands::config_location,
         ])
         .on_window_event(|window, event| {
@@ -162,8 +165,10 @@ pub fn run() {
             // uploading". Quitting is the tray's Quit item, which is the only
             // thing that should end a transfer in progress.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .run(tauri::generate_context!())

@@ -78,15 +78,28 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| on_menu(app, event.id.as_ref()))
         .on_tray_icon_event(|tray, event| {
-            // A plain left click opens the window, which is what people expect
-            // on Windows and costs nothing elsewhere.
+            // A left click opens the panel the design draws. The right-click
+            // menu stays native, because that is what every platform's tray
+            // contract promises and the only thing a screen reader can read.
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
+                rect,
                 ..
             } = event
             {
-                show_window(tray.app_handle());
+                // The rect can come back logical or physical depending on the
+                // platform; the panel is placed in physical pixels either way.
+                let scale = tray
+                    .app_handle()
+                    .get_webview_window("tray")
+                    .and_then(|w| w.scale_factor().ok())
+                    .unwrap_or(1.0);
+                toggle_panel(
+                    tray.app_handle(),
+                    rect.position.to_physical(scale),
+                    rect.size.to_physical(scale),
+                );
             }
         })
         .build(app)?;
@@ -266,4 +279,81 @@ mod tests {
         assert_eq!(describe(false, 0, 0, 2), "2 need attention");
         assert!(describe(false, 1, 1, 1).contains("need attention"));
     }
+}
+
+/// Show or hide the tray panel, positioned against the tray icon itself.
+///
+/// A native menu cannot be styled — it is drawn by the OS on every platform —
+/// so the panel the design draws is a small borderless window instead. That
+/// buys the appearance at the cost of having to do what a menu does for free:
+/// place itself sensibly, and close when it loses focus.
+fn toggle_panel(
+    app: &AppHandle,
+    position: tauri::PhysicalPosition<f64>,
+    size: tauri::PhysicalSize<f64>,
+) {
+    let Some(panel) = app.get_webview_window("tray") else { return };
+
+    if panel.is_visible().unwrap_or(false) {
+        let _ = panel.hide();
+        return;
+    }
+
+    if let Ok(panel_size) = panel.outer_size() {
+        let (x, y) = anchor(app, &panel, position, size, panel_size);
+        let _ = panel.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+
+    let _ = panel.show();
+    let _ = panel.set_focus();
+}
+
+/// Where the panel sits relative to the tray icon.
+///
+/// The tray is at the top on macOS and the bottom on Windows, and a panel that
+/// assumed either would hang off the screen on the other — so the side is
+/// decided by which half of the display the icon is actually in, and the
+/// horizontal position is clamped so it never runs past an edge.
+fn anchor(
+    app: &AppHandle,
+    panel: &tauri::WebviewWindow,
+    icon_at: tauri::PhysicalPosition<f64>,
+    icon_size: tauri::PhysicalSize<f64>,
+    panel_size: tauri::PhysicalSize<u32>,
+) -> (i32, i32) {
+    const GAP: i32 = 6;
+
+    let monitor = panel
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| app.primary_monitor().ok().flatten());
+
+    let icon_x = icon_at.x as i32;
+    let icon_y = icon_at.y as i32;
+    let icon_w = icon_size.width as i32;
+    let icon_h = icon_size.height as i32;
+    let pw = panel_size.width as i32;
+    let ph = panel_size.height as i32;
+
+    let mut x = icon_x + icon_w / 2 - pw / 2;
+    let mut y = icon_y + icon_h + GAP;
+
+    if let Some(monitor) = monitor {
+        let area = monitor.size();
+        let origin = monitor.position();
+        let left = origin.x;
+        let top = origin.y;
+        let right = left + area.width as i32;
+        let bottom = top + area.height as i32;
+
+        // Tray at the bottom of the screen: the panel belongs above it.
+        if icon_y > top + (area.height as i32 / 2) {
+            y = icon_y - ph - GAP;
+        }
+        x = x.clamp(left + GAP, (right - pw - GAP).max(left + GAP));
+        y = y.clamp(top + GAP, (bottom - ph - GAP).max(top + GAP));
+    }
+
+    (x, y)
 }

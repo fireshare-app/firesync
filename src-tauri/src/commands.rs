@@ -644,3 +644,25 @@ pub fn queue_backlog(
 ) -> Result<usize> {
     state.ledger.promote_baseline(&folder_id, &paths)
 }
+
+// ---------------------------------------------------------------------------
+// The tray panel
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn open_main_window(app: tauri::AppHandle) {
+    crate::tray::show_window(&app);
+}
+
+#[tauri::command]
+pub fn open_main_at(app: tauri::AppHandle, tab: String) {
+    use tauri::Emitter;
+    crate::tray::show_window(&app);
+    let _ = app.emit("firesync://navigate", tab);
+}
+
+/// Quit for real, which is the one thing the window's close button does not do.
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}

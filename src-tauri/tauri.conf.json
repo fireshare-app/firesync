@@ -18,7 +18,21 @@
         "minWidth": 880,
         "minHeight": 560,
         "resizable": true,
-        "decorations": false
+        "decorations": false,
+        "label": "main"
+      },
+      {
+        "label": "tray",
+        "url": "index.html",
+        "width": 320,
+        "height": 338,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "shadow": true
       }
     ],
     "security": {
