@@ -138,14 +138,35 @@ pub async fn fetch_options(base_url: &str, token: &str) -> Result<UploadOptions>
 pub struct ExistsAnswer {
     #[serde(default)]
     pub exists: bool,
+    /// Where it already lives, when it does.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
-/// Whether the library already holds a video with this content id.
+/// Whether the library already holds this file, asked before sending it.
 ///
-/// Worth asking before a backlog is queued: the duplicate rejection on the
-/// upload routes only fires once the file is on the server's disk, so without
-/// this a folder that was already uploaded would be sent again in full, one
-/// file at a time, to be told each time that it was not needed.
-pub async fn video_exists(base_url: &str, token: &str, video_id: &str) -> Result<ExistsAnswer> {
-    get_json(base_url, token, &format!("/api/upload/token/exists?video_id={video_id}")).await
+/// Both media types need this and neither can do without it:
+///
+/// * A video is rejected on upload, but only once the file is on the server's
+///   disk — for a chunked upload the whole thing has crossed the network before
+///   the 409 comes back.
+/// * An image is never rejected. The upload is accepted and the scan folds it
+///   into the existing row, so without asking there is no way to find out at
+///   all; the transfer is simply paid for and reported as a success.
+///
+/// An error here means "not known to be present", never "absent": a server too
+/// old to have the route 404s, and the only safe reading of any failure is to
+/// go ahead and upload.
+pub async fn media_exists(
+    base_url: &str,
+    token: &str,
+    id: &str,
+    viewer: crate::api::identity::Viewer,
+) -> Result<ExistsAnswer> {
+    use crate::api::identity::Viewer;
+    let param = match viewer {
+        Viewer::Watch => "video_id",
+        Viewer::Image => "image_id",
+    };
+    get_json(base_url, token, &format!("/api/upload/token/exists?{param}={id}")).await
 }

@@ -6,7 +6,7 @@ use tauri::Manager;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::api::client::normalize_base_url;
-use crate::api::discovery::{check_token, fetch_options, video_exists, TokenCheck, UploadOptions};
+use crate::api::discovery::{check_token, fetch_options, media_exists, TokenCheck, UploadOptions};
 use crate::api::identity::video_id;
 use crate::config::{self, AfterUpload, MediaKind, Settings, WatchedFolder};
 use crate::error::{AppError, Result};
@@ -493,7 +493,7 @@ pub fn recent_activity(
 /// bytes, which means the page exists — arguably the case where wanting the
 /// link is most likely, since nothing new appeared to go looking for.
 fn link_for(file: &FileRow, base: Option<&str>, types: &SupportedTypes) -> Option<String> {
-    use crate::api::identity::{media_url, Viewer};
+    use crate::api::identity::media_url;
 
     if !matches!(file.state, FileState::Done | FileState::Duplicate) {
         return None;
@@ -501,18 +501,7 @@ fn link_for(file: &FileRow, base: Option<&str>, types: &SupportedTypes) -> Optio
     let hash = file.content_hash.as_deref()?;
     let base = base?;
 
-    let ext = std::path::Path::new(&file.path)
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_ascii_lowercase();
-
-    let viewer = if types.image.iter().any(|t| t == &ext) {
-        Viewer::Image
-    } else if types.video.iter().any(|t| t == &ext) {
-        Viewer::Watch
-    } else {
-        return None;
-    };
+    let viewer = types.viewer_for(std::path::Path::new(&file.path))?;
 
     Some(media_url(base, hash, viewer))
 }
@@ -719,9 +708,16 @@ pub async fn check_backlog_against_library(
     paths: Vec<String>,
 ) -> Result<Vec<(String, bool)>> {
     let (url, token) = state.credentials()?;
+    let types = state.types.lock().expect("types mutex").clone();
     let mut answers = Vec::with_capacity(paths.len());
 
     for path in paths {
+        // Images and videos are asked about under different names, though the
+        // digest is computed identically for both.
+        let Some(viewer) = types.viewer_for(std::path::Path::new(&path)) else {
+            answers.push((path, false));
+            continue;
+        };
         let hashed = {
             let p = PathBuf::from(&path);
             tokio::task::spawn_blocking(move || video_id(&p)).await
@@ -732,7 +728,7 @@ pub async fn check_backlog_against_library(
             answers.push((path, false));
             continue;
         };
-        match video_exists(&url, &token, &id).await {
+        match media_exists(&url, &token, &id, viewer).await {
             Ok(answer) => answers.push((path, answer.exists)),
             // An unreachable server should leave the picker usable rather than
             // failing the whole listing; "not known to be present" is the safe

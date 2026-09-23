@@ -13,6 +13,26 @@ pub struct SupportedTypes {
     pub image: Vec<String>,
 }
 
+impl SupportedTypes {
+    /// Which of Fireshare's two viewers this file would land in, or `None` if
+    /// the server would not take it at all.
+    ///
+    /// The lists are the server's own, so this is the one place that decides
+    /// video-or-image; anywhere that needs the answer asks here rather than
+    /// carrying a second copy of the extensions.
+    pub fn viewer_for(&self, path: &Path) -> Option<crate::api::identity::Viewer> {
+        use crate::api::identity::Viewer;
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        if self.image.iter().any(|t| t == &ext) {
+            Some(Viewer::Image)
+        } else if self.video.iter().any(|t| t == &ext) {
+            Some(Viewer::Watch)
+        } else {
+            None
+        }
+    }
+}
+
 impl Default for SupportedTypes {
     fn default() -> Self {
         Self {

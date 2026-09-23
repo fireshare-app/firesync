@@ -86,6 +86,7 @@ pub struct QueueDeps<F: Fn(UploadEvent) + Send + Sync + 'static> {
     pub control: Arc<QueueControl>,
     pub token: Arc<TokenCache>,
     pub folder_rules: Arc<Mutex<FolderRules>>,
+    pub types: Arc<Mutex<rules::SupportedTypes>>,
     pub on_event: Arc<F>,
 }
 
@@ -157,6 +158,7 @@ where
                 let on_event = deps.on_event.clone();
                 let base_url = base_url.clone();
                 let token = token.clone();
+                let types = deps.types.clone();
 
                 tasks.push(tauri::async_runtime::spawn(async move {
                     run_one(
@@ -169,6 +171,7 @@ where
                         on_event,
                         ChunkPolicy::default(),
                         folder_rules,
+                        types,
                     )
                     .await;
                 }));
@@ -344,6 +347,7 @@ async fn run_one<F>(
     on_event: Arc<F>,
     policy: ChunkPolicy,
     folder_rules: Arc<Mutex<FolderRules>>,
+    types: Arc<Mutex<rules::SupportedTypes>>,
 ) where
     F: Fn(UploadEvent) + Send + Sync + 'static,
 {
@@ -375,16 +379,56 @@ async fn run_one<F>(
     let file_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
 
     // Fireshare's id for these bytes, worked out before a single one is sent.
-    // The order matters: "remove after upload" trashes the file the moment the
-    // server confirms, so anything computed from its contents has to already
-    // exist by then. Reading the 16 MB header is cheap next to the upload that
-    // follows, and it is what makes an Activity row linkable afterwards.
-    if claim.content_hash.is_none() {
-        let for_hash = path.clone();
-        if let Ok(Ok(hash)) =
-            tokio::task::spawn_blocking(move || crate::api::identity::video_id(&for_hash)).await
-        {
-            let _ = ledger.record_hash(claim.id, &hash);
+    // The order matters twice over: it is what lets us ask whether the server
+    // already has this file, and "remove after upload" trashes the local copy
+    // the moment the server confirms, so anything computed from its contents
+    // has to already exist by then. Reading the 16 MB header is cheap next to
+    // the upload that follows.
+    let hash = match claim.content_hash.clone() {
+        Some(hash) => Some(hash),
+        None => {
+            let for_hash = path.clone();
+            match tokio::task::spawn_blocking(move || crate::api::identity::video_id(&for_hash))
+                .await
+            {
+                Ok(Ok(hash)) => {
+                    let _ = ledger.record_hash(claim.id, &hash);
+                    Some(hash)
+                }
+                _ => None,
+            }
+        }
+    };
+
+    // Ask before sending. A video would otherwise cross the network in full
+    // before its 409 came back, and an image is never rejected at all — the
+    // server accepts it and folds it into the row it already has, so without
+    // asking there is no way to find out. Any failure here means "not known to
+    // be present" and falls through to the upload: a server too old to have the
+    // route must not stop anything being sent.
+    if let Some(hash) = hash.as_deref() {
+        let viewer = types.lock().expect("types mutex").viewer_for(&path);
+        if let Some(viewer) = viewer {
+            if let Ok(answer) =
+                crate::api::discovery::media_exists(base_url, token, hash, viewer).await
+            {
+                if answer.exists {
+                    let _ = ledger.mark_duplicate(claim.id, answer.url.as_deref());
+                    let removed = reclaim_space(&path, after_upload).await;
+                    on_event(UploadEvent {
+                        id: claim.id,
+                        path: claim.path.clone(),
+                        size: claim.size,
+                        sent: claim.size,
+                        state: "duplicate".into(),
+                        reason: Some("Already in your library".into()),
+                        url: answer.url,
+                        landed_as: None,
+                        removed_local: removed,
+                    });
+                    return;
+                }
+            }
         }
     }
 
@@ -760,7 +804,29 @@ pub(crate) mod tests {
         }
     }
 
+    /// Run an upload with the pre-flight existence check switched off.
+    ///
+    /// Empty type lists mean `viewer_for` has no answer, so the queue cannot
+    /// name a parameter for the exists route and skips it. These tests are about
+    /// the status-to-disposition table and the one-shot server answers exactly
+    /// one request; a pre-flight would eat it. The check has its own tests
+    /// below, against a server that expects it.
     pub(crate) async fn run_against(f: &Fixture, url: &str, control: Arc<QueueControl>) {
+        let no_types = rules::SupportedTypes { video: vec![], image: vec![] };
+        run_one_with(f, url, control, no_types).await
+    }
+
+    /// Run an upload with the server's real type lists, so the pre-flight runs.
+    pub(crate) async fn run_checking(f: &Fixture, url: &str, control: Arc<QueueControl>) {
+        run_one_with(f, url, control, rules::SupportedTypes::default()).await
+    }
+
+    async fn run_one_with(
+        f: &Fixture,
+        url: &str,
+        control: Arc<QueueControl>,
+        types: rules::SupportedTypes,
+    ) {
         let events = f.events.clone();
         run_one(
             f.claim.clone(),
@@ -772,12 +838,107 @@ pub(crate) mod tests {
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             ChunkPolicy::default(),
             Arc::new(Mutex::new(Default::default())),
+            Arc::new(Mutex::new(types)),
         )
         .await;
     }
 
     pub(crate) fn state_of(f: &Fixture) -> FileState {
         f.ledger.recent(10).unwrap().into_iter().find(|r| r.id == f.claim.id).unwrap().state
+    }
+
+    /// A server that answers the pre-flight check, then the upload if one comes.
+    ///
+    /// The accept count is exact on purpose: the test joins this thread, so a
+    /// server waiting for a request the client was never going to make would
+    /// hang rather than fail. That makes "was the upload skipped?" something the
+    /// test proves structurally instead of asserting after the fact.
+    fn serve_preflight(
+        exists_status: u16,
+        exists_body: &'static str,
+        upload: Option<(u16, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut answers: Vec<(u16, &'static str)> = vec![(exists_status, exists_body)];
+            answers.extend(upload);
+            for (status, body) in answers {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let _ = read_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// The whole point: the bytes never leave. The server is told to expect one
+    /// request and one only, so an upload here would hang the join below.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_the_library_already_has_is_never_uploaded() {
+        let f = fixture();
+        let (url, server) =
+            serve_preflight(200, r#"{"exists":true,"url":"/w/abc123"}"#, None);
+        run_checking(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert_eq!(state_of(&f), FileState::Duplicate);
+        let ev = f.events.lock().unwrap();
+        assert_eq!(ev[0].state, "duplicate");
+        assert_eq!(ev[0].url.as_deref(), Some("/w/abc123"));
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_the_library_does_not_have_is_uploaded() {
+        let f = fixture();
+        let (url, server) = serve_preflight(
+            200,
+            r#"{"exists":false}"#,
+            Some((201, r#"{"filename":"clip.mp4","folder":"clips"}"#)),
+        );
+        run_checking(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A server too old to have the route must not stop anything being sent.
+    /// "Not known to be present" is the only safe reading of a failed check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_without_the_exists_route_still_uploads() {
+        let f = fixture();
+        let (url, server) = serve_preflight(
+            404,
+            r#"{"error":"not found"}"#,
+            Some((201, r#"{"filename":"clip.mp4","folder":"clips"}"#)),
+        );
+        run_checking(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// Skipping the transfer must not skip the tidying that a 409 would have
+    /// done — the server has the bytes either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skipped_upload_still_reclaims_the_local_file() {
+        let f = fixture_in_home(AfterUpload::Delete);
+        let clip = f.dir.join("clip.mp4");
+        let (url, server) = serve_preflight(200, r#"{"exists":true}"#, None);
+        run_checking(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        assert_eq!(state_of(&f), FileState::Duplicate);
+        assert!(!clip.exists(), "the local copy should have been reclaimed");
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1220,6 +1381,9 @@ mod chunked_tests {
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             tiny_policy(),
             Arc::new(Mutex::new(Default::default())),
+            // No pre-flight: the fake server counts chunk requests, and an
+            // exists check it does not understand would be counted as one.
+            Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
         )
         .await;
     }
@@ -1338,6 +1502,9 @@ mod chunked_tests {
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             tiny_policy(),
             Arc::new(Mutex::new(Default::default())),
+            // No pre-flight: the fake server counts chunk requests, and an
+            // exists check it does not understand would be counted as one.
+            Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
         )
         .await;
 
