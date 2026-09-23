@@ -592,3 +592,88 @@ impl Ledger {
         .map_err(db_err)
     }
 }
+
+impl Ledger {
+    /// Move a folder's rows from one path prefix to another.
+    ///
+    /// Used when a stored folder path is rewritten — dropping Windows'
+    /// extended-length prefix, say. Without this the rows would still be keyed
+    /// on the old spelling, every file would look unseen, and a folder's
+    /// baseline would be re-queued as new: an unasked-for upload of everything
+    /// it was deliberately leaving alone.
+    pub fn rewrite_path_prefix(&self, folder_id: &str, old: &str, new: &str) -> Result<usize> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files
+                SET path = ?1 || substr(path, ?2), updated_at = ?3
+              WHERE folder_id = ?4 AND substr(path, 1, ?5) = ?6",
+            params![new, old.len() as i64 + 1, now(), folder_id, old.len() as i64, old],
+        )
+        .map_err(db_err)
+    }
+}
+
+#[cfg(test)]
+mod path_migration_tests {
+    use super::*;
+
+    fn ledger() -> (Ledger, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("firesync-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Ledger::open(&dir.join("l.sqlite")).unwrap(), dir)
+    }
+
+    /// The whole point: after the move the rows are still found under the new
+    /// spelling, so nothing looks unseen and no baseline is re-queued.
+    #[test]
+    fn rows_follow_their_folder_to_a_new_prefix() {
+        let (l, dir) = ledger();
+        let old = r"\\?\E:\Segra Game Recordings\Clips\WARDOGS";
+        let new = r"E:\Segra Game Recordings\Clips\WARDOGS";
+
+        l.record_baseline(
+            "f1",
+            &[
+                (format!(r"{old}\a.mp4"), 10, 1),
+                (format!(r"{old}\b.mp4"), 20, 2),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(l.rewrite_path_prefix("f1", old, new).unwrap(), 2);
+
+        let paths: Vec<String> = l.recent(10).unwrap().into_iter().map(|r| r.path).collect();
+        assert!(paths.contains(&format!(r"{new}\a.mp4")), "{paths:?}");
+        assert!(paths.contains(&format!(r"{new}\b.mp4")), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.starts_with(r"\\?\")), "a row kept the old prefix");
+
+        // Still baseline: a rename is not a reason to upload anything.
+        assert!(l.recent(10).unwrap().iter().all(|r| r.state == FileState::Baseline));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another folder's rows are not swept along by a shared prefix.
+    #[test]
+    fn only_the_named_folder_moves() {
+        let (l, dir) = ledger();
+        let old = r"\\?\E:\Clips";
+        l.record_baseline("f1", &[(format!(r"{old}\one.mp4"), 1, 1)]).unwrap();
+        l.record_baseline("f2", &[(format!(r"{old}\two.mp4"), 1, 1)]).unwrap();
+
+        assert_eq!(l.rewrite_path_prefix("f1", old, r"E:\Clips").unwrap(), 1);
+
+        let rows = l.recent(10).unwrap();
+        let f2 = rows.iter().find(|r| r.folder_id == "f2").unwrap();
+        assert!(f2.path.starts_with(r"\\?\"), "f2 should be untouched: {}", f2.path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path that merely contains the prefix elsewhere is not a match.
+    #[test]
+    fn only_a_real_prefix_counts() {
+        let (l, dir) = ledger();
+        l.record_baseline("f1", &[(r"D:\other\file.mp4".to_string(), 1, 1)]).unwrap();
+        assert_eq!(l.rewrite_path_prefix("f1", r"\\?\E:\Clips", r"E:\Clips").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

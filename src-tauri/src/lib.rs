@@ -92,6 +92,8 @@ pub fn run() {
             });
 
             app.manage(state);
+            // Before anything watches or scans, so both see the same spelling.
+            app.state::<AppState>().tidy_stored_paths();
             let problems = app.state::<AppState>().resync_watchers();
             for problem in problems {
                 eprintln!("firesync: {problem}");

@@ -51,6 +51,9 @@ keyring = { version = "3", features = [
   "sync-secret-service",
 ] }
 
+# Canonicalises without Windows' \\?\ extended-length prefix, which std adds
+# unconditionally and which nothing here wants.
+dunce = "1"
 thiserror = "2"
 url = "2"
 uuid = { version = "1", features = ["v4"] }

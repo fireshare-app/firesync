@@ -133,10 +133,22 @@ impl Watchers {
 /// recorded as baseline and then queued anyway by the watcher, which is exactly
 /// the promise this feature exists to keep.
 ///
+/// On Windows this also drops the `\\?\` extended-length prefix that
+/// `std::fs::canonicalize` adds unconditionally. Nothing here wants it: it
+/// showed up verbatim in the interface, and it makes two spellings of the same
+/// folder that every path comparison then has to know about. It is kept only
+/// for the paths that genuinely require it — ones past the old length limit —
+/// which is exactly the distinction `dunce` draws.
+///
 /// Falls back to the original path when the file has already gone: an identity
 /// for something that no longer exists is not worth failing over.
 pub fn canonical(path: &std::path::Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The same tidying, for a path that is already recorded and need not exist.
+pub fn simplified(path: &std::path::Path) -> PathBuf {
+    dunce::simplified(path).to_path_buf()
 }
 
 /// notify's errors are accurate and unreadable. The inotify limit in particular

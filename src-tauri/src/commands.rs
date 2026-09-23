@@ -71,6 +71,42 @@ impl AppState {
         Ok(())
     }
 
+    /// Rewrite stored folder paths into their tidy form, moving the ledger's
+    /// rows with them.
+    ///
+    /// Windows' `\\?\` prefix was stored verbatim by earlier versions. Dropping
+    /// it from the config alone would leave every row keyed on the old spelling,
+    /// so each file would look unseen and a folder's baseline would be re-queued
+    /// as new — an upload of everything it was deliberately leaving alone. The
+    /// two move together or not at all.
+    pub fn tidy_stored_paths(&self) {
+        let mut settings = self.snapshot();
+        let mut changed = false;
+
+        for folder in settings.folders.iter_mut() {
+            let tidy = crate::watcher::simplified(&folder.path);
+            if tidy == folder.path {
+                continue;
+            }
+            let (old, new) = (folder.path.to_string_lossy().to_string(), tidy.to_string_lossy().to_string());
+            match self.ledger.rewrite_path_prefix(&folder.id, &old, &new) {
+                Ok(moved) => {
+                    eprintln!("firesync: tidied {old} -> {new} ({moved} rows moved)");
+                    folder.path = tidy;
+                    changed = true;
+                }
+                // Leave the pair alone rather than split them.
+                Err(e) => eprintln!("firesync: could not move rows for {old}: {e}"),
+            }
+        }
+
+        if changed {
+            if let Err(e) = self.persist(settings) {
+                eprintln!("firesync: could not save tidied paths: {e}");
+            }
+        }
+    }
+
     /// Bring watchers in line with the current folder list. Any folder that
     /// could not be watched is reported rather than silently dropped — a folder
     /// that looks active in the UI but is watching nothing is the worst outcome.
