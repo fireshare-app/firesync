@@ -14,6 +14,7 @@ import {
   PauseIcon,
   RetryIcon,
 } from '../components/Icons'
+import { humanRate } from '../lib/format'
 import {
   activity as activityApi,
   asAppError,
@@ -80,7 +81,9 @@ export function Activity() {
   const [rows, setRows] = useState<ActivityRow[]>([])
   const [folders, setFolders] = useState<FolderSummary[]>([])
   const [status, setStatus] = useState<QueueStatus | null>(null)
-  const [sending, setSending] = useState<Record<string, number>>({})
+  const [sending, setSending] = useState<Record<string, { fraction: number; rate: number | null }>>(
+    {},
+  )
   const [landings, setLandings] = useState<Record<string, string>>({})
   const [filter, setFilter] = useState<Filter>('all')
   const [copied, setCopied] = useState<number | null>(null)
@@ -105,11 +108,14 @@ export function Activity() {
 
   useEffect(() => {
     const stop = listen<UploadEvent>('firesync://upload', (event) => {
-      const { path, state, sent, size, landedAs, removedLocal } = event.payload
+      const { path, state, sent, size, bytesPerSecond, landedAs, removedLocal } = event.payload
       // Progress arrives twice a second and does not change the ledger row, so
       // it updates in place rather than triggering a reread.
       if (state === 'uploading') {
-        setSending((prev) => ({ ...prev, [path]: size > 0 ? sent / size : 0 }))
+        setSending((prev) => ({
+          ...prev,
+          [path]: { fraction: size > 0 ? sent / size : 0, rate: bytesPerSecond },
+        }))
         return
       }
       setSending((prev) => {
@@ -241,8 +247,8 @@ export function Activity() {
           </p>
         )}
         {visible.map((r) => {
-          const fraction = sending[r.path]
-          const inFlight = fraction !== undefined
+          const flight = sending[r.path]
+          const inFlight = flight !== undefined
           const state = inFlight ? 'uploading' : r.state
           return (
             <div key={r.id} className={`arow arow--${state}`}>
@@ -256,13 +262,18 @@ export function Activity() {
               <span className="spacer" />
               {inFlight ? (
                 <>
+                  {flight.rate !== null && flight.rate > 0 && (
+                    <span className="arow__rate mono">{humanRate(flight.rate)}</span>
+                  )}
                   <span className="arow__bar">
                     <span
                       className="arow__bar-fill"
-                      style={{ width: `${Math.min(100, Math.round(fraction * 100))}%` }}
+                      style={{ width: `${Math.min(100, Math.round(flight.fraction * 100))}%` }}
                     />
                   </span>
-                  <span className="arow__pct">{Math.min(100, Math.round(fraction * 100))}%</span>
+                  <span className="arow__pct">
+                    {Math.min(100, Math.round(flight.fraction * 100))}%
+                  </span>
                 </>
               ) : (
                 <>
