@@ -1,3 +1,2 @@
-- Fixes the setup screen appearing on launch with "state not managed for field state on command connection_status". Your server and token were never lost — the window was asking about them before Firesync had finished starting, and a single early failure was enough to send you to the setup form
-- This was also behind 0.1.2 asking to reconnect while the tray still showed the connection and uploads carried on. The same failure was happening then, silently
-- The first check is now retried for a couple of seconds before anything is concluded, so a slow start cannot cost you your setup
+- Settings has a "What's new" button next to the version. It opens the full release history, newest first, so you can read what changed in this version and catch up on any you skipped
+- Each entry links out to its page on GitHub if you want the full detail
