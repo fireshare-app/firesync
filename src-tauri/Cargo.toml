@@ -37,6 +37,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 rand = "0.8"
 # Wrapping the upload stream to count bytes as they leave.
 futures-util = "0.3"
+# The same identity Fireshare files videos under, so a backlog can be checked
+# against the library before anything is transferred.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Moving to the OS trash rather than unlinking, so "remove after upload" has an
 # undo for anyone who wants one.
 trash = "5"

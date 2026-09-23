@@ -98,3 +98,22 @@ pub async fn check_token(base_url: &str, token: &str) -> Result<TokenCheck> {
 pub async fn fetch_options(base_url: &str, token: &str) -> Result<UploadOptions> {
     get_json(base_url, token, "/api/upload/token/options").await
 }
+
+/// The server also returns the existing item's title and url. Only presence is
+/// used here — the picker says "in library", not which entry — so they are not
+/// carried into the client's types until something needs them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExistsAnswer {
+    #[serde(default)]
+    pub exists: bool,
+}
+
+/// Whether the library already holds a video with this content id.
+///
+/// Worth asking before a backlog is queued: the duplicate rejection on the
+/// upload routes only fires once the file is on the server's disk, so without
+/// this a folder that was already uploaded would be sent again in full, one
+/// file at a time, to be told each time that it was not needed.
+pub async fn video_exists(base_url: &str, token: &str, video_id: &str) -> Result<ExistsAnswer> {
+    get_json(base_url, token, &format!("/api/upload/token/exists?video_id={video_id}")).await
+}

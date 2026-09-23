@@ -209,3 +209,24 @@ export const updates = {
   install: () => invoke<void>('install_update'),
   blockedByUpload: () => invoke<boolean>('update_blocked_by_upload'),
 }
+
+// --- Phase 6: the backlog -------------------------------------------------
+
+export interface BacklogFile {
+  path: string
+  name: string
+  size: number
+  mtime: number
+  /** Why this folder's rules would exclude it, if they would. */
+  excluded: string | null
+  /** Filled in once the library has been asked. */
+  inLibrary: boolean | null
+}
+
+export const backlog = {
+  list: (folderId: string) => invoke<BacklogFile[]>('list_backlog', { folderId }),
+  checkAgainstLibrary: (paths: string[]) =>
+    invoke<[string, boolean][]>('check_backlog_against_library', { paths }),
+  queue: (folderId: string, paths: string[]) =>
+    invoke<number>('queue_backlog', { folderId, paths }),
+}

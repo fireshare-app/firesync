@@ -6,7 +6,8 @@ use tauri::Manager;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::api::client::normalize_base_url;
-use crate::api::discovery::{check_token, fetch_options, TokenCheck, UploadOptions};
+use crate::api::discovery::{check_token, fetch_options, video_exists, TokenCheck, UploadOptions};
+use crate::api::identity::video_id;
 use crate::config::{self, AfterUpload, MediaKind, Settings, WatchedFolder};
 use crate::error::{AppError, Result};
 use crate::ledger::{FileRow, Ledger};
@@ -461,4 +462,105 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<()> {
 #[tauri::command]
 pub fn update_blocked_by_upload(state: tauri::State<'_, AppState>) -> bool {
     crate::updater::busy_uploading(&state)
+}
+
+// ---------------------------------------------------------------------------
+// The backlog: files that were already there when a folder was added
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BacklogFile {
+    pub path: String,
+    pub name: String,
+    pub size: i64,
+    pub mtime: i64,
+    /// Why this folder's rules would exclude it, if they would.
+    pub excluded: Option<String>,
+    /// Set once the library has been asked about it.
+    pub in_library: Option<bool>,
+}
+
+/// Everything a folder is holding back, with the rules applied.
+///
+/// The rules are re-evaluated rather than trusted from when the file was
+/// recorded: a folder's size limits or media kinds may have changed since, and
+/// the picker should offer what would happen now, not what would have happened
+/// then.
+#[tauri::command]
+pub fn list_backlog(state: tauri::State<'_, AppState>, folder_id: String) -> Result<Vec<BacklogFile>> {
+    let settings = state.snapshot();
+    let Some(folder) = settings.folders.iter().find(|f| f.id == folder_id) else {
+        return Err(AppError::Storage("That folder is not being watched.".into()));
+    };
+    let types = state.types.lock().expect("types mutex").clone();
+
+    Ok(state
+        .ledger
+        .baseline_files(&folder_id)?
+        .into_iter()
+        .map(|row| {
+            let path = PathBuf::from(&row.path);
+            let excluded =
+                crate::queue::rules::evaluate(folder, &path, row.size.max(0) as u64, &types);
+            BacklogFile {
+                name: path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&row.path)
+                    .to_string(),
+                path: row.path,
+                size: row.size,
+                mtime: row.mtime,
+                excluded,
+                in_library: None,
+            }
+        })
+        .collect())
+}
+
+/// Ask the library which of these it already has.
+///
+/// Separate from listing because it is the slow part: every file is hashed and
+/// every hash is a round trip. The picker shows the list immediately and fills
+/// this in behind it, rather than making somebody wait on the network to see
+/// their own folder.
+#[tauri::command]
+pub async fn check_backlog_against_library(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<(String, bool)>> {
+    let (url, token) = state.credentials()?;
+    let mut answers = Vec::with_capacity(paths.len());
+
+    for path in paths {
+        let hashed = {
+            let p = PathBuf::from(&path);
+            tokio::task::spawn_blocking(move || video_id(&p)).await
+        };
+        // Only the first 16 MB is read, but that is still disk work, and a
+        // folder of 200 clips is 200 of them.
+        let Ok(Ok(id)) = hashed else {
+            answers.push((path, false));
+            continue;
+        };
+        match video_exists(&url, &token, &id).await {
+            Ok(answer) => answers.push((path, answer.exists)),
+            // An unreachable server should leave the picker usable rather than
+            // failing the whole listing; "not known to be present" is the safe
+            // reading, since it only ever means offering to upload something.
+            Err(_) => answers.push((path, false)),
+        }
+    }
+    Ok(answers)
+}
+
+/// Queue chosen files from the backlog.
+#[tauri::command]
+pub fn queue_backlog(
+    state: tauri::State<'_, AppState>,
+    folder_id: String,
+    paths: Vec<String>,
+) -> Result<usize> {
+    state.ledger.promote_baseline(&folder_id, &paths)
 }

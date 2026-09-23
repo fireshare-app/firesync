@@ -541,3 +541,38 @@ impl Ledger {
         Ok(())
     }
 }
+
+impl Ledger {
+    /// Files this folder is deliberately not uploading: the ones that were
+    /// already there when it was added.
+    pub fn baseline_files(&self, folder_id: &str) -> Result<Vec<FileRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, folder_id, path, size, mtime, state, reason, attempts,
+                        observed_at, updated_at
+                   FROM files WHERE folder_id = ?1 AND state = 'baseline'
+                  ORDER BY mtime DESC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![folder_id], |r| {
+                Ok(FileRow {
+                    id: r.get(0)?,
+                    folder_id: r.get(1)?,
+                    path: r.get(2)?,
+                    size: r.get(3)?,
+                    mtime: r.get(4)?,
+                    state: FileState::from_str(&r.get::<_, String>(5)?),
+                    reason: r.get(6)?,
+                    attempts: r.get(7)?,
+                    observed_at: r.get(8)?,
+                    updated_at: r.get(9)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+}

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
+import { Backlog } from './Backlog'
 import { listen } from '@tauri-apps/api/event'
 import {
   activity,
@@ -48,6 +49,7 @@ export function Folders({ options }: Props) {
   const [adding, setAdding] = useState(false)
   const [composing, setComposing] = useState(false)
   const [draftPath, setDraftPath] = useState('')
+  const [backlogFor, setBacklogFor] = useState<FolderSummary | null>(null)
 
   // Same filename in two watched folders is ordinary — a move between them
   // produces exactly that — so each row says which folder it belongs to.
@@ -296,6 +298,15 @@ export function Folders({ options }: Props) {
               >
                 {folder.enabled ? 'Pause' : 'Resume'}
               </button>
+              {folder.presentCount > 0 && (
+                <button
+                  type="button"
+                  className="btn btn--ghost btn--sm"
+                  onClick={() => setBacklogFor(folder)}
+                >
+                  Upload existing…
+                </button>
+              )}
               <button
                 type="button"
                 className="btn btn--ghost btn--sm"
@@ -412,6 +423,14 @@ export function Folders({ options }: Props) {
           </ul>
         )}
       </section>
+
+      {backlogFor && (
+        <Backlog
+          folder={backlogFor}
+          onClose={() => setBacklogFor(null)}
+          onQueued={refresh}
+        />
+      )}
     </div>
   )
 }
