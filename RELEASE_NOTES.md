@@ -1,1 +1,2 @@
-- Right-clicking the tray icon now opens the same panel a left click does, instead of a plain system menu. Windows only — on Linux the tray cannot report clicks at all, so it keeps its system menu
+- The sidebar no longer repeats the app name and logo that the title bar already shows an inch above them. The version moved to the foot of the sidebar, and is still in Settings under Updates
+- The example path in Add folder is a Windows one now, so it looks like something you might actually be about to type

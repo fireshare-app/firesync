@@ -1,6 +1,6 @@
 [package]
 name = "firesync"
-version = "1.0.1"
+version = "1.0.2"
 description = "Watches folders and uploads new clips and screenshots to Fireshare"
 authors = ["Shane Israel"]
 edition = "2021"
