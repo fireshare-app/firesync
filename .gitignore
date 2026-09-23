@@ -12,9 +12,9 @@ dist
 dist-ssr
 *.local
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
+# Editor and tooling directories, kept local
+.vscode
+.claude
 .idea
 .DS_Store
 *.suo
@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Planning and design notes, kept out of the published repository
+PLAN.md
+STACK.md

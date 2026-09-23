@@ -7,7 +7,7 @@ rules for where they land and what gets skipped.
 Windows and Linux. Built on Tauri v2 — a Rust core that keeps running with the window closed, and
 a React UI that only exists while you are looking at it.
 
-> Early development. Nothing here is releasable yet; see [PLAN.md](PLAN.md) for what lands when.
+> Early development. Nothing here is releasable yet.
 
 ## What it does
 
@@ -91,5 +91,6 @@ Three things, none of which can be done from a build:
 
 ## Design notes
 
-[STACK.md](STACK.md) — why Tauri, what the upload-token API does and does not give a desktop client,
-and the failure modes that shaped the design. [PLAN.md](PLAN.md) — the build order.
+The Rust core owns all durable state: the ledger of every file ever seen, the upload queue and its
+retry policy, the watcher, and the upload token. The webview renders that state and can be closed at
+any moment without interrupting a transfer.
