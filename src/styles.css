@@ -745,3 +745,20 @@ select {
 .crash__title { margin: 0; font-size: 18px; font-weight: 600; color: var(--text); }
 .crash__body { margin: 0; font-size: 13px; color: var(--text-dim); line-height: 1.5; }
 .crash__detail { margin: 0; width: 100%; font-size: 12px; color: var(--bad-text); background: var(--panel-sunken); border: 1px solid var(--border-soft); border-radius: 8px; padding: 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+/* Release notes ---------------------------------------------------------- */
+.modal__box--narrow { max-width: 620px; }
+.notes__scroll { gap: 26px; }
+.rel { display: flex; flex-direction: column; gap: 10px; }
+.rel__head { display: flex; align-items: center; gap: 9px; }
+.rel__version { font-size: 14px; font-weight: 600; color: var(--text); }
+.rel__badge { font-size: 10px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ok); background: var(--ok-bg); border: 1px solid var(--ok-border); border-radius: 5px; padding: 2px 6px; }
+.rel__badge--pre { color: var(--warn); background: #241d10; border-color: #6b5220; }
+.rel__date { font-size: 11.5px; color: var(--text-muted); }
+.rel__list { margin: 0; padding: 0 0 0 18px; display: flex; flex-direction: column; gap: 7px; }
+.rel__list li { font-size: 13px; line-height: 1.55; color: var(--text-dim); }
+/* A line that was not a bullet keeps its own shape rather than being given one. */
+.rel__para { list-style: none; margin-left: -18px; color: var(--text-muted); }
+.rel__none { margin: 0; font-size: 12.5px; color: var(--text-muted); font-style: italic; }
+/* Each release sits above a hairline, except the first. */
+.rel + .rel { border-top: 1px solid var(--border-soft); padding-top: 22px; }

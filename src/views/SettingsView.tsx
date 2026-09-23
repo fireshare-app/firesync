@@ -9,6 +9,7 @@ import {
   type UpdateInfo,
 } from '../lib/ipc'
 import { BellIcon } from '../components/Icons'
+import { ReleaseNotes } from './ReleaseNotes'
 import { Select } from '../components/Select'
 
 interface ToggleProps {
@@ -56,6 +57,7 @@ export function SettingsView({ connection, onDisconnected }: Props) {
   const [checking, setChecking] = useState(false)
   const [updateNote, setUpdateNote] = useState<string | null>(null)
   const [probe, setProbe] = useState<{ text: string; bad: boolean } | null>(null)
+  const [notesOpen, setNotesOpen] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -120,6 +122,12 @@ export function SettingsView({ connection, onDisconnected }: Props) {
 
   return (
     <div className="page">
+      {notesOpen && (
+        <ReleaseNotes
+          current={update?.currentVersion ?? __APP_VERSION__}
+          onClose={() => setNotesOpen(false)}
+        />
+      )}
       <header className="page__head">
         <div className="page__headtext">
           <h1 className="page__title">Settings</h1>
@@ -201,6 +209,13 @@ export function SettingsView({ connection, onDisconnected }: Props) {
             v{update?.currentVersion ?? __APP_VERSION__}
             {update ? ` · ${update.version} available` : ''}
           </span>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            onClick={() => setNotesOpen(true)}
+          >
+            What&rsquo;s new
+          </button>
         </h2>
         <Toggle
           id="u-auto"

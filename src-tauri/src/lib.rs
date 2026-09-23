@@ -5,6 +5,7 @@ mod error;
 mod ledger;
 mod notify;
 mod queue;
+mod releases;
 mod secrets;
 mod tray;
 mod updater;
@@ -169,6 +170,7 @@ pub fn run() {
             commands::recent_activity,
             commands::watcher_problems,
             commands::test_notification,
+            commands::release_history,
             commands::get_settings,
             commands::save_settings,
             commands::queue_status,
