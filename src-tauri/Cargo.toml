@@ -4,6 +4,8 @@ version = "1.0.2"
 description = "Watches folders and uploads new clips and screenshots to Fireshare"
 authors = ["Shane Israel"]
 edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/fireshare-app/firesync"
 
 [lib]
 # The `_lib` suffix keeps the lib name distinct from the bin name, which
