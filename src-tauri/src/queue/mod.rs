@@ -551,7 +551,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::config::{MediaKind, WatchedFolder};
     use crate::ledger::FileState;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
 
@@ -560,23 +560,65 @@ pub(crate) mod tests {
     /// Real sockets rather than a mocked client: the point of these tests is the
     /// status-to-disposition table, and that is only meaningful against a
     /// response that actually crossed a connection.
+    /// Read a whole request: headers, then the body.
+    ///
+    /// Reading only the headers and then answering is what made these tests
+    /// flaky. The server would respond and close while the client was still
+    /// writing its multipart body, the client would see the reset instead of
+    /// the status, and reqwest classifies that as a transport failure — so a
+    /// deliberate 400 arrived as "retryable" and the test asserting `Failed`
+    /// saw `Queued`. Whether it lost that race depended on machine load, which
+    /// is why it failed a few runs in twenty-five and never the same test.
+    pub(crate) fn read_request(stream: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).ok()? == 0 {
+                return None;
+            }
+            headers.push(byte[0]);
+        }
+
+        let text = String::from_utf8_lossy(&headers).to_lowercase();
+        let length: Option<usize> = text
+            .split("content-length:")
+            .nth(1)
+            .and_then(|rest| rest.split("\r\n").next())
+            .and_then(|v| v.trim().parse().ok());
+
+        let mut body = Vec::new();
+        match length {
+            Some(len) => {
+                body.resize(len, 0);
+                stream.read_exact(&mut body).ok()?;
+            }
+            // Chunked transfer encoding, which reqwest uses when a part's
+            // length is unknown. Rather than decode it, read until the client
+            // stops talking — enough to be sure it is no longer writing.
+            None => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&buf[..n]);
+                }
+                let _ = stream.set_read_timeout(None);
+            }
+        }
+        Some(body)
+    }
+
     pub(crate) fn serve(status: u16, extra_headers: &str, body: &'static str) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let headers = extra_headers.to_string();
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                // Drain the request so the client is not writing into a closed
-                // socket while we answer.
-                let peek = stream.try_clone().unwrap();
-                let mut reader = BufReader::new(peek);
-                let mut line = String::new();
-                while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if line == "\r\n" {
-                        break;
-                    }
-                    line.clear();
-                }
+                // The whole request, body included, before answering.
+                let _ = read_request(&mut stream);
+
                 let reason = match status {
                     201 => "CREATED",
                     400 => "BAD REQUEST",
@@ -587,9 +629,6 @@ pub(crate) mod tests {
                     503 => "SERVICE UNAVAILABLE",
                     _ => "ERROR",
                 };
-                // Connection: close, or reqwest can read the socket ending as a
-                // dropped connection — which classifies as retryable and turns
-                // a deterministic status test into a flaky one.
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n{headers}\r\n{body}",
                     body.len()
@@ -960,7 +999,7 @@ mod chunked_tests {
     use crate::api::upload::ChunkPolicy;
     use crate::config::AfterUpload;
     use crate::ledger::FileState;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -1064,31 +1103,6 @@ mod chunked_tests {
                 drop(h);
             }
         }
-    }
-
-    fn read_request(stream: &mut std::net::TcpStream) -> Option<Vec<u8>> {
-        let mut buf = Vec::new();
-        let mut byte = [0u8; 1];
-        // Headers, one byte at a time — slow but unambiguous, and these bodies
-        // are kilobytes.
-        while !buf.ends_with(b"\r\n\r\n") {
-            if stream.read(&mut byte).ok()? == 0 {
-                return None;
-            }
-            buf.push(byte[0]);
-        }
-        let headers = String::from_utf8_lossy(&buf).to_lowercase();
-        let len: usize = headers
-            .split("content-length:")
-            .nth(1)?
-            .split("\r\n")
-            .next()?
-            .trim()
-            .parse()
-            .ok()?;
-        let mut body = vec![0u8; len];
-        stream.read_exact(&mut body).ok()?;
-        Some(body)
     }
 
     /// Pull a multipart text field out of a raw body. Crude, and enough: these
