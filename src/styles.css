@@ -429,7 +429,11 @@ select {
 .tag { font-size: 11.5px; color: var(--text-dim); background: #12314e; border-radius: 5px; padding: 4px 8px; }
 .tag--game { color: var(--text); background: rgba(188, 0, 230, 0.16); border: 1px solid rgba(255, 55, 41, 0.35); font-weight: 600; padding: 3px 8px; }
 
-.fcard__progress { border-top: 1px solid var(--border-soft); padding-top: 11px; display: flex; flex-direction: column; gap: 7px; }
+/* Several files go up at once, so the card stacks one bar per file. Only the
+   first wears the divider — the rest read as a group under it. */
+.fcard__flights { display: flex; flex-direction: column; gap: 10px; }
+.fcard__progress { display: flex; flex-direction: column; gap: 7px; }
+.fcard__flights .fcard__progress:first-child { border-top: 1px solid var(--border-soft); padding-top: 11px; }
 .fcard__progresshead { display: flex; align-items: baseline; gap: 10px; font-size: 12px; color: var(--text-muted); }
 .fcard__progresshead .mono { color: var(--text); }
 .fcard__bar { height: 5px; border-radius: 3px; background: #12314e; overflow: hidden; }
@@ -456,17 +460,24 @@ select {
 .arow__icon--failed { color: var(--bad); }
 .arow__icon--done { color: var(--ok); }
 .arow__icon--queued { color: var(--warn); }
-.arow__name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Every variable-length cell in a row truncates and carries the full text as a
+   tooltip. A clip named by its kill feed is not rare, and one long name must not
+   be allowed to push the size and the timestamp out of their columns. */
+.arow__name { color: var(--text); flex: 0 1 auto; min-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.arow__landed { flex: 0 1 auto; min-width: 0; max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
 .arow--failed .arow__name { color: var(--text); }
 .arow__folder { font-size: 10.5px; color: var(--text-muted); background: var(--border-soft); border-radius: 4px; padding: 2px 6px; flex-shrink: 0; }
 .arow__meta { font-size: 11.5px; color: var(--text-muted); white-space: nowrap; }
-.arow__reason { font-size: 11.5px; color: var(--warn); }
+.arow__reason { font-size: 11.5px; color: var(--warn); flex: 0 1 auto; min-width: 0; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* A duplicate is a success with nothing to do, and a skip is a rule working as
    asked. Neither is a warning, so neither wears warning colour. */
 .arow--duplicate .arow__reason,
 .arow--skipped .arow__reason { color: var(--text-muted); }
 .arow--failed .arow__reason { color: var(--bad-text); }
 .arow__when { font-size: 12px; color: var(--text-muted); width: 104px; text-align: right; }
+/* Row actions sit in a fixed slot so names and times stay in their columns
+   whether or not a row has a link to offer. */
+.arow__actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; width: 52px; justify-content: flex-end; }
 .arow__bar { width: 140px; height: 4px; border-radius: 3px; background: #12314e; overflow: hidden; flex-shrink: 0; }
 .arow__bar-fill { display: block; height: 4px; background: linear-gradient(90deg, #007fff, #66b2ff); transition: width 0.4s ease; }
 .arow__pct { width: 40px; text-align: right; font-size: 12px; font-weight: 600; color: var(--accent-light); font-variant-numeric: tabular-nums; }
@@ -670,3 +681,52 @@ select {
 .tp__icon { display: inline-flex; flex-shrink: 0; color: var(--text-dim); }
 .tp__value { margin-left: auto; font-size: 12px; color: var(--text-muted); }
 .tp__count { margin-left: auto; font-size: 11px; font-weight: 600; color: #071320; background: var(--warn); border-radius: 9px; padding: 1px 7px; }
+
+/* Small icon-only action buttons, dim until wanted ----------------------- */
+.iconbtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0;
+  border: 0; border-radius: 6px;
+  background: transparent; color: var(--text-muted);
+  cursor: pointer; opacity: 0.6;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.iconbtn:hover { opacity: 1; background: var(--border-soft); color: var(--text); }
+.iconbtn:focus-visible { opacity: 1; outline: 2px solid var(--accent); outline-offset: 1px; }
+.arow:hover .iconbtn { opacity: 0.85; }
+.arow:hover .iconbtn:hover { opacity: 1; }
+
+/* Scrollbars -------------------------------------------------------------
+   The platform default is a wide, pale bar that reads as part of the page
+   rather than part of the chrome, which on a dark panel is the one thing it
+   should not do. Thin, transparent-tracked, and only as visible as it needs to
+   be to say how far down you are.
+
+   Both spellings are here on purpose, and only one applies per engine: from
+   Chromium 121 on, setting `scrollbar-width` or `scrollbar-color` makes the
+   ::-webkit-scrollbar rules be ignored entirely. So WebView2 on Windows takes
+   the standard properties below, and an older WebKitGTK on Linux — which does
+   not know them — falls through to the pseudo-elements. Changing the colour
+   means changing it in both places. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #24557f transparent;
+}
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #24557f;
+  border-radius: 99px;
+  /* Drawn inside a transparent border so the thumb is slimmer than the track
+     it needs for a comfortable hit area. */
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #3a74a8; background-clip: content-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* A panel's own action row, under the switches it belongs to. */
+.panel__action { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 4px; }
+.panel__probe { font-size: 12px; color: var(--text-muted); }
+.panel__probe--bad { color: var(--bad-text); }

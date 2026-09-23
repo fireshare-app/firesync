@@ -58,8 +58,15 @@ interface Props {
   onChanged?: () => void
 }
 
-/** An upload in flight, keyed by the folder it belongs to. */
+/**
+ * An upload in flight, keyed by the file's path.
+ *
+ * Keyed by path rather than by folder because the queue sends several files at
+ * once: a per-folder key meant each tick overwrote the last, and the card
+ * flickered between whichever files happened to report most recently.
+ */
 interface InFlight {
+  folderId: string
   name: string
   fraction: number
 }
@@ -96,7 +103,8 @@ export function Folders({ options, onChanged }: Props) {
       if (state === 'uploading') {
         setInFlight((prev) => ({
           ...prev,
-          [folder.id]: {
+          [path]: {
+            folderId: folder.id,
             name: path.split(/[\\/]/).pop() ?? path,
             fraction: size > 0 ? sent / size : 0,
           },
@@ -105,7 +113,7 @@ export function Folders({ options, onChanged }: Props) {
       }
       setInFlight((prev) => {
         const next = { ...prev }
-        delete next[folder.id]
+        delete next[path]
         return next
       })
       void refresh()
@@ -156,18 +164,21 @@ export function Folders({ options, onChanged }: Props) {
 
       <div className="cards">
         {list.map((folder) => {
-          const flight = inFlight[folder.id]
+          const flights = Object.entries(inFlight)
+            .filter(([, f]) => f.folderId === folder.id)
+            .sort(([a], [b]) => a.localeCompare(b))
+          const live = flights.length > 0
           const failed = countOf(folder, 'failed')
           const lastUpload = ago(folder.lastUploadAt ?? 0)
           return (
-            <article key={folder.id} className={`fcard ${flight ? 'fcard--live' : ''}`}>
+            <article key={folder.id} className={`fcard ${live ? 'fcard--live' : ''}`}>
               <div className="fcard__head">
                 <span
-                  className={`dot ${!folder.enabled ? 'dot--off' : flight ? 'dot--live' : 'dot--ok'}`}
+                  className={`dot ${!folder.enabled ? 'dot--off' : live ? 'dot--live' : 'dot--ok'}`}
                 />
                 <span className="mono fcard__path">{folder.path}</span>
-                <span className={`pill ${!folder.enabled ? '' : flight ? 'pill--live' : 'pill--ok'}`}>
-                  {!folder.enabled ? 'Paused' : flight ? 'Uploading' : 'Watching'}
+                <span className={`pill ${!folder.enabled ? '' : live ? 'pill--live' : 'pill--ok'}`}>
+                  {!folder.enabled ? 'Paused' : live ? 'Uploading' : 'Watching'}
                 </span>
                 <span className="spacer" />
                 <button
@@ -227,19 +238,23 @@ export function Folders({ options, onChanged }: Props) {
                 )}
               </div>
 
-              {flight ? (
-                <div className="fcard__progress">
-                  <div className="fcard__progresshead">
-                    <span className="mono">{flight.name}</span>
-                    <span className="spacer" />
-                    <span>{Math.min(100, Math.round(flight.fraction * 100))}%</span>
-                  </div>
-                  <div className="fcard__bar">
-                    <div
-                      className="fcard__bar-fill"
-                      style={{ width: `${Math.min(100, Math.round(flight.fraction * 100))}%` }}
-                    />
-                  </div>
+              {flights.length > 0 ? (
+                <div className="fcard__flights">
+                  {flights.map(([path, flight]) => {
+                    const pct = Math.min(100, Math.round(flight.fraction * 100))
+                    return (
+                      <div key={path} className="fcard__progress">
+                        <div className="fcard__progresshead">
+                          <span className="mono">{flight.name}</span>
+                          <span className="spacer" />
+                          <span>{pct}%</span>
+                        </div>
+                        <div className="fcard__bar">
+                          <div className="fcard__bar-fill" style={{ width: `${pct}%` }} />
+                        </div>
+                      </div>
+                    )
+                  })}
                 </div>
               ) : failed > 0 ? (
                 <div className="fcard__warn">

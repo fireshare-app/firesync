@@ -44,6 +44,21 @@ pub fn screen_is_busy() -> bool {
     false
 }
 
+/// What a test notification found out.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationProbe {
+    /// The platform accepted the toast. It can still be swallowed downstream by
+    /// Focus Assist or by the per-app notification switch, which is why this is
+    /// reported as "accepted" rather than "shown".
+    pub delivered: bool,
+    pub error: Option<String>,
+    /// Something owns the screen right now.
+    pub screen_busy: bool,
+    /// A real notification arriving this second would have been held.
+    pub would_hold: bool,
+}
+
 /// One thing worth telling somebody about.
 #[derive(Debug, Clone)]
 pub struct Note {
@@ -114,17 +129,51 @@ impl Notifier {
             return;
         }
 
-        self.show(&note);
+        self.show_logging(&note);
     }
 
-    fn show(&self, note: &Note) {
-        let _ = self
-            .app
+    /// Hand a note to the OS.
+    ///
+    /// The error is returned rather than dropped because the two ways a
+    /// notification goes missing — held here on purpose, or refused by the
+    /// platform — are indistinguishable from the outside, and swallowing this
+    /// one made them indistinguishable from the inside too.
+    fn show(&self, note: &Note) -> std::result::Result<(), String> {
+        self.app
             .notification()
             .builder()
             .title(&note.title)
             .body(&note.body)
-            .show();
+            .show()
+            .map_err(|e| e.to_string())
+    }
+
+    fn show_logging(&self, note: &Note) {
+        if let Err(e) = self.show(note) {
+            eprintln!("firesync: the system refused a notification: {e}");
+        }
+    }
+
+    /// Deliver one note right now, ignoring the quiet-hours rules, and say what
+    /// happened.
+    ///
+    /// This exists for the "send a test notification" button, whose entire job
+    /// is to tell those two failures apart: it reports whether the platform
+    /// accepted the toast *and*, separately, whether a real notification would
+    /// have been held back at this moment.
+    pub fn probe(&self) -> NotificationProbe {
+        let note = Note {
+            title: "Firesync".into(),
+            body: "Notifications are working.".into(),
+            needs_attention: false,
+        };
+        let result = self.show(&note);
+        NotificationProbe {
+            delivered: result.is_ok(),
+            error: result.err(),
+            screen_busy: screen_is_busy(),
+            would_hold: self.quiet_while_busy() && screen_is_busy(),
+        }
     }
 
     /// Wait for the screen to be free, then deliver whatever piled up as one
@@ -151,7 +200,7 @@ impl Notifier {
                     this.draining.store(false, Ordering::SeqCst);
                     return;
                 }
-                this.show(&summarise(&held));
+                this.show_logging(&summarise(&held));
             }
         });
     }

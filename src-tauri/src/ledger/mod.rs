@@ -94,6 +94,10 @@ pub struct FileRow {
     pub state: FileState,
     pub reason: Option<String>,
     pub attempts: i64,
+    /// Fireshare's own id for these bytes, once it has been computed. The same
+    /// xxh3 the server files media under, so a link can be built without asking
+    /// it anything.
+    pub content_hash: Option<String>,
     pub observed_at: i64,
     pub updated_at: i64,
 }
@@ -273,7 +277,7 @@ impl Ledger {
         let mut stmt = conn
             .prepare(
                 "SELECT id, folder_id, path, size, mtime, state, reason, attempts,
-                        observed_at, updated_at
+                        content_hash, observed_at, updated_at
                    FROM files ORDER BY updated_at DESC, id DESC LIMIT ?1",
             )
             .map_err(db_err)?;
@@ -288,8 +292,9 @@ impl Ledger {
                     state: FileState::from_str(&r.get::<_, String>(5)?),
                     reason: r.get(6)?,
                     attempts: r.get(7)?,
-                    observed_at: r.get(8)?,
-                    updated_at: r.get(9)?,
+                    content_hash: r.get(8)?,
+                    observed_at: r.get(9)?,
+                    updated_at: r.get(10)?,
                 })
             })
             .map_err(db_err)?
@@ -327,6 +332,9 @@ pub struct Claim {
     pub path: String,
     pub size: i64,
     pub attempts: i64,
+    /// Already known for a file coming back for a second attempt, so the header
+    /// is read once per file rather than once per try.
+    pub content_hash: Option<String>,
 }
 
 impl Ledger {
@@ -340,7 +348,7 @@ impl Ledger {
         let claims: Vec<Claim> = {
             let mut stmt = tx
                 .prepare(
-                    "SELECT id, folder_id, path, size, attempts FROM files
+                    "SELECT id, folder_id, path, size, attempts, content_hash FROM files
                       WHERE state = 'queued'
                         AND (next_try_at IS NULL OR next_try_at <= ?1)
                       ORDER BY next_try_at IS NULL DESC, next_try_at ASC, id ASC
@@ -355,6 +363,7 @@ impl Ledger {
                         path: r.get(2)?,
                         size: r.get(3)?,
                         attempts: r.get(4)?,
+                        content_hash: r.get(5)?,
                     })
                 })
                 .map_err(db_err)?
@@ -375,6 +384,18 @@ impl Ledger {
         }
         tx.commit().map_err(db_err)?;
         Ok(claims)
+    }
+
+    /// Remember Fireshare's id for these bytes.
+    ///
+    /// Recorded before the upload rather than after it, because "remove after
+    /// upload" sends the file to the trash the moment the server confirms —
+    /// and by then there is nothing left to hash.
+    pub fn record_hash(&self, id: i64, hash: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("UPDATE files SET content_hash = ?1 WHERE id = ?2", params![hash, id])
+            .map_err(db_err)?;
+        Ok(())
     }
 
     pub fn mark_done(&self, id: i64, remote_url: Option<&str>) -> Result<()> {
@@ -550,7 +571,7 @@ impl Ledger {
         let mut stmt = conn
             .prepare(
                 "SELECT id, folder_id, path, size, mtime, state, reason, attempts,
-                        observed_at, updated_at
+                        content_hash, observed_at, updated_at
                    FROM files WHERE folder_id = ?1 AND state = 'baseline'
                   ORDER BY mtime DESC",
             )
@@ -566,8 +587,9 @@ impl Ledger {
                     state: FileState::from_str(&r.get::<_, String>(5)?),
                     reason: r.get(6)?,
                     attempts: r.get(7)?,
-                    observed_at: r.get(8)?,
-                    updated_at: r.get(9)?,
+                    content_hash: r.get(8)?,
+                    observed_at: r.get(9)?,
+                    updated_at: r.get(10)?,
                 })
             })
             .map_err(db_err)?
