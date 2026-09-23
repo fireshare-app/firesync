@@ -2,11 +2,13 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   api,
   asAppError,
+  notifications as notificationsApi,
   updates,
   type Connection,
   type Settings,
   type UpdateInfo,
 } from '../lib/ipc'
+import { BellIcon } from '../components/Icons'
 import { Select } from '../components/Select'
 
 interface ToggleProps {
@@ -53,6 +55,7 @@ export function SettingsView({ connection, onDisconnected }: Props) {
   const [update, setUpdate] = useState<UpdateInfo | null>(null)
   const [checking, setChecking] = useState(false)
   const [updateNote, setUpdateNote] = useState<string | null>(null)
+  const [probe, setProbe] = useState<{ text: string; bad: boolean } | null>(null)
 
   const load = useCallback(async () => {
     try {
@@ -78,6 +81,33 @@ export function SettingsView({ connection, onDisconnected }: Props) {
     } catch (e) {
       setError(asAppError(e).message)
       void load()
+    }
+  }
+
+  // Say which of the two silences this is.
+  //
+  // The toast is sent regardless of the quiet setting — a test that obeys the
+  // rule it is meant to be testing around tells you nothing — and the rule's
+  // current verdict is reported separately.
+  async function runTest() {
+    setProbe(null)
+    try {
+      const r = await notificationsApi.test()
+      if (!r.delivered) {
+        setProbe({ text: r.error ?? 'The system refused it.', bad: true })
+      } else if (r.wouldHold) {
+        setProbe({
+          text: 'Sent. Something has the screen, so a real one would be held until you alt-tab out.',
+          bad: false,
+        })
+      } else {
+        setProbe({
+          text: "Sent. If nothing appeared, check this app's notification permission in your OS settings.",
+          bad: false,
+        })
+      }
+    } catch (e) {
+      setProbe({ text: asAppError(e).message, bad: true })
     }
   }
 
@@ -154,6 +184,13 @@ export function SettingsView({ connection, onDisconnected }: Props) {
           checked={n.group_bursts}
           onChange={(v) => patch({ ...settings, notifications: { ...n, group_bursts: v } })}
         />
+        <div className="panel__action">
+          <button type="button" className="btn btn--ghost btn--icon" onClick={() => void runTest()}>
+            <BellIcon />
+            Send a test notification
+          </button>
+          {probe && <span className={`panel__probe ${probe.bad ? 'panel__probe--bad' : ''}`}>{probe.text}</span>}
+        </div>
       </section>
 
       <section className="panel">

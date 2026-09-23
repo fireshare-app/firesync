@@ -132,3 +132,30 @@ export const DotsIcon = ({ size = 14 }: Props) => (
     <circle cx="8" cy="12.5" r="1.1" fill="currentColor" />
   </svg>
 )
+
+export const LinkIcon = ({ size = 15 }: Props) => (
+  <svg width={size} height={size} viewBox="0 0 18 18" aria-hidden="true">
+    <path d="M7.4 10.6a2.9 2.9 0 0 0 4.3.3l2-2a2.9 2.9 0 0 0-4.1-4.1l-1.1 1.1" {...stroke} strokeWidth="1.4" />
+    <path d="M10.6 7.4a2.9 2.9 0 0 0-4.3-.3l-2 2a2.9 2.9 0 0 0 4.1 4.1l1.1-1.1" {...stroke} strokeWidth="1.4" />
+  </svg>
+)
+
+export const ExternalLinkIcon = ({ size = 15 }: Props) => (
+  <svg width={size} height={size} viewBox="0 0 18 18" aria-hidden="true">
+    <path d="M10.6 2.8H15v4.4M15 2.8 8.4 9.4" {...stroke} strokeWidth="1.4" />
+    <path d="M13.2 10.8v3.2c0 .7-.6 1.3-1.3 1.3H4c-.7 0-1.3-.6-1.3-1.3V6.1c0-.7.6-1.3 1.3-1.3h3.2" {...stroke} strokeWidth="1.4" />
+  </svg>
+)
+
+export const CheckIcon = ({ size = 15 }: Props) => (
+  <svg width={size} height={size} viewBox="0 0 18 18" aria-hidden="true">
+    <path d="m3.8 9.4 3.2 3.2 7.2-7.2" {...stroke} strokeWidth="1.6" />
+  </svg>
+)
+
+export const BellIcon = ({ size = 14 }: Props) => (
+  <svg width={size} height={size} viewBox="0 0 18 18" aria-hidden="true">
+    <path d="M9 2.4a4.3 4.3 0 0 0-4.3 4.3c0 3.5-1.4 4.6-1.4 4.6h11.4s-1.4-1.1-1.4-4.6A4.3 4.3 0 0 0 9 2.4Z" {...stroke} strokeWidth="1.4" />
+    <path d="M10.3 14a1.4 1.4 0 0 1-2.6 0" {...stroke} strokeWidth="1.4" />
+  </svg>
+)

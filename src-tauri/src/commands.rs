@@ -10,7 +10,7 @@ use crate::api::discovery::{check_token, fetch_options, video_exists, TokenCheck
 use crate::api::identity::video_id;
 use crate::config::{self, AfterUpload, MediaKind, Settings, WatchedFolder};
 use crate::error::{AppError, Result};
-use crate::ledger::{FileRow, Ledger};
+use crate::ledger::{FileRow, FileState, Ledger};
 use crate::queue::rules::SupportedTypes;
 use crate::queue::QueueControl;
 use crate::secrets::TokenCache;
@@ -453,9 +453,81 @@ pub fn upload_existing(
     state.ledger.promote_baseline(&folder_id, &paths)
 }
 
+/// A ledger row plus the one thing the UI cannot work out for itself.
+///
+/// The link is built here rather than in the webview because everything it
+/// needs — the server address and which extensions the server calls a video —
+/// already lives on this side, and duplicating the extension lists in
+/// TypeScript would mean two places to be wrong.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityRow {
+    #[serde(flatten)]
+    pub file: FileRow,
+    /// Where this landed in Fireshare. `None` until the file has a hash and has
+    /// actually arrived — an upload that failed has nothing to open.
+    pub link: Option<String>,
+}
+
 #[tauri::command]
-pub fn recent_activity(state: tauri::State<'_, AppState>, limit: Option<i64>) -> Result<Vec<FileRow>> {
-    state.ledger.recent(limit.unwrap_or(200))
+pub fn recent_activity(
+    state: tauri::State<'_, AppState>,
+    limit: Option<i64>,
+) -> Result<Vec<ActivityRow>> {
+    let rows = state.ledger.recent(limit.unwrap_or(200))?;
+    let base = state.settings.lock().expect("settings mutex").server_url.clone();
+    let types = state.types.lock().expect("types mutex").clone();
+
+    Ok(rows
+        .into_iter()
+        .map(|file| {
+            let link = link_for(&file, base.as_deref(), &types);
+            ActivityRow { file, link }
+        })
+        .collect())
+}
+
+/// The page a row can be opened at, when there is one.
+///
+/// `duplicate` counts alongside `done`: the server said it already had these
+/// bytes, which means the page exists — arguably the case where wanting the
+/// link is most likely, since nothing new appeared to go looking for.
+fn link_for(file: &FileRow, base: Option<&str>, types: &SupportedTypes) -> Option<String> {
+    use crate::api::identity::{media_url, Viewer};
+
+    if !matches!(file.state, FileState::Done | FileState::Duplicate) {
+        return None;
+    }
+    let hash = file.content_hash.as_deref()?;
+    let base = base?;
+
+    let ext = std::path::Path::new(&file.path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+
+    let viewer = if types.image.iter().any(|t| t == &ext) {
+        Viewer::Image
+    } else if types.video.iter().any(|t| t == &ext) {
+        Viewer::Watch
+    } else {
+        return None;
+    };
+
+    Some(media_url(base, hash, viewer))
+}
+
+/// Send a notification right now and report what the platform said.
+///
+/// Worth a button because "no toast appeared" has two completely different
+/// causes — Firesync held it on purpose, or Windows declined to show it — and
+/// from the outside they look the same. This separates them: it always attempts
+/// delivery, and reports the suppression state alongside rather than obeying it.
+#[tauri::command]
+pub fn test_notification(
+    notifier: tauri::State<'_, std::sync::Arc<crate::notify::Notifier>>,
+) -> crate::notify::NotificationProbe {
+    notifier.probe()
 }
 
 #[tauri::command]

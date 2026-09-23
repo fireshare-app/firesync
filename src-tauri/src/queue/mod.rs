@@ -374,6 +374,20 @@ async fn run_one<F>(
 
     let file_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
 
+    // Fireshare's id for these bytes, worked out before a single one is sent.
+    // The order matters: "remove after upload" trashes the file the moment the
+    // server confirms, so anything computed from its contents has to already
+    // exist by then. Reading the 16 MB header is cheap next to the upload that
+    // follows, and it is what makes an Activity row linkable afterwards.
+    if claim.content_hash.is_none() {
+        let for_hash = path.clone();
+        if let Ok(Ok(hash)) =
+            tokio::task::spawn_blocking(move || crate::api::identity::video_id(&for_hash)).await
+        {
+            let _ = ledger.record_hash(claim.id, &hash);
+        }
+    }
+
     // Reported from the side rather than from inside the transfer: the sender
     // only adds to this counter, and a ticker reads it on its own schedule. A
     // three gigabyte upload should not be deciding how often the UI redraws,

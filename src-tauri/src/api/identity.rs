@@ -22,6 +22,32 @@ pub fn video_id(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&header)))
 }
 
+/// Which of Fireshare's two viewers a file ends up in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Viewer {
+    Watch,
+    Image,
+}
+
+/// The page a finished upload can be opened at.
+///
+/// Built locally rather than read from a response, because the upload routes
+/// answer before the scan that creates the row has run and so have no id to
+/// give. They do not need to: `video_id` and `image_id` are the same digest of
+/// the same bytes, and we already computed it to send the file.
+///
+/// The link can therefore be correct a moment before it resolves — the scan is
+/// what publishes the page. Nothing here can close that window, and it is
+/// seconds.
+pub fn media_url(base_url: &str, hash: &str, viewer: Viewer) -> String {
+    let base = base_url.trim_end_matches('/');
+    let segment = match viewer {
+        Viewer::Watch => "w",
+        Viewer::Image => "i",
+    };
+    format!("{base}/{segment}/{hash}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +92,31 @@ mod tests {
 
         assert_eq!(video_id(&a).unwrap(), video_id(&b).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn videos_and_images_use_the_viewer_each_belongs_to() {
+        assert_eq!(
+            media_url("https://v.fireshare.net", "abc", Viewer::Watch),
+            "https://v.fireshare.net/w/abc"
+        );
+        assert_eq!(
+            media_url("https://v.fireshare.net", "abc", Viewer::Image),
+            "https://v.fireshare.net/i/abc"
+        );
+    }
+
+    /// A base URL that picked up a trailing slash must not produce `//w/`.
+    #[test]
+    fn a_trailing_slash_does_not_double_up() {
+        assert_eq!(
+            media_url("https://v.fireshare.net/", "abc", Viewer::Watch),
+            "https://v.fireshare.net/w/abc"
+        );
     }
 }

@@ -42,6 +42,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
@@ -92,6 +93,9 @@ pub fn run() {
             });
 
             app.manage(state);
+            // So the "send a test notification" button can reach the same
+            // notifier the queue uses, rather than testing a different one.
+            app.manage(notifier.clone());
             // Before anything watches or scans, so both see the same spelling.
             app.state::<AppState>().tidy_stored_paths();
             let problems = app.state::<AppState>().resync_watchers();
@@ -146,6 +150,7 @@ pub fn run() {
             commands::queue_backlog,
             commands::recent_activity,
             commands::watcher_problems,
+            commands::test_notification,
             commands::get_settings,
             commands::save_settings,
             commands::queue_status,

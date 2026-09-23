@@ -124,8 +124,18 @@ export interface FileRow {
   state: FileState
   reason: string | null
   attempts: number
+  /** Fireshare's id for these bytes, once it has been computed. */
+  contentHash: string | null
   observedAt: number
   updatedAt: number
+}
+
+export interface ActivityRow extends FileRow {
+  /**
+   * The page this landed on in Fireshare, when there is one. Built in Rust,
+   * where the server address and the extension lists already live.
+   */
+  link: string | null
 }
 
 export interface FolderSummary extends WatchedFolder {
@@ -177,7 +187,22 @@ export const folders = {
 }
 
 export const activity = {
-  recent: (limit = 200) => invoke<FileRow[]>('recent_activity', { limit }),
+  recent: (limit = 200) => invoke<ActivityRow[]>('recent_activity', { limit }),
+}
+
+/** What a test notification found out. */
+export interface NotificationProbe {
+  /** The platform accepted the toast. It may still be hidden downstream. */
+  delivered: boolean
+  error: string | null
+  /** Something owns the screen right now. */
+  screenBusy: boolean
+  /** A real notification arriving this second would have been held back. */
+  wouldHold: boolean
+}
+
+export const notifications = {
+  test: () => invoke<NotificationProbe>('test_notification'),
 }
 
 // --- Phase 3: the upload queue -------------------------------------------

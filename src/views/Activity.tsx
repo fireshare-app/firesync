@@ -1,11 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import {
+  AlertCircleIcon,
   ArrowUpIcon,
   CheckCircleIcon,
+  CheckIcon,
   ClockIcon,
   CopyIcon,
-  AlertCircleIcon,
+  ExternalLinkIcon,
+  LinkIcon,
   PauseIcon,
   RetryIcon,
 } from '../components/Icons'
@@ -14,7 +19,7 @@ import {
   asAppError,
   folders as foldersApi,
   queue as queueApi,
-  type FileRow,
+  type ActivityRow,
   type FileState,
   type FolderSummary,
   type QueueStatus,
@@ -72,13 +77,15 @@ function iconFor(state: FileState, inFlight: boolean) {
 }
 
 export function Activity() {
-  const [rows, setRows] = useState<FileRow[]>([])
+  const [rows, setRows] = useState<ActivityRow[]>([])
   const [folders, setFolders] = useState<FolderSummary[]>([])
   const [status, setStatus] = useState<QueueStatus | null>(null)
   const [sending, setSending] = useState<Record<string, number>>({})
   const [landings, setLandings] = useState<Record<string, string>>({})
   const [filter, setFilter] = useState<Filter>('all')
+  const [copied, setCopied] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -125,6 +132,21 @@ export function Activity() {
       void stop.then((fn) => fn())
     }
   }, [refresh])
+
+  useEffect(() => () => {
+    if (copyTimer.current) clearTimeout(copyTimer.current)
+  }, [])
+
+  const copyLink = useCallback(async (id: number, link: string) => {
+    try {
+      await writeText(link)
+      setCopied(id)
+      if (copyTimer.current) clearTimeout(copyTimer.current)
+      copyTimer.current = setTimeout(() => setCopied(null), 1600)
+    } catch (e) {
+      setError(asAppError(e).message)
+    }
+  }, [])
 
   const folderName = useCallback(
     (id: string) => {
@@ -225,7 +247,9 @@ export function Activity() {
           return (
             <div key={r.id} className={`arow arow--${state}`}>
               <span className={`arow__icon arow__icon--${state}`}>{iconFor(r.state, inFlight)}</span>
-              <span className="mono arow__name">{basename(r.path)}</span>
+              <span className="mono arow__name" title={r.path}>
+                {basename(r.path)}
+              </span>
               {folderName(r.folderId) && (
                 <span className="arow__folder">{folderName(r.folderId)}</span>
               )}
@@ -242,10 +266,40 @@ export function Activity() {
                 </>
               ) : (
                 <>
-                  {landings[r.path] && <span className="arow__meta mono">{landings[r.path]}</span>}
-                  {r.reason && <span className="arow__reason">{r.reason}</span>}
+                  {landings[r.path] && (
+                    <span className="arow__meta mono arow__landed" title={landings[r.path]}>
+                      {landings[r.path]}
+                    </span>
+                  )}
+                  {r.reason && (
+                    <span className="arow__reason" title={r.reason}>
+                      {r.reason}
+                    </span>
+                  )}
                   <span className="arow__meta">{humanSize(r.size)}</span>
                   <span className="arow__when">{ago(r.updatedAt)}</span>
+                  {r.link && (
+                    <span className="arow__actions">
+                      <button
+                        type="button"
+                        className="iconbtn"
+                        title={copied === r.id ? 'Link copied' : 'Copy link'}
+                        aria-label="Copy link"
+                        onClick={() => void copyLink(r.id, r.link!)}
+                      >
+                        {copied === r.id ? <CheckIcon /> : <LinkIcon />}
+                      </button>
+                      <button
+                        type="button"
+                        className="iconbtn"
+                        title="Open in Fireshare"
+                        aria-label="Open in Fireshare"
+                        onClick={() => void openUrl(r.link!).catch(() => {})}
+                      >
+                        <ExternalLinkIcon />
+                      </button>
+                    </span>
+                  )}
                 </>
               )}
             </div>
