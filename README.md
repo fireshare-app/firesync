@@ -161,3 +161,11 @@ release.
 **The signing key lives only in repo secrets**, as `TAURI_SIGNING_PRIVATE_KEY`. Losing it means no
 existing install can ever update again, and the only remedy is asking everybody to reinstall by
 hand. Keep a backup somewhere that is not the build machine.
+
+## License
+
+Firesync is free software under the [GNU General Public License v3.0](LICENSE) — the same license as
+[Fireshare](https://github.com/fireshare-app/fireshare). Use it, read it, change it, pass it on. The
+one condition is that a copy you distribute — modified or not — carries those same freedoms with it.
+
+Copyright © 2026 Shane Israel.
