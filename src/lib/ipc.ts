@@ -205,6 +205,20 @@ export interface NotificationProbe {
   wouldHold: boolean
 }
 
+/** One published release, for the "what's new" panel. */
+export interface Release {
+  version: string
+  name: string
+  notes: string
+  publishedAt: string | null
+  url: string
+  prerelease: boolean
+}
+
+export const releases = {
+  history: (limit = 15) => invoke<Release[]>('release_history', { limit }),
+}
+
 export const notifications = {
   test: () => invoke<NotificationProbe>('test_notification'),
 }

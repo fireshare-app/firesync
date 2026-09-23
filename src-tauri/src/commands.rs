@@ -573,6 +573,15 @@ pub fn test_notification(
     notifier.probe()
 }
 
+/// Every release, for the "what changed" window.
+///
+/// Not cached: it is asked for when somebody opens a panel, which is rare
+/// enough that a stale answer would be a worse trade than a request.
+#[tauri::command]
+pub async fn release_history(limit: Option<u8>) -> Result<Vec<crate::releases::Release>> {
+    crate::releases::history(limit.unwrap_or(15)).await
+}
+
 #[tauri::command]
 pub fn watcher_problems(state: tauri::State<'_, AppState>) -> Vec<String> {
     state.resync_watchers()
