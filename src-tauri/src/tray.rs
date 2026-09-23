@@ -4,10 +4,26 @@
 //! not a shortcut to the UI — it is the UI, most of the time. It has to answer
 //! "is it working?" without being clicked, and offer the handful of things
 //! somebody would open the window for.
+//!
+//! It is built two different ways, because the platforms genuinely differ:
+//!
+//! * **Windows and macOS** get the styled panel on either mouse button and no
+//!   native menu at all. Attaching a menu is precisely what makes Windows pop
+//!   its own on right click, so having the panel on both buttons means having
+//!   no menu to attach.
+//! * **Linux** gets the native menu and only that. Tauri does not emit tray
+//!   click events there — "Unsupported. The event is not emitted even though
+//!   the icon is shown" — and the icon can fail to appear at all without a menu
+//!   set, so the menu is not a fallback there, it is the whole interface.
+//!
+//! Which is why everything below that builds or updates a menu is Linux-only,
+//! while the tooltip, the one part every platform shows, is not.
 
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
@@ -27,6 +43,9 @@ pub const QUIT: &str = "quit";
 ///
 /// Kept rather than rebuilt: replacing the whole menu on a timer makes it
 /// flicker and drops it if somebody has it open.
+///
+/// Linux only, because that is the only platform with a menu to keep current.
+#[cfg(target_os = "linux")]
 pub struct TrayItems {
     pub status: MenuItem<tauri::Wry>,
     pub pause: MenuItem<tauri::Wry>,
@@ -36,15 +55,29 @@ pub struct TrayItems {
 }
 
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
+    #[cfg(target_os = "linux")]
     let status = MenuItem::with_id(app, "status", "Firesync", false, None::<&str>)?;
+    #[cfg(target_os = "linux")]
     let open = MenuItem::with_id(app, OPEN, "Open Firesync", true, None::<&str>)?;
+    #[cfg(target_os = "linux")]
     let pause = MenuItem::with_id(app, PAUSE, "Pause all uploads", true, None::<&str>)?;
+    #[cfg(target_os = "linux")]
     let backlog = MenuItem::with_id(app, BACKLOG, "Upload existing files…", true, None::<&str>)?;
+    #[cfg(target_os = "linux")]
     let notifications = CheckMenuItem::with_id(app, NOTIFY, "Notifications", true, true, None::<&str>)?;
+    #[cfg(target_os = "linux")]
     let settings = MenuItem::with_id(app, SETTINGS, "Settings", true, None::<&str>)?;
+    #[cfg(target_os = "linux")]
     let updates = MenuItem::with_id(app, UPDATES, "Check for updates", true, None::<&str>)?;
+    #[cfg(target_os = "linux")]
     let quit = MenuItem::with_id(app, QUIT, "Quit Firesync", true, None::<&str>)?;
 
+    // Only Linux ever shows this. Tauri does not emit tray click events there
+    // at all — "Unsupported. The event is not emitted even though the icon is
+    // shown and will still show a context menu on right click" — and the icon
+    // can fail to appear without a menu attached, so on Linux the native menu is
+    // not a fallback, it is the entire interface.
+    #[cfg(target_os = "linux")]
     let menu = Menu::with_items(
         app,
         &[
@@ -62,6 +95,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         ],
     )?;
 
+    #[cfg(target_os = "linux")]
     app.manage(TrayItems {
         status: status.clone(),
         pause: pause.clone(),
@@ -70,19 +104,20 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         last_line: Mutex::new(String::new()),
     });
 
-    TrayIconBuilder::with_id("firesync")
+    #[allow(unused_mut)]
+    let mut builder = TrayIconBuilder::with_id("firesync")
         .icon(app.default_window_icon().cloned().expect("bundled icon"))
-        .menu(&menu)
-        // The menu is the tray's whole interface on Linux, where a left click is
-        // not reliably distinct from a right one.
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| on_menu(app, event.id.as_ref()))
         .on_tray_icon_event(|tray, event| {
-            // A left click opens the panel the design draws. The right-click
-            // menu stays native, because that is what every platform's tray
-            // contract promises and the only thing a screen reader can read.
+            // Either button opens the panel the design draws.
+            //
+            // Attaching a menu is what makes Windows pop the native one on right
+            // click, so the way to have the panel on both buttons is to not have
+            // a menu at all — which is only survivable because Linux, the one
+            // platform that needs the menu, never delivers these events anyway.
             if let TrayIconEvent::Click {
-                button: MouseButton::Left,
+                button: MouseButton::Left | MouseButton::Right,
                 button_state: MouseButtonState::Up,
                 rect,
                 ..
@@ -101,8 +136,14 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
                     rect.size.to_physical(scale),
                 );
             }
-        })
-        .build(app)?;
+        });
+
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.menu(&menu);
+    }
+
+    builder.build(app)?;
 
     Ok(())
 }
@@ -181,11 +222,11 @@ pub fn show_window(app: &AppHandle) {
 /// event of its own.
 pub fn spawn_status_loop(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let mut last_tooltip = String::new();
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             let Some(state) = app.try_state::<AppState>() else { continue };
-            let Some(items) = app.try_state::<TrayItems>() else { continue };
 
             let paused = state.queue.is_paused();
             let uploading = state.ledger.count_in_state(FileState::Uploading).unwrap_or(0);
@@ -193,25 +234,35 @@ pub fn spawn_status_loop(app: AppHandle) {
             let failed = state.ledger.count_in_state(FileState::Failed).unwrap_or(0);
             let line = describe(paused, uploading, queued, failed);
 
-            // Only touch the menu when something actually changed: writing the
-            // same text twice a second makes some tray implementations redraw.
-            let mut last = items.last_line.lock().expect("tray line mutex");
-            if *last != line {
-                let _ = items.status.set_text(&line);
-                let _ = items
-                    .pause
-                    .set_text(if paused { "Resume uploads" } else { "Pause all uploads" });
-                *last = line.clone();
+            // The tooltip is the one part of this every platform shows, so it
+            // is written before anything that only some of them have.
+            if last_tooltip != line {
+                if let Some(tray) = app.tray_by_id("firesync") {
+                    let _ = tray.set_tooltip(Some(&format!("Firesync — {line}")));
+                }
+                last_tooltip = line.clone();
             }
-            drop(last);
 
-            let notifications = state.snapshot().notifications;
-            let _ = items
-                .notifications
-                .set_checked(notifications.on_complete || notifications.on_needs_attention);
+            // The rest is the native menu, which only Linux has.
+            #[cfg(target_os = "linux")]
+            if let Some(items) = app.try_state::<TrayItems>() {
+                // Only touch the menu when something actually changed: writing
+                // the same text twice a second makes some tray implementations
+                // redraw.
+                let mut last = items.last_line.lock().expect("tray line mutex");
+                if *last != line {
+                    let _ = items.status.set_text(&line);
+                    let _ = items
+                        .pause
+                        .set_text(if paused { "Resume uploads" } else { "Pause all uploads" });
+                    *last = line.clone();
+                }
+                drop(last);
 
-            if let Some(tray) = app.tray_by_id("firesync") {
-                let _ = tray.set_tooltip(Some(&format!("Firesync — {line}")));
+                let notifications = state.snapshot().notifications;
+                let _ = items
+                    .notifications
+                    .set_checked(notifications.on_complete || notifications.on_needs_attention);
             }
         }
     });
@@ -220,9 +271,13 @@ pub fn spawn_status_loop(app: AppHandle) {
 /// Show a found version in the menu, so the tray carries the badge the design
 /// draws rather than making somebody open the window to find out.
 pub fn note_update(app: &AppHandle, version: &str) {
+    #[cfg(target_os = "linux")]
     if let Some(items) = app.try_state::<TrayItems>() {
         let _ = items.updates.set_text(format!("Update to {version}"));
     }
+    // Everywhere else the panel carries the badge, so there is nothing to mark.
+    #[cfg(not(target_os = "linux"))]
+    let _ = (app, version);
 }
 
 /// One line that answers "is it working?" without being clicked.
