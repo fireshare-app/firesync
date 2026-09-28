@@ -1,4 +1,5 @@
 pub mod catchup;
+pub mod network;
 pub mod settle;
 
 use std::collections::{HashMap, HashSet};
@@ -10,7 +11,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebouncedEvent, Debouncer, RecommendedCache};
 use serde::Serialize;
 
-use crate::config::WatchedFolder;
+use crate::config::{WatchMode, WatchedFolder};
 use crate::error::{AppError, Result};
 use crate::ledger::{Ledger, Outcome};
 use crate::queue::rules::{self, SupportedTypes};
@@ -56,11 +57,24 @@ pub struct Synced {
 }
 
 struct Running {
-    /// Held, never read: the watch lasts exactly as long as this does.
-    _debouncer: Deb,
+    /// Held, never read: the watch lasts exactly as long as this does. None
+    /// for a folder that is scanned on a timer instead of watched.
+    _debouncer: Option<Deb>,
     /// What it was started watching, so a change to it restarts the watch.
     /// Without this, turning on "Watch subfolders" did nothing until relaunch.
     recursive: bool,
+    scanning: bool,
+}
+
+/// Whether a folder is scanned on a timer rather than watched for changes:
+/// because it asked to be, or because it is on a network drive, where change
+/// events cannot be relied on.
+pub fn scans(folder: &WatchedFolder) -> bool {
+    match folder.watch_mode {
+        WatchMode::Scan => true,
+        WatchMode::Events => false,
+        WatchMode::Auto => network::is_network_path(&folder.path),
+    }
 }
 
 pub struct Watchers {
@@ -105,15 +119,16 @@ impl Watchers {
     /// network share that has gone away the question can take as long as the
     /// network's timeout — and the folders page waits on this lock.
     pub fn sync_with(&mut self, folders: &[WatchedFolder], unreachable: &HashSet<String>) -> Synced {
-        let wanted: HashMap<&str, bool> = folders
+        let wanted: HashMap<&str, (bool, bool)> = folders
             .iter()
             .filter(|f| f.enabled)
-            .map(|f| (f.id.as_str(), f.include_subfolders))
+            .map(|f| (f.id.as_str(), (f.include_subfolders, scans(f))))
             .collect();
 
         // Stopped when no longer wanted, and restarted when what it should
-        // cover has changed.
-        self.running.retain(|id, r| wanted.get(id.as_str()) == Some(&r.recursive));
+        // cover, or how, has changed.
+        self.running
+            .retain(|id, r| wanted.get(id.as_str()) == Some(&(r.recursive, r.scanning)));
         self.reported.retain(|id, _| wanted.contains_key(id.as_str()));
 
         // A folder whose path has gone — a drive pulled out, a share down — is
@@ -130,22 +145,30 @@ impl Watchers {
             if self.running.contains_key(&folder.id) {
                 continue;
             }
+            let scanning = wanted.get(folder.id.as_str()).is_some_and(|(_, scanning)| *scanning);
             let started = if unreachable.contains(&folder.id) {
                 Err(not_reachable(folder))
+            } else if scanning {
+                Ok(None)
             } else {
-                self.start_one(folder)
+                self.start_one(folder).map(Some)
             };
             match started {
                 Ok(debouncer) => {
                     log::info!(
-                        "Watching {}{}",
+                        "{} {}{}",
+                        if scanning { "Scanning" } else { "Watching" },
                         folder.path.display(),
                         if folder.include_subfolders { " and its subfolders" } else { "" }
                     );
                     self.reported.remove(&folder.id);
                     self.running.insert(
                         folder.id.clone(),
-                        Running { _debouncer: debouncer, recursive: folder.include_subfolders },
+                        Running {
+                            _debouncer: debouncer,
+                            recursive: folder.include_subfolders,
+                            scanning,
+                        },
                     );
                     synced.attached.push(folder.id.clone());
                 }
@@ -169,6 +192,11 @@ impl Watchers {
 
     pub fn is_running(&self, folder_id: &str) -> bool {
         self.running.contains_key(folder_id)
+    }
+
+    /// Whether this folder is being scanned on a timer rather than watched.
+    pub fn is_scanning(&self, folder_id: &str) -> bool {
+        self.running.get(folder_id).is_some_and(|r| r.scanning)
     }
 
     pub fn availability(&self, folder: &WatchedFolder) -> Availability {
@@ -516,6 +544,9 @@ mod tests {
             max_size_bytes: None,
             after_upload: crate::config::AfterUpload::Keep,
             auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         };
 
         let types = SupportedTypes::default();
@@ -667,6 +698,9 @@ mod tests {
             max_size_bytes: None,
             after_upload: crate::config::AfterUpload::Keep,
             auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         };
         let present = scan_existing(&folder, &SupportedTypes::default());
         reopened.record_baseline(&folder.id, &present, None).unwrap();

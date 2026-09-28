@@ -1,12 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
 import { Select } from '../components/Select'
+import { TagPicker } from '../components/TagPicker'
 import {
   asAppError,
   folders as foldersApi,
   type AfterUpload,
   type FolderSummary,
   type MediaKind,
+  type TitlePreview,
+  type WatchMode,
 } from '../lib/ipc'
 import { pickerStatus, useUploadOptions } from '../lib/useUploadOptions'
 
@@ -25,6 +28,15 @@ function formatLimit(bytes: number | null | undefined, unit: number): string {
   if (!bytes) return ''
   const n = bytes / unit
   return Number.isInteger(n) ? String(n) : n.toFixed(1)
+}
+
+/** What a title template can say, in the order the chips offer them. */
+const TOKENS = ['{game}', '{date}', '{time}', '{filename}', '{folder}']
+
+/** The name a file would be titled by when there is no template: its stem. */
+function stem(name: string) {
+  const dot = name.lastIndexOf('.')
+  return dot > 0 ? name.slice(0, dot) : name
 }
 
 interface Props {
@@ -58,6 +70,12 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
   const [after, setAfter] = useState<AfterUpload>(folder?.after_upload ?? 'keep')
   const [autoSort, setAutoSort] = useState(folder?.auto_sort_by_game ?? true)
   const [uploadExisting, setUploadExisting] = useState(false)
+  const [template, setTemplate] = useState(folder?.title_template ?? '')
+  const [preview, setPreview] = useState<TitlePreview | null>(null)
+  const [tagIds, setTagIds] = useState<number[]>(folder?.tag_ids ?? [])
+  const [watchMode, setWatchMode] = useState<WatchMode>(folder?.watch_mode ?? 'auto')
+  const [network, setNetwork] = useState(folder?.network ?? false)
+  const titleRef = useRef<HTMLInputElement>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -68,6 +86,63 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
   useEffect(() => {
     if (!folder && defaultFolder) setDest((current) => current || defaultFolder)
   }, [folder, defaultFolder])
+
+  // Rendered by the core, the way an upload will be, so the two cannot
+  // disagree. Settled typing only.
+  useEffect(() => {
+    if (!template.trim()) {
+      setPreview(null)
+      return
+    }
+    const t = setTimeout(() => {
+      foldersApi
+        .previewTitle(template, path, game.trim() || null, subfolders)
+        .then(setPreview)
+        .catch(() => setPreview(null))
+    }, 250)
+    return () => clearTimeout(t)
+  }, [template, path, game, subfolders])
+
+  // For a folder being added: whether "automatically" would mean scanning.
+  useEffect(() => {
+    if (folder || !path.trim()) return
+    const t = setTimeout(() => {
+      foldersApi
+        .detectNetwork(path.trim())
+        .then(setNetwork)
+        .catch(() => setNetwork(false))
+    }, 300)
+    return () => clearTimeout(t)
+  }, [folder, path])
+
+  /** Put a token where the cursor is, not at the end. */
+  function insertToken(token: string) {
+    const input = titleRef.current
+    const from = input?.selectionStart ?? template.length
+    const to = input?.selectionEnd ?? template.length
+    const before = template.slice(0, from)
+    const after = template.slice(to)
+    // A space either side, unless one is already there, so two tokens never
+    // run together into something that reads as one.
+    const pad = before && !before.endsWith(' ') ? ' ' : ''
+    const padAfter = after && !after.startsWith(' ') ? ' ' : ''
+    const next = before + pad + token + padAfter + after
+    setTemplate(next)
+    requestAnimationFrame(() => {
+      const at = (before + pad + token).length
+      input?.focus()
+      input?.setSelectionRange(at, at)
+    })
+  }
+
+  const watchHint =
+    watchMode === 'scan'
+      ? 'Firesync lists the folder every 15 seconds and compares it with what it has already seen.'
+      : watchMode === 'events'
+        ? 'Files are noticed the moment they appear.'
+        : network
+          ? 'This folder is on a network drive, where change events can’t be relied on, so Firesync lists it every 15 seconds instead. New clips show up within about 20 seconds.'
+          : 'Files are noticed the moment they appear. A folder on a network drive would be checked every 15 seconds instead.'
 
   // Which folder list to offer depends on what this folder sends: the server
   // keeps videos and images in separate trees, so a name valid for one is not
@@ -119,6 +194,9 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
       maxSizeBytes: parseLimit(maxGb, GB),
       afterUpload: after,
       autoSortByGame: autoSort,
+      titleTemplate: template.trim() || null,
+      tagIds,
+      watchMode,
     }
 
     try {
@@ -189,6 +267,29 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
               />
               Watch subfolders too
             </label>
+          </div>
+
+          <div className="field">
+            <label className="field__label" htmlFor="fd-watch">
+              Noticing new files
+            </label>
+            <Select
+              id="fd-watch"
+              value={watchMode}
+              options={[
+                { value: 'auto', label: 'Automatically', note: network ? 'every 15 s here' : undefined },
+                { value: 'events', label: 'As soon as the folder changes' },
+                { value: 'scan', label: 'Every 15 seconds' },
+              ]}
+              onChange={(v) => setWatchMode(v as WatchMode)}
+            />
+            <span className="field__hint">{watchHint}</span>
+            {watchMode === 'events' && network && (
+              <span className="field__warn">
+                Change events over a network drive can miss files. Choose this only if your NAS is
+                known to send them.
+              </span>
+            )}
           </div>
 
           <div className="row2">
@@ -263,6 +364,61 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
                 Auto-sort into game folder
               </label>
             </div>
+          </div>
+
+          <div className="field">
+            <label className="field__label" htmlFor="fd-title">
+              Title <span className="field__optional">(optional)</span>
+            </label>
+            <input
+              id="fd-title"
+              ref={titleRef}
+              type="text"
+              className="mono"
+              placeholder="Use the file name"
+              spellCheck={false}
+              value={template}
+              onChange={(e) => setTemplate(e.target.value)}
+            />
+            <div className="tokens">
+              {TOKENS.map((token) => (
+                <button key={token} type="button" className="token" onClick={() => insertToken(token)}>
+                  {token}
+                </button>
+              ))}
+            </div>
+            {template.trim() && preview ? (
+              <span className="preview">
+                {preview.from ? 'The newest file here would be titled ' : 'An upload would be titled '}
+                <strong>{preview.title ?? (preview.from ? stem(preview.from) : 'its file name')}</strong>
+                {preview.from && <span className="mono"> · from {preview.from}</span>}
+              </span>
+            ) : null}
+            <span className="field__hint">
+              {template.trim()
+                ? 'Date and time are when the recording finished, in your time zone. A token with nothing to fill it is dropped along with its separator.'
+                : 'Leave it empty and Fireshare titles each upload by its file name.'}
+            </span>
+          </div>
+
+          <div className="field">
+            <span className="field__label">
+              Tags <span className="field__optional">(optional)</span>
+            </span>
+            <TagPicker
+              offered={options?.tags}
+              chosen={tagIds}
+              onChange={setTagIds}
+              onOpen={() => void refresh()}
+              status={listStatus}
+            />
+            {options?.tags && (
+              <span className="field__hint">
+                {tagIds.some((id) => !options.tags!.some((t) => t.id === id))
+                  ? 'A tag this folder used is no longer offered by Fireshare: deleted, or now only on private media. It is left off uploads.'
+                  : 'Every upload from this folder gets these tags.'}
+              </span>
+            )}
           </div>
 
           <div className="field">

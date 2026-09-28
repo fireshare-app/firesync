@@ -23,6 +23,11 @@ use crate::watcher::{scan_existing, Availability, Watchers};
 /// it, for the events a platform drops without saying so.
 const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// How often a folder that is scanned rather than watched is looked at. The
+/// scan is its only way of noticing anything, so this is how late a new clip
+/// can be.
+pub const SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub type WatchEvent = (String, PathBuf);
 
 pub struct AppState {
@@ -186,15 +191,20 @@ impl AppState {
 
         let rescans = self.watchers.lock().expect("watchers mutex").take_rescans();
         for folder in self.snapshot().folders {
-            if !self.watchers.lock().expect("watchers mutex").is_running(&folder.id) {
+            let (running, scanning) = {
+                let watchers = self.watchers.lock().expect("watchers mutex");
+                (watchers.is_running(&folder.id), watchers.is_scanning(&folder.id))
+            };
+            if !running {
                 continue;
             }
+            let every = if scanning { SCAN_EVERY } else { SWEEP_EVERY };
             let swept_recently = self
                 .swept
                 .lock()
                 .expect("swept mutex")
                 .get(&folder.id)
-                .is_some_and(|at| at.elapsed() < SWEEP_EVERY);
+                .is_some_and(|at| at.elapsed() < every);
             if rescans.contains(&folder.id) || !swept_recently {
                 self.catch_up(&folder);
             }
@@ -397,6 +407,12 @@ pub struct NewFolder {
     pub after_upload: AfterUpload,
     #[serde(default = "default_true")]
     pub auto_sort_by_game: bool,
+    #[serde(default)]
+    pub title_template: Option<String>,
+    #[serde(default)]
+    pub tag_ids: Vec<i64>,
+    #[serde(default)]
+    pub watch_mode: crate::config::WatchMode,
     /// Upload what is already there, instead of leaving it as baseline.
     #[serde(default)]
     pub upload_existing: bool,
@@ -430,6 +446,12 @@ pub struct FolderSummary {
     pub availability: Availability,
     /// Why this folder is not being watched, when it is not.
     pub problem: Option<String>,
+    /// Seconds between scans, for a folder scanned on a timer rather than
+    /// watched: on a network drive, or set to scan.
+    pub scanned_every: Option<u64>,
+    /// Whether the folder's path is on a network drive, for the dialog to say
+    /// what "automatically" chose.
+    pub network: bool,
 }
 
 /// Everything a folder card shows about one folder.
@@ -442,10 +464,15 @@ fn summarise(state: &AppState, folder: WatchedFolder, present_count: i64) -> Res
         [(reason, _)] => Some(reason.clone()),
         _ => None,
     };
-    let (availability, problem) = {
+    let (availability, problem, scanning) = {
         let watchers = state.watchers.lock().expect("watchers mutex");
-        (watchers.availability(&folder), watchers.problem(&folder.id).map(str::to_string))
+        (
+            watchers.availability(&folder),
+            watchers.problem(&folder.id).map(str::to_string),
+            watchers.is_scanning(&folder.id),
+        )
     };
+    let network = crate::watcher::network::is_network_path(&folder.path);
     Ok(FolderSummary {
         folder,
         counts,
@@ -455,7 +482,82 @@ fn summarise(state: &AppState, folder: WatchedFolder, present_count: i64) -> Res
         held_reason,
         availability,
         problem,
+        scanned_every: scanning.then_some(SCAN_EVERY.as_secs()),
+        network,
     })
+}
+
+/// Whether a folder not yet added is on a network drive, for the add dialog.
+#[tauri::command]
+pub fn detect_network(path: String) -> bool {
+    crate::watcher::network::is_network_path(std::path::Path::new(&path))
+}
+
+/// What the folder's newest file would be titled, for the dialog's preview.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TitlePreview {
+    /// None: Fireshare would title it by its file name, which `from` is.
+    pub title: Option<String>,
+    /// The file the preview was made from, or None for a made-up example.
+    pub from: Option<String>,
+}
+
+/// Render a title template the way an upload will, against the newest file in
+/// the folder, so the preview cannot disagree with what is sent.
+#[tauri::command]
+pub fn preview_title(
+    state: tauri::State<'_, AppState>,
+    template: String,
+    path: String,
+    game: Option<String>,
+    include_subfolders: bool,
+) -> TitlePreview {
+    let folder_path = PathBuf::from(&path);
+    let probe = WatchedFolder {
+        id: String::new(),
+        path: folder_path.clone(),
+        enabled: true,
+        include_subfolders,
+        media: vec![MediaKind::Video, MediaKind::Image],
+        dest_folder: None,
+        game: None,
+        min_size_bytes: None,
+        max_size_bytes: None,
+        after_upload: AfterUpload::Keep,
+        auto_sort_by_game: false,
+        title_template: None,
+        tag_ids: Vec::new(),
+        watch_mode: crate::config::WatchMode::Auto,
+    };
+    let types = state.types.lock().expect("types mutex").clone();
+    let newest = if folder_path.is_dir() {
+        crate::watcher::scan_found(&probe, &types).into_iter().max_by_key(|f| f.mtime)
+    } else {
+        None
+    };
+    let game = game.filter(|g| !g.trim().is_empty());
+    match newest {
+        Some(file) => {
+            let file = PathBuf::from(&file.path);
+            TitlePreview {
+                title: crate::titles::for_file(Some(&template), game.as_deref(), &folder_path, &file),
+                from: file.file_name().map(|n| n.to_string_lossy().to_string()),
+            }
+        }
+        None => TitlePreview {
+            title: crate::titles::render(
+                &template,
+                &crate::titles::Facts {
+                    file_stem: "clip",
+                    game: game.as_deref(),
+                    folder: folder_path.file_name().and_then(|n| n.to_str()).unwrap_or("clips"),
+                    finished: chrono::Local::now(),
+                },
+            ),
+            from: None,
+        },
+    }
 }
 
 fn unix_now() -> i64 {
@@ -512,6 +614,9 @@ pub async fn add_folder(
         max_size_bytes: folder.max_size_bytes,
         after_upload: folder.after_upload,
         auto_sort_by_game: folder.auto_sort_by_game,
+        title_template: folder.title_template.filter(|t| !t.trim().is_empty()),
+        tag_ids: folder.tag_ids,
+        watch_mode: folder.watch_mode,
     };
 
     // Snapshot what is already here BEFORE watching, so nothing that predates
@@ -576,6 +681,12 @@ pub struct FolderRules {
     pub after_upload: AfterUpload,
     #[serde(default = "default_true")]
     pub auto_sort_by_game: bool,
+    #[serde(default)]
+    pub title_template: Option<String>,
+    #[serde(default)]
+    pub tag_ids: Vec<i64>,
+    #[serde(default)]
+    pub watch_mode: crate::config::WatchMode,
 }
 
 /// Change a folder's rules in place.
@@ -633,6 +744,9 @@ impl AppState {
         folder.max_size_bytes = rules.max_size_bytes.filter(|n| *n > 0);
         folder.after_upload = rules.after_upload;
         folder.auto_sort_by_game = rules.auto_sort_by_game;
+        folder.title_template = rules.title_template.filter(|t| !t.trim().is_empty());
+        folder.tag_ids = rules.tag_ids;
+        folder.watch_mode = rules.watch_mode;
 
         // Turning on subfolders brings in everything already in them, which is
         // exactly the situation of adding a folder: present before, so left alone.
@@ -1272,6 +1386,9 @@ mod catch_up_tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         });
         state.save(settings).unwrap();
         World { state, rx, root, clips }
@@ -1373,6 +1490,28 @@ mod catch_up_tests {
         assert_eq!(w.state.watchers.lock().unwrap().availability(&folder), Availability::Unavailable);
     }
 
+    /// No watch at all: the folder is listed every `SCAN_EVERY`, and that is
+    /// how a new clip is found.
+    #[test]
+    fn a_folder_set_to_scan_is_scanned_rather_than_watched() {
+        let mut w = world(true);
+        recently_complete(&w);
+        let mut settings = w.state.snapshot();
+        settings.folders[0].watch_mode = crate::config::WatchMode::Scan;
+        w.state.save(settings).unwrap();
+        w.state.resync_watchers();
+        assert!(w.state.watchers.lock().unwrap().is_scanning("f1"));
+
+        std::fs::write(w.clips.join("on-the-nas.mp4"), b"clip").unwrap();
+        w.state.upkeep();
+        assert!(sent(&mut w).is_empty(), "not due yet, and nothing is watching");
+
+        let long_ago = std::time::Instant::now() - SCAN_EVERY - std::time::Duration::from_secs(1);
+        w.state.swept.lock().unwrap().insert("f1".into(), long_ago);
+        w.state.upkeep();
+        assert_eq!(sent(&mut w), vec!["on-the-nas.mp4"]);
+    }
+
     #[test]
     fn turning_on_subfolders_leaves_what_was_already_in_them() {
         let mut w = world(true);
@@ -1393,6 +1532,9 @@ mod catch_up_tests {
                     max_size_bytes: None,
                     after_upload: AfterUpload::Keep,
                     auto_sort_by_game: false,
+                    title_template: None,
+                    tag_ids: Vec::new(),
+                    watch_mode: crate::config::WatchMode::Auto,
                 },
             )
             .unwrap();

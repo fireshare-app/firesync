@@ -555,6 +555,22 @@ select {
 /* A button beside a setting keeps its size and its one line; the text beside
    it is what wraps. */
 .setting .btn { flex-shrink: 0; white-space: nowrap; }
+/* A folder's title template, and its tags. */
+.tokens { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.token { font-family: var(--mono); font-size: 11.5px; color: var(--accent-light); background: rgba(102, 178, 255, 0.1); border: 1px solid rgba(102, 178, 255, 0.25); border-radius: 5px; padding: 3px 7px; cursor: pointer; }
+.token:hover { background: rgba(102, 178, 255, 0.18); }
+.preview { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.preview strong { color: var(--text); font-weight: 600; }
+.tagpick { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.tagpick .sel__panel { width: 250px; right: auto; }
+.tagpick__option { width: 100%; border: 0; background: transparent; font-family: inherit; text-align: left; }
+.tagpick__empty { margin: 0; padding: 10px 12px; font-size: 12px; color: var(--text-muted); }
+.tagchip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); background: #12314e; border-radius: 5px; padding: 4px 5px 4px 8px; }
+.tagchip__dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.tagchip__x { border: 0; background: transparent; color: var(--text-muted); cursor: pointer; padding: 0 3px; font-size: 14px; line-height: 1; }
+.tagchip__x:hover { color: var(--text); }
+.tagchip--gone { color: var(--text-muted); text-decoration: line-through; }
+.tagadd { font-family: inherit; font-size: 12px; color: var(--accent-light); background: transparent; border: 1px dashed var(--border); border-radius: 5px; padding: 4px 9px; cursor: pointer; }
 /* Controls that sit side by side at the end of a setting's row. */
 .setting__controls { display: flex; gap: 8px; flex-shrink: 0; }
 .setting__control { width: 200px; flex-shrink: 0; }

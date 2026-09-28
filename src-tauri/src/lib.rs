@@ -10,6 +10,7 @@ mod options;
 mod queue;
 mod releases;
 mod secrets;
+mod titles;
 mod tray;
 mod updater;
 mod watcher;
@@ -209,6 +210,8 @@ pub fn run() {
             commands::queue_backlog,
             commands::activity_page,
             commands::recent_links,
+            commands::detect_network,
+            commands::preview_title,
             commands::retry_file,
             commands::skip_file,
             commands::stop_upload,
@@ -250,14 +253,15 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-/// Every 30 seconds: reattach what came back, drop what went away, and give each
-/// watched folder its rescans and sweeps. Blocking work — directory listings, and
+/// Every 15 seconds: reattach what came back, drop what went away, give each
+/// watched folder its rescans and sweeps, and scan the folders that are scanned
+/// rather than watched. Blocking work — directory listings, and
 /// on a share that has vanished a network timeout — so it runs off the async
 /// workers.
 fn spawn_upkeep(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(commands::SCAN_EVERY).await;
             let app = app.clone();
             let _ = tokio::task::spawn_blocking(move || app.state::<AppState>().upkeep()).await;
         }

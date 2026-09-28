@@ -404,7 +404,7 @@ fn destination_for(
                     && !folder.media.contains(&MediaKind::Video));
 
             if let Some(sorted) = rules.folder_for(game, is_image) {
-                return UploadMeta { folder: Some(sorted), game: None, title: None };
+                return UploadMeta { folder: Some(sorted), game: None, ..UploadMeta::default() };
             }
         }
     }
@@ -412,7 +412,7 @@ fn destination_for(
     UploadMeta {
         folder: folder.dest_folder.clone(),
         game: folder.game.clone(),
-        title: None,
+        ..UploadMeta::default()
     }
 }
 
@@ -602,7 +602,14 @@ async fn run_one<F>(
     } else {
         FolderRules::default()
     };
-    let meta = destination_for(&folder, &rules, &path);
+    let mut meta = destination_for(&folder, &rules, &path);
+    meta.title = crate::titles::for_file(
+        folder.title_template.as_deref(),
+        folder.game.as_deref(),
+        &folder.path,
+        &path,
+    );
+    meta.tag_ids = tags_to_send(&folder, &options, base_url, token).await;
     let after_upload = folder.after_upload;
 
     let file_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
@@ -894,6 +901,34 @@ async fn run_one<F>(
     }
 }
 
+/// The folder's tags, less any Fireshare no longer offers.
+///
+/// Fireshare stores whatever tag ids an upload names without checking them, so
+/// a tag deleted since the folder chose it would leave a link to nothing.
+/// Checked against a copy no older than the rules would be; sent unchecked
+/// only when there is no list to check against, which is also a Fireshare too
+/// old to have offered tags to choose from in the first place.
+async fn tags_to_send(
+    folder: &crate::config::WatchedFolder,
+    options: &OptionsCache,
+    base_url: &str,
+    token: &str,
+) -> Vec<i64> {
+    if folder.tag_ids.is_empty() {
+        return Vec::new();
+    }
+    let offered = options.fresh(base_url, token, RULES_MAX_AGE).await.ok().and_then(|o| o.tags);
+    let Some(offered) = offered else {
+        return folder.tag_ids.clone();
+    };
+    let (kept, dropped): (Vec<i64>, Vec<i64>) =
+        folder.tag_ids.iter().partition(|id| offered.iter().any(|t| t.id == **id));
+    if !dropped.is_empty() {
+        log::info!("Leaving off tags Fireshare no longer offers: {dropped:?}");
+    }
+    kept
+}
+
 /// Whether this folder files its uploads by game, and so needs the rules.
 fn sorts_by_game(folder: &crate::config::WatchedFolder) -> bool {
     folder.auto_sort_by_game && folder.game.as_deref().is_some_and(|g| !g.trim().is_empty())
@@ -1132,6 +1167,9 @@ pub(crate) mod tests {
             max_size_bytes: None,
             after_upload,
             auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         };
 
         let ledger = Arc::new(Ledger::open(&dir.join("l.sqlite")).unwrap());
@@ -2036,6 +2074,9 @@ mod routing_tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: auto,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         }
     }
 
@@ -2207,6 +2248,32 @@ mod sorting_tests {
         assert_eq!(bodies.len(), 2, "one request for the rules, then the upload");
         assert_eq!(field(&bodies[1], "folder"), Some("valorant"));
         assert_eq!(field(&bodies[1], "game"), None, "the folder does the tagging");
+        assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// Tags are checked against Fireshare before they go, and the folder's
+    /// title template is rendered for the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_carries_its_title_and_only_the_tags_that_still_exist() {
+        let f = fixture();
+        {
+            let mut settings = f.settings.lock().unwrap();
+            let folder = &mut settings.folders[0];
+            folder.tag_ids = vec![1, 2, 99];
+            folder.title_template = Some("{game} — {filename}".into());
+        }
+        let (url, server) = serve_sequence(vec![
+            (200, r##"{"tags":[{"id":1,"name":"Clutch","color":"#ff5733"},{"id":2,"name":"Ranked"}]}"##),
+            (201, r#"{"status":"accepted","filename":"clip.mp4","folder":"clips"}"#),
+        ]);
+
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2, "one request for the tags, then the upload");
+        assert_eq!(field(&bodies[1], "tag_ids"), Some("1,2"), "99 was deleted in Fireshare");
+        assert_eq!(field(&bodies[1], "title"), Some("VALORANT — clip"));
         assert_eq!(state_of(&f), FileState::Done);
         let _ = std::fs::remove_dir_all(&f.dir);
     }
@@ -2388,6 +2455,9 @@ mod slot_tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         };
         let mut settings = Settings { folders: vec![folder], ..Settings::default() };
         settings.server_url = Some(serve(64 << 10, std::time::Duration::from_secs(4)));
@@ -2442,6 +2512,9 @@ mod slot_tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         };
         let mut settings = Settings { folders: vec![folder], ..Settings::default() };
         // Slow enough that the stop certainly lands mid-upload.

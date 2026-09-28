@@ -234,6 +234,9 @@ mod tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         };
         let ledger = Ledger::open(&dir.join("l.sqlite")).unwrap();
         Scratch { dir, folder, ledger }

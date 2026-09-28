@@ -195,18 +195,25 @@ impl OptionsCache {
         token: &str,
         max_age: Duration,
     ) -> Result<FolderRules> {
+        Ok(self.fresh(base_url, token, max_age).await?.folder_rules)
+    }
+
+    /// The whole list, asked for again if the copy held is older than
+    /// `max_age`, and the older copy if Fireshare cannot be asked. An error
+    /// only when there is no copy at all.
+    pub async fn fresh(&self, base_url: &str, token: &str, max_age: Duration) -> Result<UploadOptions> {
         {
             let held = self.lock();
             if let (Some(options), Some(at)) = (&held.options, held.fetched_at) {
                 if at.elapsed() < max_age {
-                    return Ok(options.folder_rules.clone());
+                    return Ok(options.clone());
                 }
             }
         }
 
         match self.refresh(base_url, token).await {
-            Ok(options) => Ok(options.folder_rules),
-            Err(e) => self.lock().options.as_ref().map(|o| o.folder_rules.clone()).ok_or(e),
+            Ok(options) => Ok(options),
+            Err(e) => self.lock().options.clone().ok_or(e),
         }
     }
 

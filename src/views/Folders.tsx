@@ -239,6 +239,11 @@ export function Folders({ onChanged }: Props) {
                 </span>
                 {sizeRule(folder) && <span className="tag">{sizeRule(folder)}</span>}
                 {folder.include_subfolders && <span className="tag">Subfolders</span>}
+                {folder.scannedEvery && (
+                  <span className="tag" title="On a network drive, or set to scan: listed on a timer rather than watched">
+                    Checked every {folder.scannedEvery} s
+                  </span>
+                )}
                 {folder.after_upload !== 'keep' && (
                   <span className="tag">
                     {folder.after_upload === 'trash' ? 'Trash after upload' : 'Delete after upload'}

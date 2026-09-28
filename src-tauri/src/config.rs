@@ -81,6 +81,30 @@ pub struct WatchedFolder {
     /// its own, since a guess would be worse than the explicit choice.
     #[serde(default = "default_true")]
     pub auto_sort_by_game: bool,
+    /// How uploads from this folder are titled, e.g. `{game} — {date}`. None
+    /// leaves it to Fireshare, which uses the file name. See `titles`.
+    #[serde(default)]
+    pub title_template: Option<String>,
+    /// Fireshare tags every upload from this folder gets. Ids, because that is
+    /// what the upload takes; names come from Fireshare each time they are
+    /// shown, so a rename there shows up here.
+    #[serde(default)]
+    pub tag_ids: Vec<i64>,
+    #[serde(default)]
+    pub watch_mode: WatchMode,
+}
+
+/// How a folder learns that a file has arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchMode {
+    /// Change events on a local disk, a timed scan on a network one.
+    #[default]
+    Auto,
+    /// Change events, wherever the folder is.
+    Events,
+    /// List the folder on a timer and compare it with the ledger.
+    Scan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

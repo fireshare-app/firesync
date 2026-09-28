@@ -55,10 +55,20 @@ export interface FolderRule {
   game: string | null
 }
 
+/** A Fireshare tag an upload may name. */
+export interface Tag {
+  id: number
+  name: string
+  /** A hex colour, when it has one. */
+  color: string | null
+}
+
 export interface UploadOptions {
   default_folder: string | null
   folders: { video: string[]; image: string[] }
   games: Game[]
+  /** Missing on a Fireshare too old to offer tags to upload tokens. */
+  tags?: Tag[] | null
   /** Which folder each game's media belongs in, as Fireshare's scanner reads it. */
   folder_rules: { video: FolderRule[]; image: FolderRule[] }
 }
@@ -101,7 +111,14 @@ export interface WatchedFolder {
   max_size_bytes: number | null
   after_upload: AfterUpload
   auto_sort_by_game: boolean
+  /** e.g. `{game} — {date}`. Null keeps the file name as the title. */
+  title_template: string | null
+  tag_ids: number[]
+  watch_mode: WatchMode
 }
+
+/** How a folder notices new files: change events, or a timed scan. */
+export type WatchMode = 'auto' | 'events' | 'scan'
 
 export interface Settings {
   server_url: string | null
@@ -185,6 +202,10 @@ export interface FolderSummary extends WatchedFolder {
   availability: 'watching' | 'unavailable' | 'paused'
   /** Why this folder is not being watched, when it is not. */
   problem: string | null
+  /** Seconds between scans, for a folder scanned rather than watched. */
+  scannedEvery: number | null
+  /** Whether it is on a network drive, for the dialog to explain "automatically". */
+  network: boolean
 }
 
 export interface FolderRules {
@@ -196,6 +217,17 @@ export interface FolderRules {
   maxSizeBytes?: number | null
   afterUpload?: AfterUpload
   autoSortByGame?: boolean
+  titleTemplate?: string | null
+  tagIds?: number[]
+  watchMode?: WatchMode
+}
+
+/** What a folder's newest file would be titled. */
+export interface TitlePreview {
+  /** Null: Fireshare would title it by its file name. */
+  title: string | null
+  /** The file the preview was made from, or null for a made-up example. */
+  from: string | null
 }
 
 export interface NewFolder extends FolderRules {
@@ -222,6 +254,9 @@ export const folders = {
   setAfterUpload: (id: string, afterUpload: AfterUpload) =>
     invoke<void>('set_folder_after_upload', { id, afterUpload }),
   update: (id: string, rules: FolderRules) => invoke<void>('update_folder', { id, rules }),
+  detectNetwork: (path: string) => invoke<boolean>('detect_network', { path }),
+  previewTitle: (template: string, path: string, game: string | null, includeSubfolders: boolean) =>
+    invoke<TitlePreview>('preview_title', { template, path, game, includeSubfolders }),
   uploadExisting: (folderId: string, paths: string[]) =>
     invoke<number>('upload_existing', { folderId, paths }),
 }

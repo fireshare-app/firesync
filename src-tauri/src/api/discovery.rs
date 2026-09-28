@@ -31,6 +31,20 @@ pub struct UploadOptions {
     /// it. Absent on an instance that predates the field.
     #[serde(default)]
     pub folder_rules: FolderRules,
+    /// The tags an upload may name. None from a Fireshare that predates the
+    /// field, which is not the same as having no tags: the window says it
+    /// cannot offer them rather than that there are none.
+    #[serde(default)]
+    pub tags: Option<Vec<Tag>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tag {
+    pub id: i64,
+    pub name: String,
+    /// A hex colour, when the tag has one.
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

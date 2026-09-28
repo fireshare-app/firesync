@@ -81,6 +81,8 @@ pub struct UploadMeta {
     pub folder: Option<String>,
     pub game: Option<String>,
     pub title: Option<String>,
+    /// Sent as one comma-separated field, the same on every chunk.
+    pub tag_ids: Vec<i64>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +141,10 @@ pub async fn upload_single(
     }
     if let Some(title) = meta.title.as_deref().filter(|s| !s.is_empty()) {
         form = form.text("title", title.to_string());
+    }
+    if !meta.tag_ids.is_empty() {
+        let ids: Vec<String> = meta.tag_ids.iter().map(i64::to_string).collect();
+        form = form.text("tag_ids", ids.join(","));
     }
 
     let client = reqwest::Client::builder()
@@ -432,6 +438,10 @@ pub async fn upload_chunk(
     }
     if let Some(title) = meta.title.as_deref().filter(|s| !s.is_empty()) {
         form = form.text("title", title.to_string());
+    }
+    if !meta.tag_ids.is_empty() {
+        let ids: Vec<String> = meta.tag_ids.iter().map(i64::to_string).collect();
+        form = form.text("tag_ids", ids.join(","));
     }
 
     let client = reqwest::Client::builder()

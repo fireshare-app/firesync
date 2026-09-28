@@ -404,6 +404,9 @@ mod tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Trash,
             auto_sort_by_game: true,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         };
         let settings = Settings {
             server_url: Some("https://v.fireshare.net".into()),
