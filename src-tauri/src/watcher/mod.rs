@@ -38,11 +38,15 @@ pub struct Watchers {
     debouncers: HashMap<String, Deb>,
     tx: tokio::sync::mpsc::UnboundedSender<(String, PathBuf)>,
     debounce: Duration,
+    /// The last problem logged per folder. `sync` runs whenever the folders
+    /// page refreshes, and a folder whose drive is unplugged would otherwise
+    /// write the same warning into the log on every one of those.
+    reported: HashMap<String, String>,
 }
 
 impl Watchers {
     pub fn new(tx: tokio::sync::mpsc::UnboundedSender<(String, PathBuf)>) -> Self {
-        Self { debouncers: HashMap::new(), tx, debounce: DEBOUNCE }
+        Self { debouncers: HashMap::new(), tx, debounce: DEBOUNCE, reported: HashMap::new() }
     }
 
     /// Tests need the debounce shorter than the two seconds a real recorder
@@ -52,7 +56,7 @@ impl Watchers {
         tx: tokio::sync::mpsc::UnboundedSender<(String, PathBuf)>,
         debounce: Duration,
     ) -> Self {
-        Self { debouncers: HashMap::new(), tx, debounce }
+        Self { debouncers: HashMap::new(), tx, debounce, reported: HashMap::new() }
     }
 
     /// Bring the running watchers in line with the configured folders. Called on
@@ -70,9 +74,22 @@ impl Watchers {
             }
             match self.start_one(folder) {
                 Ok(deb) => {
+                    log::info!(
+                        "Watching {}{}",
+                        folder.path.display(),
+                        if folder.include_subfolders { " and its subfolders" } else { "" }
+                    );
+                    self.reported.remove(&folder.id);
                     self.debouncers.insert(folder.id.clone(), deb);
                 }
-                Err(e) => problems.push((folder.id.clone(), e)),
+                Err(e) => {
+                    let message = e.to_string();
+                    if self.reported.get(&folder.id) != Some(&message) {
+                        log::warn!("Not watching {}: {message}", folder.path.display());
+                        self.reported.insert(folder.id.clone(), message);
+                    }
+                    problems.push((folder.id.clone(), e));
+                }
             }
         }
         problems
@@ -241,7 +258,7 @@ pub fn spawn_event_loop<F>(
                 ) {
                     Ok(o) => o,
                     Err(e) => {
-                        eprintln!("firesync: could not record {path_str}: {e}");
+                        log::error!("Could not record {path_str}: {e}");
                         return;
                     }
                 };
@@ -249,6 +266,11 @@ pub fn spawn_event_loop<F>(
                 // Nothing changed and nothing to say — do not spam the UI.
                 if matches!(outcome, Outcome::Unchanged | Outcome::Held) {
                     return;
+                }
+
+                match &verdict {
+                    Some(reason) => log::info!("Skipped {path_str} ({size} bytes): {reason}"),
+                    None => log::info!("{outcome:?}: {path_str} ({size} bytes)"),
                 }
 
                 on_decision(Decision {

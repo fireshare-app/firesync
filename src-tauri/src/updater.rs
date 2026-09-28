@@ -106,6 +106,7 @@ pub fn spawn_check_loop(app: AppHandle) {
 
             match found {
                 Ok(Some(info)) => {
+                    log::info!("Version {} is available (running {})", info.version, info.current_version);
                     // The tray carries the version too, so a waiting update is
                     // visible without opening the window.
                     crate::tray::note_update(&app, &info.version);
@@ -121,7 +122,7 @@ pub fn spawn_check_loop(app: AppHandle) {
                     }
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("firesync: {e}"),
+                Err(e) => log::warn!("Update check failed: {e}"),
             }
 
             tokio::time::sleep(CHECK_EVERY).await;
@@ -141,8 +142,9 @@ async fn wait_for_idle_then_install(app: AppHandle) {
             .map(|s| busy_uploading(&s))
             .unwrap_or(true);
         if !busy {
+            log::info!("Nothing is uploading; installing the update");
             if let Err(e) = install(app.clone()).await {
-                eprintln!("firesync: automatic update did not install: {e}");
+                log::warn!("Automatic update did not install: {e}");
             }
             return;
         }
@@ -150,5 +152,5 @@ async fn wait_for_idle_then_install(app: AppHandle) {
     }
     // Ten hours of continuous uploading is not a state to keep a pending
     // install alive through; the next daily check will offer it again.
-    eprintln!("firesync: gave up waiting for the queue to be idle before updating");
+    log::warn!("Gave up waiting for the queue to be idle before updating");
 }

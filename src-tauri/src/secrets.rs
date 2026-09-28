@@ -66,7 +66,7 @@ impl TokenCache {
     /// outcome than refusing to launch because a keychain was locked.
     pub fn load() -> Self {
         let cached = read().unwrap_or_else(|e| {
-            eprintln!("firesync: could not read the stored token ({e}); starting disconnected");
+            log::warn!("Could not read the stored token ({e}); starting disconnected");
             None
         });
         Self { cached: RwLock::new(cached) }

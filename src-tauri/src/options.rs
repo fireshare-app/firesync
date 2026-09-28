@@ -157,6 +157,17 @@ impl OptionsCache {
             }
             match &result {
                 Ok(options) => {
+                    // Routine refreshes are the common case and say nothing new;
+                    // the first answer, and the first after a failure, do.
+                    let news = !matches!(&held.last_attempt, Some(Attempt { outcome: Ok(()), .. }));
+                    let level = if news { log::Level::Info } else { log::Level::Debug };
+                    log::log!(
+                        level,
+                        "Fireshare lists {} games, {} video and {} image folder rules",
+                        options.games.len(),
+                        options.folder_rules.video.len(),
+                        options.folder_rules.image.len()
+                    );
                     held.options = Some(options.clone());
                     held.fetched_at = Some(Instant::now());
                     held.fetched_unix = Some(unix_now());
@@ -267,12 +278,12 @@ pub fn spawn_refresh_loop(app: AppHandle) {
                         TICK
                     }
                     Err(AppError::TokenRejected(e)) => {
-                        eprintln!("firesync: Fireshare refused the upload token; not asking again until it changes: {e}");
+                        log::warn!("Fireshare refused the upload token; not asking again until it changes: {e}");
                         refused = Some(creds);
                         TICK
                     }
                     Err(e) => {
-                        eprintln!("firesync: could not refresh Fireshare's folders and games: {e}");
+                        log::warn!("Could not refresh Fireshare's folders and games: {e}");
                         let wait = retry_in;
                         retry_in = (retry_in * 2).min(MAX_RETRY);
                         wait

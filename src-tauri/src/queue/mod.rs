@@ -105,7 +105,7 @@ where
     // Anything left mid-upload was interrupted by a quit or a crash, not by a
     // decision, so it goes back in the queue rather than sitting as a lie.
     if let Err(e) = deps.ledger.requeue_interrupted() {
-        eprintln!("firesync: could not requeue interrupted uploads: {e}");
+        log::error!("Could not requeue interrupted uploads: {e}");
     }
 
     tauri::async_runtime::spawn(async move {
@@ -145,7 +145,7 @@ where
             let claims = match deps.ledger.claim(concurrency, &paused_folders) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("firesync: could not claim uploads: {e}");
+                    log::error!("Could not claim uploads: {e}");
                     tokio::time::sleep(IDLE_POLL).await;
                     continue;
                 }
@@ -363,6 +363,7 @@ async fn run_one<F>(
     // The file may have been moved or deleted between being queued and being
     // sent. That is not a failure worth retrying.
     if !path.is_file() {
+        log::warn!("#{} {} is no longer on disk", claim.id, claim.path);
         let _ = ledger.mark_failed(claim.id, "The file is no longer on disk.");
         emit(&on_event, &claim, "failed", Some("The file is no longer on disk."), None);
         return;
@@ -412,6 +413,16 @@ async fn run_one<F>(
     let after_upload = folder.after_upload;
 
     let file_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+    let started = std::time::Instant::now();
+    log::info!(
+        "#{} starting {} ({} bytes, attempt {}) to {}{}",
+        claim.id,
+        claim.path,
+        file_size,
+        claim.attempts + 1,
+        meta.folder.as_deref().unwrap_or("the default folder"),
+        meta.game.as_deref().map(|g| format!(" as {g}")).unwrap_or_default()
+    );
 
     // Fireshare's id for these bytes, worked out before a single one is sent.
     // The order matters twice over: it is what lets us ask whether the server
@@ -448,6 +459,7 @@ async fn run_one<F>(
                 crate::api::discovery::media_exists(base_url, token, hash, viewer).await
             {
                 if answer.exists {
+                    log::info!("#{} is already in the library; nothing sent", claim.id);
                     let _ = ledger.mark_duplicate(claim.id, answer.url.as_deref());
                     let removed = reclaim_space(&path, after_upload).await;
                     on_event(UploadEvent {
@@ -556,6 +568,7 @@ async fn run_one<F>(
             // resume onto. Counted as an attempt so a server that keeps losing
             // sets cannot hold one file in a loop forever.
             let _ = ledger.clear_chunks(claim.id);
+            log::warn!("#{} starting over: {message}", claim.id);
             if retry::should_retry(claim.attempts) {
                 let wait = retry::backoff(claim.attempts);
                 let reason = retry::waiting_reason(
@@ -582,6 +595,7 @@ async fn run_one<F>(
             } else {
                 format!("{folder}/{filename}")
             };
+            log::info!("#{} uploaded in {:.1?} as {landed}", claim.id, started.elapsed());
             let _ = ledger.mark_done(claim.id, None);
             let removed = reclaim_space(&path, after_upload).await;
             on_event(UploadEvent {
@@ -604,6 +618,7 @@ async fn run_one<F>(
         // 201 gives — so the local copy is just as safe to clear, and a folder
         // being re-scanned after an earlier upload is exactly when it helps.
         Ok(UploadResult::Duplicate { url }) => {
+            log::info!("#{} was already in the library ({:.1?})", claim.id, started.elapsed());
             let _ = ledger.mark_duplicate(claim.id, url.as_deref());
             let removed = reclaim_space(&path, after_upload).await;
             on_event(UploadEvent {
@@ -623,6 +638,7 @@ async fn run_one<F>(
         Err(UploadError::Unauthorized(message)) => {
             // Put this file back untouched — it did nothing wrong, and charging
             // it an attempt for a credential problem would burn its retries.
+            log::warn!("#{} refused: {message} Pausing every upload.", claim.id);
             let _ = ledger.release(claim.id);
             control.pause(Some(message.clone()));
             emit(&on_event, &claim, "paused", Some(&message), None);
@@ -631,11 +647,13 @@ async fn run_one<F>(
         // Chunking was the way out of a 413 and it did not help, so the cap is
         // below the chunk size or the refusal was never about size.
         Err(UploadError::TooLarge(message)) => {
+            log::warn!("#{} failed: {message}", claim.id);
             let _ = ledger.mark_failed(claim.id, &message);
             emit(&on_event, &claim, "failed", Some(&message), None);
         }
 
         Err(UploadError::Permanent(message)) => {
+            log::warn!("#{} failed: {message}", claim.id);
             let _ = ledger.mark_failed(claim.id, &message);
             emit(&on_event, &claim, "failed", Some(&message), None);
         }
@@ -645,6 +663,7 @@ async fn run_one<F>(
         Err(UploadError::RetryAfter { message, seconds }) => {
             let due = unix_now() + seconds as i64;
             let reason = format!("{message} Waiting {seconds}s as asked.");
+            log::info!("#{} {reason}", claim.id);
             let _ = ledger.reschedule(claim.id, &reason, due);
             emit(&on_event, &claim, "waiting", Some(&reason), None);
         }
@@ -673,11 +692,13 @@ where
     if retry::should_retry(claim.attempts) {
         let wait = retry::backoff(claim.attempts);
         let reason = retry::waiting_reason(message, claim.attempts, wait);
+        log::info!("#{} {reason}", claim.id);
         let due = unix_now() + wait.as_secs() as i64;
         let _ = ledger.reschedule(claim.id, &reason, due);
         emit(on_event, claim, "waiting", Some(&reason), None);
     } else {
         let reason = format!("{message} Gave up after {} attempts.", retry::MAX_ATTEMPTS);
+        log::warn!("#{} {reason}", claim.id);
         let _ = ledger.mark_failed(claim.id, &reason);
         emit(on_event, claim, "failed", Some(&reason), None);
     }
@@ -711,14 +732,14 @@ async fn reclaim_space(path: &std::path::Path, action: AfterUpload) -> Option<St
         AfterUpload::Trash => match trash::delete(&path) {
             Ok(()) => Some("Moved to trash".to_string()),
             Err(e) => {
-                eprintln!("firesync: could not trash {}: {e}", path.display());
+                log::warn!("Could not trash {}: {e}", path.display());
                 None
             }
         },
         AfterUpload::Delete => match std::fs::remove_file(&path) {
             Ok(()) => Some("Deleted locally".to_string()),
             Err(e) => {
-                eprintln!("firesync: could not delete {}: {e}", path.display());
+                log::warn!("Could not delete {}: {e}", path.display());
                 None
             }
         },
@@ -1931,5 +1952,82 @@ mod sorting_tests {
         assert_eq!(field(&bodies[0], "folder"), Some("clips"));
         assert_eq!(state_of(&f), FileState::Done);
         let _ = std::fs::remove_dir_all(&f.dir);
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::tests::{fixture, read_request, state_of};
+    use super::*;
+    use crate::ledger::FileState;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    const SECRET: &str = "fsk_do_not_ever_log_this_31337";
+
+    fn serve(answers: Vec<(u16, &'static str)>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (status, body) in answers {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let _ = read_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn upload(f: &tests::Fixture, url: &str) {
+        run_one(
+            f.claim.clone(),
+            url,
+            SECRET,
+            f.ledger.clone(),
+            f.settings.clone(),
+            Arc::new(QueueControl::new()),
+            Arc::new(|_: UploadEvent| {}),
+            ChunkPolicy::default(),
+            Arc::new(OptionsCache::new()),
+            Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
+        )
+        .await;
+    }
+
+    /// The token is the one thing a log must never hold: a log is exactly what
+    /// somebody attaches to a public issue. Every level is captured here, the
+    /// HTTP layer's included, across a sorted upload that fetches options and an
+    /// upload the server refuses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_token_never_reaches_the_log() {
+        let lines = crate::logging::capture::lines();
+
+        let sorted = fixture();
+        sorted.settings.lock().unwrap().folders[0].auto_sort_by_game = true;
+        let (url, server) = serve(vec![
+            (200, r#"{"folder_rules":{"video":[{"folder":"valorant","game":"VALORANT"}],"image":[]}}"#),
+            (201, r#"{"status":"accepted","filename":"clip.mp4","folder":"valorant"}"#),
+        ]);
+        upload(&sorted, &url).await;
+        server.join().unwrap();
+        assert_eq!(state_of(&sorted), FileState::Done);
+
+        let refused = fixture();
+        let (url, server) = serve(vec![(401, "Invalid upload token.")]);
+        upload(&refused, &url).await;
+        server.join().unwrap();
+
+        let lines = lines.lock().unwrap();
+        let ours = format!("#{} starting", sorted.claim.id);
+        assert!(lines.iter().any(|l| l.contains(&ours)), "the capture should have seen the upload");
+        let leaked: Vec<&String> = lines.iter().filter(|l| l.contains(SECRET)).collect();
+        assert!(leaked.is_empty(), "the token was logged: {leaked:?}");
+
+        let _ = std::fs::remove_dir_all(&sorted.dir);
+        let _ = std::fs::remove_dir_all(&refused.dir);
     }
 }

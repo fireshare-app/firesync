@@ -1,8 +1,10 @@
 mod api;
 mod commands;
 mod config;
+mod diagnostics;
 mod error;
 mod ledger;
+mod logging;
 mod notify;
 mod options;
 mod queue;
@@ -19,7 +21,11 @@ use watcher::settle::SettleConfig;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut builder = tauri::Builder::default();
+    logging::install_panic_hook();
+
+    // First, so everything after it — the other plugins' setup included — has
+    // somewhere to write.
+    let mut builder = tauri::Builder::default().plugin(logging::plugin());
 
     // A second launch should surface the running copy, not start a rival that
     // watches the same folders and uploads everything twice.
@@ -50,6 +56,12 @@ pub fn run() {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
             let first_run = config::is_first_run(&app_data_dir);
+            log::info!(
+                "Firesync {} starting on {} ({})",
+                app.package_info().version,
+                os_info::get(),
+                std::env::consts::ARCH
+            );
 
             let (state, rx) = AppState::new(app_data_dir)?;
 
@@ -126,10 +138,9 @@ pub fn run() {
                 }),
             });
 
-            let problems = app.state::<AppState>().resync_watchers();
-            for problem in problems {
-                eprintln!("firesync: {problem}");
-            }
+            // Each folder that could not be watched is logged by the watcher
+            // itself, once, rather than every time this list is asked for.
+            let _ = app.state::<AppState>().resync_watchers();
 
             tray::build(app.handle())?;
             tray::spawn_status_loop(app.handle().clone());
@@ -142,7 +153,7 @@ pub fn run() {
             if first_run {
                 use tauri_plugin_autostart::ManagerExt;
                 if let Err(e) = app.autolaunch().enable() {
-                    eprintln!("firesync: could not add the login item: {e}");
+                    log::warn!("Could not add the login item: {e}");
                 }
             }
 
@@ -196,6 +207,9 @@ pub fn run() {
             commands::open_main_at,
             commands::quit_app,
             commands::config_location,
+            commands::log_location,
+            commands::open_log_dir,
+            commands::diagnostics_report,
         ])
         .on_window_event(|window, event| {
             // Closing the window means "get out of my way", not "stop

@@ -99,18 +99,18 @@ impl AppState {
             let (old, new) = (folder.path.to_string_lossy().to_string(), tidy.to_string_lossy().to_string());
             match self.ledger.rewrite_path_prefix(&folder.id, &old, &new) {
                 Ok(moved) => {
-                    eprintln!("firesync: tidied {old} -> {new} ({moved} rows moved)");
+                    log::info!("Tidied {old} -> {new} ({moved} rows moved)");
                     folder.path = tidy;
                     changed = true;
                 }
                 // Leave the pair alone rather than split them.
-                Err(e) => eprintln!("firesync: could not move rows for {old}: {e}"),
+                Err(e) => log::warn!("Could not move rows for {old}: {e}"),
             }
         }
 
         if changed {
             if let Err(e) = self.persist(settings) {
-                eprintln!("firesync: could not save tidied paths: {e}");
+                log::warn!("Could not save tidied paths: {e}");
             }
         }
     }
@@ -164,7 +164,14 @@ pub async fn connect(
         return Err(AppError::TokenRejected("Paste an upload token first.".into()));
     }
 
-    let check = check_token(&base_url, &token).await?;
+    let check = match check_token(&base_url, &token).await {
+        Ok(check) => check,
+        Err(e) => {
+            log::warn!("Could not connect to {base_url}: {e}");
+            return Err(e);
+        }
+    };
+    log::info!("Connected to {base_url} as {}", check.username);
 
     // The server's own allowlist replaces the compiled-in default, so the rules
     // match what this instance would actually accept.
@@ -231,18 +238,24 @@ pub async fn connection_status(state: tauri::State<'_, AppState>) -> Result<Opti
             Ok(Some(Connection { server_url, check, verified: true, problem: None }))
         }
 
-        Err(e) if needs_reconnect(&e) => Err(e),
+        Err(e) if needs_reconnect(&e) => {
+            log::warn!("{server_url} no longer accepts the stored connection: {e}");
+            Err(e)
+        }
 
         // Everything else is about reaching the server, not about the token.
         // Carry on with what it told us last time, and say plainly at the top of
         // the window that this is what we are doing.
         Err(e) => match settings.last_check {
-            Some(check) => Ok(Some(Connection {
-                server_url,
-                check,
-                verified: false,
-                problem: Some(e.to_string()),
-            })),
+            Some(check) => {
+                log::warn!("Could not re-check {server_url}; carrying on with its last answer: {e}");
+                Ok(Some(Connection {
+                    server_url,
+                    check,
+                    verified: false,
+                    problem: Some(e.to_string()),
+                }))
+            }
             // Never successfully connected, so there is nothing to fall back to.
             None => Err(e),
         },
@@ -278,7 +291,7 @@ pub fn upload_options(state: tauri::State<'_, AppState>) -> OptionsSnapshot {
 pub async fn refresh_options(state: tauri::State<'_, AppState>) -> Result<OptionsSnapshot> {
     let (url, token) = state.credentials()?;
     if let Err(e) = state.options.refresh(&url, &token).await {
-        eprintln!("firesync: could not refresh Fireshare's folders and games: {e}");
+        log::warn!("Could not refresh Fireshare's folders and games: {e}");
     }
     Ok(state.options.snapshot())
 }
@@ -634,6 +647,91 @@ pub fn config_location(app: tauri::AppHandle) -> Result<String> {
         .app_data_dir()
         .map_err(|e| AppError::Storage(format!("Could not resolve the app data directory: {e}")))?;
     Ok(config::config_path(&dir).display().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Troubleshooting
+// ---------------------------------------------------------------------------
+
+fn log_dir(app: &tauri::AppHandle) -> Result<PathBuf> {
+    app.path()
+        .app_log_dir()
+        .map_err(|e| AppError::Storage(format!("Could not resolve the log directory: {e}")))
+}
+
+/// Where the log files are, for the Troubleshooting panel to show.
+#[tauri::command]
+pub fn log_location(app: tauri::AppHandle) -> Result<String> {
+    Ok(log_dir(&app)?.display().to_string())
+}
+
+/// Open the log folder in the file manager, so the files can be attached to an
+/// issue or read directly.
+#[tauri::command]
+pub fn open_log_dir(app: tauri::AppHandle) -> Result<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = log_dir(&app)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Storage(format!("Could not create {}: {e}", dir.display())))?;
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| AppError::Storage(format!("Could not open {}: {e}", dir.display())))
+}
+
+/// The login name, for masking where it shows up outside the home folder.
+fn os_user() -> Option<String> {
+    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok()
+}
+
+/// Everything a bug report needs, ready to paste, with what identifies the
+/// person masked. `include_server` keeps the server address, for the reports
+/// where the server or the proxy in front of it is the problem.
+#[tauri::command]
+pub fn diagnostics_report(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    include_server: bool,
+) -> Result<String> {
+    use crate::diagnostics::{report, Facts, Masks, QueueFacts};
+
+    let settings = state.snapshot();
+    let folder_counts = settings
+        .folders
+        .iter()
+        .map(|f| Ok((f.id.clone(), state.ledger.counts(&f.id)?)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let facts = Facts {
+        version: app.package_info().version.to_string(),
+        os: format!("{} · {}", os_info::get(), std::env::consts::ARCH),
+        queue: QueueFacts {
+            paused: state.queue.is_paused(),
+            pause_reason: state.queue.reason(),
+            queued: state.ledger.count_in_state(FileState::Queued)?,
+            uploading: state.ledger.count_in_state(FileState::Uploading)?,
+            failed: state.ledger.count_in_state(FileState::Failed)?,
+        },
+        options: state.options.snapshot(),
+        folder_counts,
+        watcher_problems: state.resync_watchers(),
+        log_lines: crate::logging::recent_lines(&log_dir(&app)?, 200),
+        now_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        settings: settings.clone(),
+    };
+
+    let home = app.path().home_dir().ok();
+    let masks = Masks::new(
+        home.as_deref(),
+        os_user().as_deref(),
+        settings.last_check.as_ref().map(|c| c.username.as_str()),
+        settings.server_url.as_deref(),
+        include_server,
+        state.token.get().as_deref(),
+    );
+    Ok(masks.apply(&report(&facts)))
 }
 
 // ---------------------------------------------------------------------------

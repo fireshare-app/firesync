@@ -239,6 +239,16 @@ export const releases = {
   history: (limit = 15) => invoke<Release[]>('release_history', { limit }),
 }
 
+export const diagnostics = {
+  /**
+   * Everything a bug report needs, as text to paste. Home folder, usernames and
+   * (unless asked for) the server address are masked; the token never appears.
+   */
+  report: (includeServer: boolean) => invoke<string>('diagnostics_report', { includeServer }),
+  logLocation: () => invoke<string>('log_location'),
+  openLogFolder: () => invoke<void>('open_log_dir'),
+}
+
 export const notifications = {
   test: () => invoke<NotificationProbe>('test_notification'),
 }

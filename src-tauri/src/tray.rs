@@ -196,7 +196,7 @@ fn on_menu(app: &AppHandle, id: &str) {
                     Ok(None) => {
                         let _ = handle.emit("firesync://update-none", ());
                     }
-                    Err(e) => eprintln!("firesync: {e}"),
+                    Err(e) => log::warn!("Update check from the tray failed: {e}"),
                 }
             });
         }

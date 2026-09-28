@@ -221,7 +221,7 @@ pub fn load(app_data_dir: &Path) -> Settings {
         return Settings::default();
     };
     serde_json::from_str(&raw).unwrap_or_else(|e| {
-        eprintln!("firesync: {} is not readable ({e}); starting with defaults", path.display());
+        log::warn!("{} is not readable ({e}); starting with defaults", path.display());
         Settings::default()
     })
 }

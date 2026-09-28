@@ -509,6 +509,10 @@ select {
 .switch input:focus-visible ~ .switch__track { outline: 2px solid var(--accent-light); outline-offset: 2px; }
 
 .settings__path { font-size: 11px; color: var(--text-muted); }
+.panel .settings__path { margin: 10px 0 0; overflow-wrap: anywhere; }
+/* A button beside a setting keeps its size and its one line; the text beside
+   it is what wraps. */
+.setting .btn { flex-shrink: 0; white-space: nowrap; }
 .settings__conn { display: flex; gap: 10px; align-items: flex-end; }
 .settings__conn .field { flex-grow: 1; margin-top: 0; }
 

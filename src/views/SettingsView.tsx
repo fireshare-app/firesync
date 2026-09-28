@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import {
   api,
   asAppError,
+  diagnostics as diagnosticsApi,
   notifications as notificationsApi,
   updates,
   type Connection,
   type Settings,
   type UpdateInfo,
 } from '../lib/ipc'
-import { BellIcon } from '../components/Icons'
+import { BellIcon, CheckIcon, CopyIcon, ExternalLinkIcon, FolderIcon } from '../components/Icons'
 import { ReleaseNotes } from './ReleaseNotes'
 import { Select } from '../components/Select'
 
@@ -43,6 +46,9 @@ function Toggle({ id, label, hint, checked, onChange }: ToggleProps) {
   )
 }
 
+/** Nothing about the person goes in the URL; the report is pasted in by hand. */
+const ISSUES_URL = 'https://github.com/fireshare-app/firesync/issues/new'
+
 interface Props {
   connection: Connection
   onDisconnected: () => void
@@ -58,12 +64,18 @@ export function SettingsView({ connection, onDisconnected }: Props) {
   const [updateNote, setUpdateNote] = useState<string | null>(null)
   const [probe, setProbe] = useState<{ text: string; bad: boolean } | null>(null)
   const [notesOpen, setNotesOpen] = useState(false)
+  const [logPath, setLogPath] = useState('')
+  const [includeServer, setIncludeServer] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const [troubleNote, setTroubleNote] = useState<string | null>(null)
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const load = useCallback(async () => {
     try {
       setSettings(await api.getSettings())
       setAtLogin(await api.launchAtLoginState())
       setConfigPath(await api.configLocation())
+      setLogPath(await diagnosticsApi.logLocation())
     } catch (e) {
       setError(asAppError(e).message)
     }
@@ -72,6 +84,22 @@ export function SettingsView({ connection, onDisconnected }: Props) {
   useEffect(() => {
     void load()
   }, [load])
+
+  useEffect(() => () => {
+    if (copiedTimer.current) clearTimeout(copiedTimer.current)
+  }, [])
+
+  async function copyDiagnostics() {
+    setTroubleNote(null)
+    try {
+      await writeText(await diagnosticsApi.report(includeServer))
+      setCopied(true)
+      if (copiedTimer.current) clearTimeout(copiedTimer.current)
+      copiedTimer.current = setTimeout(() => setCopied(false), 2000)
+    } catch (e) {
+      setTroubleNote(asAppError(e).message)
+    }
+  }
 
   // Written through immediately rather than behind a Save button: each of these
   // is a single switch whose effect is obvious, and a settings page that can be
@@ -329,7 +357,74 @@ export function SettingsView({ connection, onDisconnected }: Props) {
         </section>
       </div>
 
-      {configPath && <p className="mono settings__path">{configPath}</p>}
+      <section className="panel">
+        <h2 className="panel__title">Troubleshooting</h2>
+        <div className="setting">
+          <span className="setting__text">
+            <span className="setting__label">Diagnostics</span>
+            <span className="setting__hint">
+              Version, settings, folder rules, what the queue is doing and the last 200 log lines,
+              ready to paste into a bug report. Your home folder and usernames are masked
+              {includeServer ? '' : ', and so is your server address'}. The upload token is never
+              included.
+            </span>
+            <label className="inline-check" htmlFor="d-server">
+              <input
+                id="d-server"
+                type="checkbox"
+                checked={includeServer}
+                onChange={(e) => setIncludeServer(e.target.checked)}
+              />
+              Include my server address
+            </label>
+            {troubleNote && <span className="field__warn">{troubleNote}</span>}
+          </span>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm btn--icon"
+            onClick={() => void copyDiagnostics()}
+          >
+            {copied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+            {copied ? 'Copied' : 'Copy diagnostics'}
+          </button>
+        </div>
+        <div className="setting">
+          <span className="setting__text">
+            <span className="setting__label">Log files</span>
+            {logPath && <span className="setting__hint mono">{logPath}</span>}
+            <span className="setting__hint">
+              Unlike the copied diagnostics, these are not masked.
+            </span>
+          </span>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm btn--icon"
+            onClick={() =>
+              diagnosticsApi.openLogFolder().catch((e) => setTroubleNote(asAppError(e).message))
+            }
+          >
+            <FolderIcon size={14} />
+            Open folder
+          </button>
+        </div>
+        <div className="setting">
+          <span className="setting__text">
+            <span className="setting__label">Report a problem</span>
+            <span className="setting__hint">
+              Opens a new issue on GitHub. Paste the diagnostics into it.
+            </span>
+          </span>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm btn--icon"
+            onClick={() => void openUrl(ISSUES_URL).catch(() => {})}
+          >
+            <ExternalLinkIcon size={14} />
+            Open GitHub
+          </button>
+        </div>
+        {configPath && <p className="mono settings__path">Settings file: {configPath}</p>}
+      </section>
     </div>
   )
 }
