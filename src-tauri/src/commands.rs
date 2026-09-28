@@ -708,22 +708,95 @@ pub struct ActivityRow {
     pub link: Option<String>,
 }
 
+/// What the activity feed asks for.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityQuery {
+    pub tab: crate::ledger::ActivityTab,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub folder_id: Option<String>,
+    pub limit: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityPage {
+    pub rows: Vec<ActivityRow>,
+    pub counts: crate::ledger::ActivityCounts,
+}
+
+/// One page of the activity feed, and every tab's count under the same filter.
+///
+/// Filtered in the ledger rather than in the window: the window only ever has
+/// a page, so counts and totals worked out there described the page.
 #[tauri::command]
-pub fn recent_activity(
-    state: tauri::State<'_, AppState>,
-    limit: Option<i64>,
-) -> Result<Vec<ActivityRow>> {
-    let rows = state.ledger.recent(limit.unwrap_or(200))?;
+pub fn activity_page(state: tauri::State<'_, AppState>, query: ActivityQuery) -> Result<ActivityPage> {
+    let filter = crate::ledger::ActivityFilter { name: query.name, folder_id: query.folder_id };
+    let rows = state.ledger.activity_page(query.tab, &filter, query.limit.clamp(1, 1000))?;
+    let counts = state.ledger.activity_counts(&filter)?;
     let base = state.settings.lock().expect("settings mutex").server_url.clone();
     let types = state.types.lock().expect("types mutex").clone();
 
-    Ok(rows
+    let rows = rows
         .into_iter()
         .map(|file| {
             let link = link_for(&file, base.as_deref(), &types);
             ActivityRow { file, link }
         })
-        .collect())
+        .collect();
+    Ok(ActivityPage { rows, counts })
+}
+
+/// Queue a failed or waiting file now, with its attempts reset.
+#[tauri::command]
+pub fn retry_file(state: tauri::State<'_, AppState>, id: i64) -> Result<bool> {
+    state.ledger.retry_now(id)
+}
+
+/// Leave a queued or failed file un-uploaded.
+#[tauri::command]
+pub fn skip_file(state: tauri::State<'_, AppState>, id: i64) -> Result<bool> {
+    state.ledger.skip_by_user(id, "Skipped by you")
+}
+
+/// Stop an upload in flight. What it had sent is kept, so uploading it anyway
+/// later carries on from there.
+#[tauri::command]
+pub fn stop_upload(state: tauri::State<'_, AppState>, id: i64) -> bool {
+    state.queue.stop(id)
+}
+
+/// Queue a skipped file, whatever skipped it: a rule, or somebody.
+#[tauri::command]
+pub fn upload_anyway(state: tauri::State<'_, AppState>, id: i64) -> Result<bool> {
+    state.ledger.upload_anyway(id)
+}
+
+/// Show a file in the system's file manager. A file removed after uploading,
+/// or moved, opens the folder it was in instead, which is usually what
+/// somebody asking to see it wants next.
+#[tauri::command]
+pub fn reveal_file(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: i64) -> Result<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let Some(row) = state.ledger.file(id)? else {
+        return Err(AppError::Storage("Firesync has no record of that file.".into()));
+    };
+    let path = PathBuf::from(&row.path);
+    let failed = |e: tauri_plugin_opener::Error| {
+        AppError::Storage(format!("Could not open {}: {e}", path.display()))
+    };
+    if path.exists() {
+        return app.opener().reveal_item_in_dir(&path).map_err(failed);
+    }
+    match path.parent().filter(|dir| dir.is_dir()) {
+        Some(dir) => app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(failed),
+        None => Err(AppError::Storage(format!(
+            "{} and the folder it was in are no longer there.",
+            path.display()
+        ))),
+    }
 }
 
 /// The page a row can be opened at, when there is one.

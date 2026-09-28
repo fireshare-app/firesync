@@ -159,3 +159,24 @@ export const BellIcon = ({ size = 14 }: Props) => (
     <path d="M10.3 14a1.4 1.4 0 0 1-2.6 0" {...stroke} strokeWidth="1.4" />
   </svg>
 )
+
+export const StopIcon = ({ size = 14 }: Props) => (
+  <svg width={size} height={size} viewBox="0 0 18 18" aria-hidden="true">
+    <rect x="4.6" y="4.6" width="8.8" height="8.8" rx="1.6" {...stroke} strokeWidth="1.4" />
+  </svg>
+)
+
+export const SearchIcon = ({ size = 14 }: Props) => (
+  <svg width={size} height={size} viewBox="0 0 18 18" aria-hidden="true">
+    <circle cx="7.9" cy="7.9" r="4.7" {...stroke} strokeWidth="1.4" />
+    <path d="m11.4 11.4 3.7 3.7" {...stroke} strokeWidth="1.4" />
+  </svg>
+)
+
+/** "Won't upload": a circle with a bar through it. */
+export const SkipIcon = ({ size = 15 }: Props) => (
+  <svg width={size} height={size} viewBox="0 0 18 18" aria-hidden="true">
+    <circle cx="9" cy="9" r="5.9" {...stroke} strokeWidth="1.4" />
+    <path d="m4.9 13.1 8.2-8.2" {...stroke} strokeWidth="1.4" />
+  </svg>
+)

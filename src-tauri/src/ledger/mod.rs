@@ -110,8 +110,32 @@ pub struct FileRow {
     /// xxh3 the server files media under, so a link can be built without asking
     /// it anything.
     pub content_hash: Option<String>,
+    /// When a file waiting to retry is next due. Lets the window offer "try
+    /// now" on exactly the rows that are waiting.
+    pub next_try_at: Option<i64>,
     pub observed_at: i64,
     pub updated_at: i64,
+}
+
+/// The columns every `FileRow` query selects, in the order `file_row` reads.
+const ROW_COLUMNS: &str = "id, folder_id, path, size, mtime, state, reason, attempts, \
+                           content_hash, next_try_at, observed_at, updated_at";
+
+fn file_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
+    Ok(FileRow {
+        id: r.get(0)?,
+        folder_id: r.get(1)?,
+        path: r.get(2)?,
+        size: r.get(3)?,
+        mtime: r.get(4)?,
+        state: FileState::from_str(&r.get::<_, String>(5)?),
+        reason: r.get(6)?,
+        attempts: r.get(7)?,
+        content_hash: r.get(8)?,
+        next_try_at: r.get(9)?,
+        observed_at: r.get(10)?,
+        updated_at: r.get(11)?,
+    })
 }
 
 /// What `observe` did with a file, so the caller (and the debug view) can say
@@ -301,31 +325,20 @@ impl Ledger {
         Ok(promoted)
     }
 
+    /// Every row, newest first. The feed uses `activity_page`; tests use this.
+    #[cfg(test)]
     pub fn recent(&self, limit: i64) -> Result<Vec<FileRow>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, folder_id, path, size, mtime, state, reason, attempts,
-                        content_hash, observed_at, updated_at
-                   FROM files ORDER BY updated_at DESC, id DESC LIMIT ?1",
+                &format!(
+                    "SELECT {ROW_COLUMNS}
+                   FROM files ORDER BY updated_at DESC, id DESC LIMIT ?1"
+                ),
             )
             .map_err(db_err)?;
         let rows = stmt
-            .query_map(params![limit], |r| {
-                Ok(FileRow {
-                    id: r.get(0)?,
-                    folder_id: r.get(1)?,
-                    path: r.get(2)?,
-                    size: r.get(3)?,
-                    mtime: r.get(4)?,
-                    state: FileState::from_str(&r.get::<_, String>(5)?),
-                    reason: r.get(6)?,
-                    attempts: r.get(7)?,
-                    content_hash: r.get(8)?,
-                    observed_at: r.get(9)?,
-                    updated_at: r.get(10)?,
-                })
-            })
+            .query_map(params![limit], file_row)
             .map_err(db_err)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_err)?;
@@ -683,30 +696,17 @@ impl Ledger {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, folder_id, path, size, mtime, state, reason, attempts,
-                        content_hash, observed_at, updated_at
+                &format!(
+                    "SELECT {ROW_COLUMNS}
                    FROM files WHERE folder_id = ?1 AND state = 'baseline'
                   -- Held files first: they turned up recently, and are the
                   -- ones somebody opening this is most likely looking for.
-                  ORDER BY reason IS NULL, mtime DESC",
+                  ORDER BY reason IS NULL, mtime DESC"
+                ),
             )
             .map_err(db_err)?;
         let rows = stmt
-            .query_map(params![folder_id], |r| {
-                Ok(FileRow {
-                    id: r.get(0)?,
-                    folder_id: r.get(1)?,
-                    path: r.get(2)?,
-                    size: r.get(3)?,
-                    mtime: r.get(4)?,
-                    state: FileState::from_str(&r.get::<_, String>(5)?),
-                    reason: r.get(6)?,
-                    attempts: r.get(7)?,
-                    content_hash: r.get(8)?,
-                    observed_at: r.get(9)?,
-                    updated_at: r.get(10)?,
-                })
-            })
+            .query_map(params![folder_id], file_row)
             .map_err(db_err)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_err)?;
@@ -944,6 +944,341 @@ mod mark_tests {
         let known = l.known_files("f1").unwrap();
         assert_eq!(known.get("/w/a.mp4"), Some(&(42, 7)));
         assert!(l.known_files("f2").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Which part of the activity feed is being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityTab {
+    All,
+    Progress,
+    Attention,
+    Finished,
+}
+
+impl ActivityTab {
+    fn as_str(self) -> &'static str {
+        match self {
+            ActivityTab::All => "all",
+            ActivityTab::Progress => "progress",
+            ActivityTab::Attention => "attention",
+            ActivityTab::Finished => "finished",
+        }
+    }
+}
+
+/// What narrows the feed besides the tab.
+#[derive(Debug, Default, Clone)]
+pub struct ActivityFilter {
+    /// Part of a file name. Matched case-insensitively, as typed: `%` and `_`
+    /// mean themselves.
+    pub name: Option<String>,
+    pub folder_id: Option<String>,
+}
+
+/// Counts for each tab under the current filter, and what has been uploaded.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityCounts {
+    pub all: i64,
+    pub progress: i64,
+    pub attention: i64,
+    pub finished: i64,
+    pub uploaded_files: i64,
+    pub uploaded_bytes: i64,
+}
+
+/// A file's name, from its path, in SQL: everything after the last separator.
+/// `rtrim(p, x)` strips from the end every character that appears in `x`, and
+/// `x` is the path with its separators taken out — so what is left is the
+/// directory part, which is then cut off the front.
+const NAME_SQL: &str = r"replace(replace(path, '\', '/'), rtrim(replace(path, '\', '/'), replace(replace(path, '\', '/'), '/', '')), '')";
+
+/// The feed never shows baseline rows: those are files that were already in a
+/// folder when it was added, or held for review, and they live in the backlog.
+/// Listing them here made a folder of old clips look like a folder of uploads.
+fn activity_where() -> String {
+    format!(
+        "state != 'baseline'
+         AND (?1 IS NULL OR folder_id = ?1)
+         AND (?2 IS NULL OR {NAME_SQL} LIKE ?2 ESCAPE '\\')"
+    )
+}
+
+fn like_pattern(name: Option<&str>) -> Option<String> {
+    let name = name.map(str::trim).filter(|n| !n.is_empty())?;
+    let escaped = name.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    Some(format!("%{escaped}%"))
+}
+
+impl Ledger {
+    /// The newest `limit` rows of one tab of the activity feed.
+    ///
+    /// No cursor: the window refreshes every few seconds by asking again for as
+    /// many rows as it has loaded, so "show more" is a bigger limit.
+    pub fn activity_page(
+        &self,
+        tab: ActivityTab,
+        filter: &ActivityFilter,
+        limit: i64,
+    ) -> Result<Vec<FileRow>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {ROW_COLUMNS} FROM files
+              WHERE {}
+                AND (?3 = 'all'
+                     OR (?3 = 'progress' AND state IN ('queued', 'uploading'))
+                     OR (?3 = 'attention' AND state = 'failed')
+                     OR (?3 = 'finished' AND state IN ('done', 'duplicate', 'skipped')))
+              ORDER BY updated_at DESC, id DESC
+              LIMIT ?4",
+            activity_where()
+        );
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    filter.folder_id,
+                    like_pattern(filter.name.as_deref()),
+                    tab.as_str(),
+                    limit
+                ],
+                file_row,
+            )
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Every tab's count under `filter`, and the uploaded totals — from the
+    /// ledger, rather than summed over whatever page the window has loaded.
+    pub fn activity_counts(&self, filter: &ActivityFilter) -> Result<ActivityCounts> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(state IN ('queued', 'uploading')), 0),
+                    COALESCE(SUM(state = 'failed'), 0),
+                    COALESCE(SUM(state IN ('done', 'duplicate', 'skipped')), 0),
+                    COALESCE(SUM(state = 'done'), 0),
+                    COALESCE(SUM(CASE WHEN state = 'done' THEN size ELSE 0 END), 0)
+               FROM files WHERE {}",
+            activity_where()
+        );
+        conn.query_row(
+            &sql,
+            params![filter.folder_id, like_pattern(filter.name.as_deref())],
+            |r| {
+                Ok(ActivityCounts {
+                    all: r.get(0)?,
+                    progress: r.get(1)?,
+                    attention: r.get(2)?,
+                    finished: r.get(3)?,
+                    uploaded_files: r.get(4)?,
+                    uploaded_bytes: r.get(5)?,
+                })
+            },
+        )
+        .map_err(db_err)
+    }
+
+    pub fn file(&self, id: i64) -> Result<Option<FileRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            &format!("SELECT {ROW_COLUMNS} FROM files WHERE id = ?1"),
+            params![id],
+            file_row,
+        )
+        .optional()
+        .map_err(db_err)
+    }
+
+    /// Back into the queue now: attempts reset, no wait. For a failed file,
+    /// and for one waiting out its backoff. Anything else is refused, which is
+    /// the answer `false` gives.
+    pub fn retry_now(&self, id: i64) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE files SET state = 'queued', attempts = 0, next_try_at = NULL,
+                        reason = NULL, updated_at = ?1
+                  WHERE id = ?2 AND state IN ('failed', 'queued')",
+                params![now(), id],
+            )
+            .map_err(db_err)?;
+        Ok(changed > 0)
+    }
+
+    /// Somebody decided this file should not upload.
+    pub fn skip_by_user(&self, id: i64, reason: &str) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE files SET state = 'skipped', reason = ?1, next_try_at = NULL,
+                        updated_at = ?2
+                  WHERE id = ?3 AND state IN ('queued', 'failed')",
+                params![reason, now(), id],
+            )
+            .map_err(db_err)?;
+        Ok(changed > 0)
+    }
+
+    /// An upload somebody stopped part-way. Its chunk progress is kept, so
+    /// uploading it anyway later carries on from there.
+    pub fn stop_by_user(&self, id: i64, reason: &str) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE files SET state = 'skipped', reason = ?1, updated_at = ?2
+                  WHERE id = ?3 AND state = 'uploading'",
+                params![reason, now(), id],
+            )
+            .map_err(db_err)?;
+        Ok(changed > 0)
+    }
+
+    /// Queue a skipped file regardless of why it was skipped. The queue does
+    /// not re-check a folder's rules, so this is also how one clip gets past a
+    /// size floor.
+    pub fn upload_anyway(&self, id: i64) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE files SET state = 'queued', attempts = 0, next_try_at = NULL,
+                        reason = NULL, updated_at = ?1
+                  WHERE id = ?2 AND state = 'skipped'",
+                params![now(), id],
+            )
+            .map_err(db_err)?;
+        Ok(changed > 0)
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    fn ledger() -> (Ledger, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("firesync-activity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Ledger::open(&dir.join("l.sqlite")).unwrap(), dir)
+    }
+
+    fn id_of(l: &Ledger, path: &str) -> i64 {
+        l.recent(100).unwrap().into_iter().find(|r| r.path == path).unwrap().id
+    }
+
+    fn names(rows: Vec<FileRow>) -> Vec<String> {
+        rows.into_iter().map(|r| r.path.rsplit(['/', '\\']).next().unwrap().to_string()).collect()
+    }
+
+    fn filter(name: Option<&str>, folder: Option<&str>) -> ActivityFilter {
+        ActivityFilter { name: name.map(str::to_string), folder_id: folder.map(str::to_string) }
+    }
+
+    /// A few of each state, across two folders, one on a Windows path.
+    fn populated() -> (Ledger, std::path::PathBuf) {
+        let (l, dir) = ledger();
+        l.record_baseline("f1", &[("/clips/VALORANT/old_one.mp4".into(), 5, 1)], None).unwrap();
+        l.observe("f1", "/clips/VALORANT/ace.mp4", 100, 1, None).unwrap();
+        l.observe("f1", "/clips/VALORANT/100%_real.mp4", 200, 1, None).unwrap();
+        l.observe("f1", "/clips/VALORANT/thumb.mp4", 1, 1, Some("Under 5.0 MB")).unwrap();
+        l.observe("f2", r"E:\Recordings\ARC\extraction.mp4", 300, 1, None).unwrap();
+        let ace = id_of(&l, "/clips/VALORANT/ace.mp4");
+        l.mark_done(ace, None).unwrap();
+        let arc = id_of(&l, r"E:\Recordings\ARC\extraction.mp4");
+        l.mark_failed(arc, "No game named that").unwrap();
+        (l, dir)
+    }
+
+    #[test]
+    fn the_feed_leaves_baseline_rows_to_the_backlog() {
+        let (l, dir) = populated();
+        let all = names(l.activity_page(ActivityTab::All, &ActivityFilter::default(), 100).unwrap());
+        assert!(!all.contains(&"old_one.mp4".to_string()), "{all:?}");
+        assert_eq!(all.len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tabs_hold_what_their_names_say() {
+        let (l, dir) = populated();
+        let f = ActivityFilter::default();
+        assert_eq!(names(l.activity_page(ActivityTab::Attention, &f, 100).unwrap()), vec!["extraction.mp4"]);
+        assert_eq!(names(l.activity_page(ActivityTab::Progress, &f, 100).unwrap()), vec!["100%_real.mp4"]);
+        let mut finished = names(l.activity_page(ActivityTab::Finished, &f, 100).unwrap());
+        finished.sort();
+        assert_eq!(finished, vec!["ace.mp4", "thumb.mp4"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_matches_the_file_name_not_the_folder_it_is_in() {
+        let (l, dir) = populated();
+        let by = |q| names(l.activity_page(ActivityTab::All, &filter(Some(q), None), 100).unwrap());
+        assert!(by("VALORANT").is_empty(), "the folder name is not the file name");
+        assert_eq!(by("EXTRACT"), vec!["extraction.mp4"], "Windows paths, any case");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wildcards_typed_into_search_mean_themselves() {
+        let (l, dir) = populated();
+        let by = |q| names(l.activity_page(ActivityTab::All, &filter(Some(q), None), 100).unwrap());
+        assert_eq!(by("100%"), vec!["100%_real.mp4"]);
+        assert_eq!(by("%"), vec!["100%_real.mp4"], "a bare % is a percent sign, not everything");
+        assert!(by("a_e").is_empty(), "_ is an underscore, not any one character");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn counts_come_from_the_ledger_and_follow_the_filter() {
+        let (l, dir) = populated();
+        assert_eq!(
+            l.activity_counts(&ActivityFilter::default()).unwrap(),
+            ActivityCounts { all: 4, progress: 1, attention: 1, finished: 2, uploaded_files: 1, uploaded_bytes: 100 }
+        );
+        assert_eq!(l.activity_counts(&filter(None, Some("f2"))).unwrap().all, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_action_applies_only_where_it_makes_sense() {
+        let (l, dir) = populated();
+        let failed = id_of(&l, r"E:\Recordings\ARC\extraction.mp4");
+        let done = id_of(&l, "/clips/VALORANT/ace.mp4");
+        let skipped = id_of(&l, "/clips/VALORANT/thumb.mp4");
+
+        assert!(!l.retry_now(done).unwrap(), "a finished upload cannot be retried");
+        assert!(!l.upload_anyway(done).unwrap());
+        assert!(!l.skip_by_user(done, "Skipped by you").unwrap());
+        assert!(!l.stop_by_user(failed, "Stopped by you").unwrap(), "only a running upload stops");
+
+        assert!(l.retry_now(failed).unwrap());
+        assert_eq!(l.file(failed).unwrap().unwrap().state, FileState::Queued);
+        assert!(l.skip_by_user(failed, "Skipped by you").unwrap());
+        assert_eq!(l.file(failed).unwrap().unwrap().reason.as_deref(), Some("Skipped by you"));
+
+        assert!(l.upload_anyway(skipped).unwrap());
+        let row = l.file(skipped).unwrap().unwrap();
+        assert_eq!((row.state, row.reason), (FileState::Queued, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stopped_upload_keeps_its_parts_for_later() {
+        let (l, dir) = ledger();
+        l.observe("f1", "/clips/big.mp4", 3 << 30, 1, None).unwrap();
+        let claim = l.claim(1, &[]).unwrap().pop().unwrap();
+        l.begin_chunks(claim.id, "set-1", 96).unwrap();
+        l.advance_chunks(claim.id, 40).unwrap();
+
+        assert!(l.stop_by_user(claim.id, "Stopped by you").unwrap());
+        assert!(l.upload_anyway(claim.id).unwrap());
+        let parts = l.chunk_state(claim.id).unwrap();
+        assert_eq!((parts.check_sum.as_deref(), parts.chunks_done), (Some("set-1"), 40));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

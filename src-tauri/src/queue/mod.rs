@@ -13,7 +13,7 @@ use crate::api::upload::{
 };
 use crate::api::discovery::FolderRules;
 use crate::config::{AfterUpload, MediaKind, Settings};
-use crate::ledger::{Claim, Ledger};
+use crate::ledger::{ChunkState, Claim, Ledger};
 use crate::options::{OptionsCache, RULES_MAX_AGE};
 use crate::secrets::TokenCache;
 
@@ -55,11 +55,40 @@ pub struct UploadEvent {
 pub struct QueueControl {
     paused: AtomicBool,
     pause_reason: Mutex<Option<String>>,
+    /// One per upload in flight, by ledger id, for "Stop".
+    stops: Mutex<std::collections::HashMap<i64, tokio_util::sync::CancellationToken>>,
 }
 
 impl QueueControl {
     pub fn new() -> Self {
-        Self { paused: AtomicBool::new(false), pause_reason: Mutex::new(None) }
+        Self {
+            paused: AtomicBool::new(false),
+            pause_reason: Mutex::new(None),
+            stops: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn watch_for_stop(&self, id: i64) -> tokio_util::sync::CancellationToken {
+        let token = tokio_util::sync::CancellationToken::new();
+        self.stops.lock().expect("stops mutex").insert(id, token.clone());
+        token
+    }
+
+    fn forget_stop(&self, id: i64) {
+        self.stops.lock().expect("stops mutex").remove(&id);
+    }
+
+    /// Stop the upload of this file, if it is going. False when it is not —
+    /// it finished, or never started — which the caller reads as "nothing to
+    /// do" rather than as a failure.
+    pub fn stop(&self, id: i64) -> bool {
+        match self.stops.lock().expect("stops mutex").get(&id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn is_paused(&self) -> bool {
@@ -178,25 +207,65 @@ where
                 let base_url = base_url.clone();
                 let token = token.clone();
                 let types = deps.types.clone();
+                let stop = deps.control.watch_for_stop(claim.id);
 
                 running.spawn(async move {
-                    run_one(
-                        claim,
-                        &base_url,
-                        &token,
-                        ledger,
-                        settings,
-                        control,
-                        on_event,
-                        ChunkPolicy::default(),
-                        options,
-                        types,
-                    )
-                    .await;
+                    let id = claim.id;
+                    let (stopped_claim, stopped_ledger, stopped_events) =
+                        (claim.clone(), ledger.clone(), on_event.clone());
+                    let forget = control.clone();
+                    // Dropping the upload's future is the stop: the request is
+                    // abandoned where it stands. What it had finished — the
+                    // chunks the server acknowledged — stays in the ledger.
+                    tokio::select! {
+                        _ = run_one(
+                            claim,
+                            &base_url,
+                            &token,
+                            ledger,
+                            settings,
+                            control,
+                            on_event,
+                            ChunkPolicy::default(),
+                            options,
+                            types,
+                        ) => {}
+                        _ = stop.cancelled() => {
+                            stopped(&stopped_claim, &stopped_ledger, &stopped_events);
+                        }
+                    }
+                    forget.forget_stop(id);
                 });
             }
         }
     });
+}
+
+/// A task that is aborted when this is dropped.
+struct AbortOnDrop(tauri::async_runtime::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Record an upload somebody stopped. A no-op if it finished first: the
+/// ledger only moves a row that is still uploading.
+fn stopped<F>(claim: &Claim, ledger: &Ledger, on_event: &Arc<F>)
+where
+    F: Fn(UploadEvent) + Send + Sync + 'static,
+{
+    let reason = match ledger.chunk_state(claim.id) {
+        Ok(ChunkState { chunks_total: Some(total), chunks_done, .. }) if chunks_done > 0 => {
+            format!("Stopped by you · {chunks_done} of {total} parts sent")
+        }
+        _ => "Stopped by you".to_string(),
+    };
+    if let Ok(true) = ledger.stop_by_user(claim.id, &reason) {
+        log::info!("#{} stopped by the user", claim.id);
+        emit(on_event, claim, "skipped", Some(&reason), None);
+    }
 }
 
 /// Wait until a slot frees or `IDLE_POLL` passes, whichever comes first.
@@ -509,7 +578,10 @@ async fn run_one<F>(
     // three gigabyte upload should not be deciding how often the UI redraws,
     // and a small one should not be paying for progress it does not need.
     let progress: Progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let ticker = {
+    // Aborted when this function ends however it ends — including by being
+    // dropped when somebody stops the upload, when a plain abort at the bottom
+    // would never run and the ticker would report progress forever.
+    let _ticker = AbortOnDrop({
         let progress = progress.clone();
         let on_event = on_event.clone();
         let path_str = claim.path.clone();
@@ -555,7 +627,7 @@ async fn run_one<F>(
                 });
             }
         })
-    };
+    });
 
     let outcome = if file_size > policy.threshold {
         send_chunked(
@@ -581,8 +653,6 @@ async fn run_one<F>(
             Err(e) => SendOutcome::Err(e),
         }
     };
-
-    ticker.abort();
 
     let result = match outcome {
         SendOutcome::Ok(r) => Ok(r),
@@ -2165,6 +2235,73 @@ mod slot_tests {
             assert_eq!(state_of(&ledger, path), FileState::Done, "{} waited", path.display());
         }
         assert_eq!(state_of(&ledger, &big), FileState::Uploading, "the big one is still going");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stop abandons the transfer where it stands, records who stopped it,
+    /// and leaves nothing behind still reporting progress.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_upload_stops_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("firesync-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = Arc::new(Ledger::open(&dir.join("l.sqlite")).unwrap());
+        let clip = dir.join("long.mp4");
+        std::fs::write(&clip, vec![0u8; 256 << 10]).unwrap();
+        ledger.observe("f1", clip.to_str().unwrap(), 256 << 10, 0, None).unwrap();
+
+        let folder = WatchedFolder {
+            id: "f1".into(),
+            path: dir.clone(),
+            enabled: true,
+            include_subfolders: false,
+            media: vec![MediaKind::Video],
+            dest_folder: None,
+            game: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            after_upload: AfterUpload::Keep,
+            auto_sort_by_game: false,
+        };
+        let mut settings = Settings { folders: vec![folder], ..Settings::default() };
+        // Slow enough that the stop certainly lands mid-upload.
+        settings.server_url = Some(serve(64 << 10, std::time::Duration::from_secs(10)));
+
+        let events: Arc<Mutex<Vec<(String, std::time::Instant)>>> = Arc::default();
+        let sink = events.clone();
+        let control = Arc::new(QueueControl::new());
+        spawn(QueueDeps {
+            ledger: ledger.clone(),
+            settings: Arc::new(Mutex::new(settings)),
+            control: control.clone(),
+            token: Arc::new(crate::secrets::TokenCache::holding("fsk_test")),
+            options: Arc::new(OptionsCache::new()),
+            types: Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
+            on_event: Arc::new(move |e: UploadEvent| {
+                sink.lock().unwrap().push((e.state, std::time::Instant::now()))
+            }),
+        });
+
+        let id = ledger.recent(1).unwrap()[0].id;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !control.stop(id) {
+            assert!(std::time::Instant::now() < deadline, "the upload never started");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let stopped_at = std::time::Instant::now();
+        // Long enough for a leaked ticker to have reported at least twice.
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+
+        let row = ledger.file(id).unwrap().unwrap();
+        assert_eq!(row.state, FileState::Skipped);
+        assert_eq!(row.reason.as_deref(), Some("Stopped by you"));
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|(state, _)| state == "skipped"), "the window is told");
+        let late: Vec<_> = events
+            .iter()
+            .filter(|(state, at)| state == "uploading" && *at > stopped_at + std::time::Duration::from_millis(100))
+            .collect();
+        assert!(late.is_empty(), "progress kept arriving after the stop: {} events", late.len());
+        assert!(!control.stop(id), "nothing left to stop");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

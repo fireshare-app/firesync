@@ -150,6 +150,8 @@ export interface FileRow {
   attempts: number
   /** Fireshare's id for these bytes, once it has been computed. */
   contentHash: string | null
+  /** When a file waiting to retry is next due, in unix seconds. */
+  nextTryAt: number | null
   observedAt: number
   updatedAt: number
 }
@@ -216,8 +218,43 @@ export const folders = {
     invoke<number>('upload_existing', { folderId, paths }),
 }
 
+export type ActivityTab = 'all' | 'progress' | 'attention' | 'finished'
+
+/** Counted in the ledger under the same filter as the page, not from the page. */
+export interface ActivityCounts {
+  all: number
+  progress: number
+  attention: number
+  finished: number
+  uploadedFiles: number
+  uploadedBytes: number
+}
+
+export interface ActivityPage {
+  rows: ActivityRow[]
+  counts: ActivityCounts
+}
+
+export interface ActivityQuery {
+  tab: ActivityTab
+  /** Part of a file name. */
+  name?: string | null
+  folderId?: string | null
+  limit: number
+}
+
+/**
+ * The feed, and what can be done to one file in it. Each action answers false
+ * when the file was no longer in a state it applies to — it finished, say —
+ * which is a reason to refresh rather than an error.
+ */
 export const activity = {
-  recent: (limit = 200) => invoke<ActivityRow[]>('recent_activity', { limit }),
+  page: (query: ActivityQuery) => invoke<ActivityPage>('activity_page', { query }),
+  retry: (id: number) => invoke<boolean>('retry_file', { id }),
+  skip: (id: number) => invoke<boolean>('skip_file', { id }),
+  stop: (id: number) => invoke<boolean>('stop_upload', { id }),
+  uploadAnyway: (id: number) => invoke<boolean>('upload_anyway', { id }),
+  reveal: (id: number) => invoke<void>('reveal_file', { id }),
 }
 
 /** What a test notification found out. */
@@ -268,7 +305,7 @@ export interface UploadEvent {
   size: number
   /** Bytes handed to the socket so far, on an `uploading` event. */
   sent: number
-  state: 'uploading' | 'done' | 'duplicate' | 'failed' | 'waiting' | 'paused'
+  state: 'uploading' | 'done' | 'duplicate' | 'failed' | 'waiting' | 'paused' | 'skipped'
   reason: string | null
   url: string | null
   landedAs: string | null
