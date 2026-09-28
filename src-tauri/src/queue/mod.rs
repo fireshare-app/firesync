@@ -44,6 +44,9 @@ pub struct UploadEvent {
     /// both should agree, and because the raw figure needs smoothing before it
     /// is fit to read.
     pub bytes_per_second: Option<i64>,
+    /// Why this upload is going slower than it could, on an `uploading` event:
+    /// `limit` for the speed limit, `playing` for a game having the screen.
+    pub limit: Option<String>,
 }
 
 /// Shared run/stop control for the whole queue.
@@ -57,6 +60,15 @@ pub struct QueueControl {
     pause_reason: Mutex<Option<String>>,
     /// One per upload in flight, by ledger id, for "Stop".
     stops: Mutex<std::collections::HashMap<i64, tokio_util::sync::CancellationToken>>,
+    /// The speed limit every upload shares.
+    pub throttle: Arc<crate::api::throttle::Throttle>,
+    /// Nothing new starts: a game has the screen and the setting says to wait.
+    /// A third reason alongside a pause and a refused token, and kept apart
+    /// from them so the window never offers "Resume" for a pause nobody made.
+    held: AtomicBool,
+    /// A game has the screen and uploads are being held back for it, by
+    /// waiting or by a lower limit.
+    for_game: AtomicBool,
 }
 
 impl QueueControl {
@@ -65,7 +77,24 @@ impl QueueControl {
             paused: AtomicBool::new(false),
             pause_reason: Mutex::new(None),
             stops: Mutex::new(std::collections::HashMap::new()),
+            throttle: Arc::new(crate::api::throttle::Throttle::new()),
+            held: AtomicBool::new(false),
+            for_game: AtomicBool::new(false),
         }
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn set_held(&self, held: bool) {
+        self.held.store(held, Ordering::Relaxed);
+    }
+
+    /// Whether a game is the reason uploads are slower than they could be.
+    pub fn for_game(&self) -> bool {
+        self.for_game.load(Ordering::Relaxed)
     }
 
     fn watch_for_stop(&self, id: i64) -> tokio_util::sync::CancellationToken {
@@ -146,7 +175,7 @@ where
         loop {
             while running.try_join_next().is_some() {}
 
-            if deps.control.is_paused() {
+            if deps.control.is_paused() || deps.control.is_held() {
                 idle(&mut running).await;
                 continue;
             }
@@ -268,6 +297,64 @@ where
     }
 }
 
+/// A single-shot upload going when a game takes the screen goes on at this,
+/// rather than stopping: idle for longer than a proxy's body timeout (nginx's
+/// is a minute) and the whole request fails.
+const TRICKLE: u64 = 256 * 1024;
+
+/// The in-game limit when "slow down" was chosen without a speed: 5 Mbps.
+const DEFAULT_GAME_CAP: u64 = 625_000;
+
+/// The lower of two limits, where 0 means none.
+fn lower_limit(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, b) => b,
+        (a, 0) => a,
+        (a, b) => a.min(b),
+    }
+}
+
+/// What the transfers settings and the screen come to: the rate every upload
+/// shares (0 for none), whether nothing new should start, and whether a game
+/// is the reason for either.
+fn govern(t: &crate::config::TransferSettings, playing: bool) -> (u64, bool, bool) {
+    use crate::config::WhilePlaying;
+    let normal = t.speed_cap.unwrap_or(0);
+    if !playing {
+        return (normal, false, false);
+    }
+    match t.while_playing {
+        WhilePlaying::Full => (normal, false, false),
+        WhilePlaying::Limit => {
+            (lower_limit(normal, t.while_playing_cap.unwrap_or(DEFAULT_GAME_CAP)), false, true)
+        }
+        WhilePlaying::Pause => (lower_limit(normal, TRICKLE), true, true),
+    }
+}
+
+/// Once a second, set the speed limit and the hold from the settings and from
+/// whether a game has the screen. Only Windows can say whether one does; on
+/// the others the in-game setting never applies, and the window says so.
+pub fn spawn_governor(settings: Arc<Mutex<Settings>>, control: Arc<QueueControl>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let transfers = settings.lock().expect("settings mutex").transfers.clone();
+            let playing = crate::notify::screen_is_busy();
+            let (rate, held, for_game) = govern(&transfers, playing);
+            control.throttle.set_rate(rate);
+            if control.held.swap(held, Ordering::Relaxed) != held {
+                if held {
+                    log::info!("A game has the screen; new uploads wait until it lets go");
+                } else {
+                    log::info!("The screen is free again; uploads carry on");
+                }
+            }
+            control.for_game.store(for_game, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
 /// Wait until a slot frees or `IDLE_POLL` passes, whichever comes first.
 ///
 /// The poll is needed even with every slot busy: a pause, or a lower "uploads
@@ -336,7 +423,13 @@ enum SendOutcome {
     Ok(UploadResult),
     Err(UploadError),
     Restart(String),
+    /// Stopped at a chunk boundary because a game has the screen. Nothing
+    /// went wrong, and the parts sent so far are kept.
+    Held,
 }
+
+/// Why a file that stopped for a game is waiting.
+const WAITING_FOR_GAME: &str = "Waiting for you to tab out";
 
 /// Send a large file in pieces, picking up wherever the last attempt stopped.
 ///
@@ -354,6 +447,7 @@ async fn send_chunked(
     ledger: &Arc<Ledger>,
     policy: ChunkPolicy,
     progress: Progress,
+    control: &QueueControl,
 ) -> SendOutcome {
     let total = chunk_count(file_size, policy.size);
     let state = ledger.chunk_state(claim.id).unwrap_or_default();
@@ -376,6 +470,11 @@ async fn send_chunked(
     };
 
     for index in (done + 1)..=total {
+        // The one safe place to stop for a game: between requests, with every
+        // acknowledged part recorded, so carrying on later re-sends nothing.
+        if control.is_held() {
+            return SendOutcome::Held;
+        }
         match upload_chunk(
             base_url,
             token,
@@ -387,6 +486,7 @@ async fn send_chunked(
             file_size,
             policy.size,
             progress.clone(),
+            control.throttle.clone(),
         )
         .await
         {
@@ -574,6 +674,7 @@ async fn run_one<F>(
                         landed_as: None,
                         removed_local: removed,
                         bytes_per_second: None,
+                        limit: None,
                     });
                     return;
                 }
@@ -591,6 +692,7 @@ async fn run_one<F>(
     // would never run and the ticker would report progress forever.
     let _ticker = AbortOnDrop({
         let progress = progress.clone();
+        let control = control.clone();
         let on_event = on_event.clone();
         let path_str = claim.path.clone();
         let id = claim.id;
@@ -632,6 +734,13 @@ async fn run_one<F>(
                     landed_as: None,
                     removed_local: None,
                     bytes_per_second: smoothed.map(|r| r.round() as i64),
+                    limit: if control.for_game() {
+                        Some("playing".into())
+                    } else if control.throttle.rate() > 0 {
+                        Some("limit".into())
+                    } else {
+                        None
+                    },
                 });
             }
         })
@@ -639,11 +748,13 @@ async fn run_one<F>(
 
     let outcome = if file_size > policy.threshold {
         send_chunked(
-            &claim, base_url, token, &path, &meta, file_size, &ledger, policy, progress,
+            &claim, base_url, token, &path, &meta, file_size, &ledger, policy, progress, &control,
         )
         .await
     } else {
-        match upload_single(base_url, token, &path, &meta, progress.clone()).await {
+        match upload_single(base_url, token, &path, &meta, progress.clone(), control.throttle.clone())
+            .await
+        {
             Ok(r) => SendOutcome::Ok(r),
             // Under the threshold but still refused for its size: something
             // between here and Fireshare caps how big one request may be, and
@@ -655,6 +766,7 @@ async fn run_one<F>(
                 progress.store(0, Ordering::Relaxed);
                 send_chunked(
                     &claim, base_url, token, &path, &meta, file_size, &ledger, policy, progress,
+                    &control,
                 )
                 .await
             }
@@ -665,6 +777,12 @@ async fn run_one<F>(
     let result = match outcome {
         SendOutcome::Ok(r) => Ok(r),
         SendOutcome::Err(e) => Err(e),
+        SendOutcome::Held => {
+            log::info!("#{} waiting at a chunk boundary while a game has the screen", claim.id);
+            let _ = ledger.hold_back(claim.id, WAITING_FOR_GAME);
+            emit(&on_event, &claim, "waiting", Some(WAITING_FOR_GAME), None);
+            return;
+        }
         SendOutcome::Restart(message) => {
             // Start the file again from nothing: a new id, and no progress to
             // resume onto. Counted as an attempt so a server that keeps losing
@@ -711,6 +829,7 @@ async fn run_one<F>(
                 landed_as: Some(landed),
                 removed_local: removed,
                 bytes_per_second: None,
+                limit: None,
             });
         }
 
@@ -734,6 +853,7 @@ async fn run_one<F>(
                 landed_as: None,
                 removed_local: removed,
                 bytes_per_second: None,
+                limit: None,
             });
         }
 
@@ -865,6 +985,7 @@ where
         landed_as: None,
         removed_local: None,
         bytes_per_second: None,
+        limit: None,
     });
 }
 
@@ -1655,6 +1776,38 @@ mod chunked_tests {
         .await;
     }
 
+    /// A game taking the screen stops a chunked upload between chunks, with no
+    /// attempt charged and every acknowledged part kept for later.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chunked_upload_waits_for_a_game_at_a_chunk_boundary() {
+        let f = Arc::new(big_fixture());
+        let server = FakeServer::start(Behaviour::Honest);
+        let control = Arc::new(QueueControl::new());
+        // Slow enough to be caught part-way: 2 KiB/s against 1 KiB chunks.
+        control.throttle.set_rate(2048);
+
+        let run = {
+            let (f, url, control) = (f.clone(), server.url.clone(), control.clone());
+            tokio::spawn(async move { run_chunked(&f, &url, control).await })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while server.chunks_seen().len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "the upload never got going");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        control.set_held(true);
+        run.await.unwrap();
+
+        let row = f.ledger.file(f.claim.id).unwrap().unwrap();
+        assert_eq!(row.state, FileState::Queued, "back in the queue, to carry on later");
+        assert_eq!(row.attempts, 0, "a game is not the file's fault");
+        assert_eq!(row.reason.as_deref(), Some(WAITING_FOR_GAME));
+        let sent = f.ledger.chunk_state(f.claim.id).unwrap().chunks_done;
+        assert!((2..10).contains(&sent), "stopped part-way, parts kept: {sent} of 10");
+        assert!(server.chunks_seen().len() < 10, "the rest were not sent");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_large_file_goes_up_in_order_and_completes() {
         let f = big_fixture();
@@ -2331,5 +2484,39 @@ mod slot_tests {
         assert!(late.is_empty(), "progress kept arriving after the stop: {} events", late.len());
         assert!(!control.stop(id), "nothing left to stop");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod playing_tests {
+    use super::*;
+    use crate::config::{TransferSettings, WhilePlaying};
+
+    fn transfers(cap: Option<u64>, mode: WhilePlaying, game_cap: Option<u64>) -> TransferSettings {
+        TransferSettings { max_concurrent: 2, speed_cap: cap, while_playing: mode, while_playing_cap: game_cap }
+    }
+
+    #[test]
+    fn with_no_game_the_normal_limit_applies() {
+        assert_eq!(govern(&transfers(None, WhilePlaying::Pause, None), false), (0, false, false));
+        assert_eq!(govern(&transfers(Some(3_125_000), WhilePlaying::Limit, None), false), (3_125_000, false, false));
+    }
+
+    #[test]
+    fn keep_uploading_ignores_the_game() {
+        assert_eq!(govern(&transfers(Some(1_000), WhilePlaying::Full, None), true), (1_000, false, false));
+    }
+
+    #[test]
+    fn slowing_down_takes_the_lower_of_the_two_limits() {
+        assert_eq!(govern(&transfers(None, WhilePlaying::Limit, Some(625_000)), true), (625_000, false, true));
+        assert_eq!(govern(&transfers(Some(100_000), WhilePlaying::Limit, Some(625_000)), true), (100_000, false, true));
+        assert_eq!(govern(&transfers(None, WhilePlaying::Limit, None), true).0, DEFAULT_GAME_CAP);
+    }
+
+    #[test]
+    fn pausing_holds_new_work_and_trickles_what_is_already_going() {
+        assert_eq!(govern(&transfers(None, WhilePlaying::Pause, None), true), (TRICKLE, true, true));
+        assert_eq!(govern(&transfers(Some(1_000), WhilePlaying::Pause, None), true), (1_000, true, true));
     }
 }

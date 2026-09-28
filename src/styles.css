@@ -555,6 +555,12 @@ select {
 /* A button beside a setting keeps its size and its one line; the text beside
    it is what wraps. */
 .setting .btn { flex-shrink: 0; white-space: nowrap; }
+/* Controls that sit side by side at the end of a setting's row. */
+.setting__controls { display: flex; gap: 8px; flex-shrink: 0; }
+.setting__control { width: 200px; flex-shrink: 0; }
+.setting__control--sm { width: 120px; flex-shrink: 0; }
+.banner--info { display: flex; align-items: center; gap: 10px; border: 1px solid #265d97; background: #0c2742; color: var(--accent-light); }
+.tp__status--held { color: var(--accent-light); }
 .settings__conn { display: flex; gap: 10px; align-items: flex-end; }
 .settings__conn .field { flex-grow: 1; margin-top: 0; }
 
@@ -806,6 +812,7 @@ select {
 
 /* Transfer rate, shown beside the percentage while a file is going up. */
 .arow__rate { font-size: 11.5px; color: var(--accent-light); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.arow__slow { color: var(--text-muted); }
 .fcard__rate { font-size: 11.5px; color: var(--accent-light); font-variant-numeric: tabular-nums; }
 .fcard__flightname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 

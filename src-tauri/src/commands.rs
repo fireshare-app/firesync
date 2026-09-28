@@ -989,6 +989,9 @@ pub fn diagnostics_report(
 #[serde(rename_all = "camelCase")]
 pub struct QueueStatus {
     pub paused: bool,
+    /// Waiting because a game has the screen, which is not a pause anybody
+    /// made and has no Resume.
+    pub held: bool,
     pub pause_reason: Option<String>,
     pub queued: i64,
     pub uploading: i64,
@@ -1000,6 +1003,7 @@ pub fn queue_status(state: tauri::State<'_, AppState>) -> Result<QueueStatus> {
     use crate::ledger::FileState;
     Ok(QueueStatus {
         paused: state.queue.is_paused(),
+        held: state.queue.is_held(),
         pause_reason: state.queue.reason(),
         queued: state.ledger.count_in_state(FileState::Queued)?,
         uploading: state.ledger.count_in_state(FileState::Uploading)?,

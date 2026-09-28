@@ -46,6 +46,51 @@ function Toggle({ id, label, hint, checked, onChange }: ToggleProps) {
   )
 }
 
+/** Speeds are chosen in Mbps, the unit people know their upstream in, and kept in bytes. */
+const BYTES_PER_MBPS = 125_000
+
+/** The in-game limit when none has been picked: 5 Mbps, as the core assumes. */
+const GAME_CAP_DEFAULT = 625_000
+
+function toMbps(bytesPerSecond: number | null | undefined) {
+  if (!bytesPerSecond) return ''
+  const mbps = bytesPerSecond / BYTES_PER_MBPS
+  return Number.isInteger(mbps) ? String(mbps) : mbps.toFixed(1)
+}
+
+function fromMbps(value: string): number | null {
+  const mbps = Number(value.trim().replace(/\s*mbps$/i, ''))
+  return Number.isFinite(mbps) && mbps > 0 ? Math.round(mbps * BYTES_PER_MBPS) : null
+}
+
+/** The same speed in the MB/s the progress bars use. */
+function perSecond(bytesPerSecond: number) {
+  const mb = bytesPerSecond / (1024 * 1024)
+  return `≈ ${mb < 10 ? mb.toFixed(2) : mb.toFixed(1)} MB/s`
+}
+
+/** The presets, plus the current value when it is one somebody typed. */
+function speedOptions(current: number | null | undefined, presets: number[], none?: string) {
+  const options = [
+    ...(none ? [{ value: '', label: none }] : []),
+    ...presets.map((m) => ({ value: String(m), label: `${m} Mbps` })),
+  ]
+  const now = toMbps(current)
+  if (now && !options.some((o) => o.value === now)) options.push({ value: now, label: `${now} Mbps` })
+  return options
+}
+
+function whilePlayingHint(t: Settings['transfers']) {
+  switch (t.while_playing) {
+    case 'limit':
+      return `Keeps the game's connection clear by holding uploads to ${toMbps(t.while_playing_cap ?? GAME_CAP_DEFAULT)} Mbps (${perSecond(t.while_playing_cap ?? GAME_CAP_DEFAULT)}) until you tab out. Detected on Windows only.`
+    case 'pause':
+      return 'Nothing new starts until you tab out. A large upload stops at the next chunk and carries on afterwards without re-sending; a small one finishes slowly rather than being thrown away. Detected on Windows only.'
+    default:
+      return 'Uploads carry on as normal while you play.'
+  }
+}
+
 /** Nothing about the person goes in the URL; the report is pasted in by hand. */
 const ISSUES_URL = 'https://github.com/fireshare-app/firesync/issues/new'
 
@@ -146,6 +191,7 @@ export function SettingsView({ connection, onDisconnected }: Props) {
   }
 
   const n = settings.notifications
+  const t = settings.transfers
   const check = connection.check
 
   return (
@@ -310,59 +356,116 @@ export function SettingsView({ connection, onDisconnected }: Props) {
         </div>
       </section>
 
-      <div className="row2">
-        <section className="panel">
-          <h2 className="panel__title">Transfers</h2>
-          <div className="setting">
-            <label className="setting__text" htmlFor="t-conc">
-              <span className="setting__label">Uploads at once</span>
-              <span className="setting__hint">
-                Files, not chunks — one file's chunks always go in order.
-              </span>
-            </label>
-            <Select
-              id="t-conc"
-              value={String(settings.transfers.max_concurrent)}
-              options={[1, 2, 3, 4].map((v) => ({ value: String(v), label: String(v) }))}
-              onChange={(v) =>
-                patch({
-                  ...settings,
-                  transfers: { ...settings.transfers, max_concurrent: Number(v) },
-                })
-              }
-            />
-          </div>
-        </section>
-
-        <section className="panel">
-          <h2 className="panel__title">Startup</h2>
-          <Toggle
-            id="s-login"
-            label="Launch at login"
-            checked={atLogin}
-            onChange={(v) => {
-              api
-                .setLaunchAtLogin(v)
-                // The OS is the authority here, not our config: it can refuse,
-                // or somebody can remove the login item behind our back.
-                .then(setAtLogin)
-                .catch((e) => {
-                  setError(asAppError(e).message)
-                  void load()
-                })
-            }}
-          />
-          <Toggle
-            id="s-tray"
-            label="Start in the tray"
-            hint="Applies when your computer starts it at login. Opening it yourself always shows the window."
-            checked={settings.startup.start_in_tray}
+      <section className="panel">
+        <h2 className="panel__title">Transfers</h2>
+        <div className="setting">
+          <label className="setting__text" htmlFor="t-conc">
+            <span className="setting__label">Uploads at once</span>
+            <span className="setting__hint">
+              Files, not chunks — one file's chunks always go in order.
+            </span>
+          </label>
+          <Select
+            id="t-conc"
+            value={String(settings.transfers.max_concurrent)}
+            options={[1, 2, 3, 4].map((v) => ({ value: String(v), label: String(v) }))}
             onChange={(v) =>
-              patch({ ...settings, startup: { ...settings.startup, start_in_tray: v } })
+              patch({
+                ...settings,
+                transfers: { ...settings.transfers, max_concurrent: Number(v) },
+              })
             }
           />
-        </section>
-      </div>
+        </div>
+        <div className="setting">
+          <label className="setting__text" htmlFor="t-cap">
+            <span className="setting__label">Upload speed limit</span>
+            <span className="setting__hint">
+              {t.speed_cap
+                ? `${perSecond(t.speed_cap)} in total, shared by every upload.`
+                : 'Uploads use as much of your connection as they can get.'}
+            </span>
+          </label>
+          <div className="setting__control">
+            <Select
+              id="t-cap"
+              value={toMbps(t.speed_cap)}
+              placeholder="No limit"
+              options={speedOptions(t.speed_cap, [5, 10, 25, 50, 100], 'No limit')}
+              onChange={(v) =>
+                patch({ ...settings, transfers: { ...t, speed_cap: fromMbps(v) } })
+              }
+              customLabel="Another speed, in Mbps…"
+            />
+          </div>
+        </div>
+        <div className="setting">
+          <label className="setting__text" htmlFor="t-game">
+            <span className="setting__label">While a game has the screen</span>
+            <span className="setting__hint">{whilePlayingHint(t)}</span>
+          </label>
+          <div className="setting__controls">
+            {t.while_playing === 'limit' && (
+              <div className="setting__control--sm">
+                <Select
+                  value={toMbps(t.while_playing_cap ?? GAME_CAP_DEFAULT)}
+                  options={speedOptions(t.while_playing_cap ?? GAME_CAP_DEFAULT, [5, 10, 25])}
+                  onChange={(v) =>
+                    patch({ ...settings, transfers: { ...t, while_playing_cap: fromMbps(v) } })
+                  }
+                />
+              </div>
+            )}
+            <div className="setting__control">
+              <Select
+                id="t-game"
+                value={t.while_playing}
+                options={[
+                  { value: 'full', label: 'Keep uploading' },
+                  { value: 'limit', label: 'Slow down to…' },
+                  { value: 'pause', label: 'Pause until I tab out' },
+                ]}
+                onChange={(v) =>
+                  patch({
+                    ...settings,
+                    transfers: { ...t, while_playing: v as Settings['transfers']['while_playing'] },
+                  })
+                }
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2 className="panel__title">Startup</h2>
+        <Toggle
+          id="s-login"
+          label="Launch at login"
+          checked={atLogin}
+          onChange={(v) => {
+            api
+              .setLaunchAtLogin(v)
+              // The OS is the authority here, not our config: it can refuse,
+              // or somebody can remove the login item behind our back.
+              .then(setAtLogin)
+              .catch((e) => {
+                setError(asAppError(e).message)
+                void load()
+              })
+          }}
+        />
+        <Toggle
+          id="s-tray"
+          label="Start in the tray"
+          hint="Applies when your computer starts it at login. Opening it yourself always shows the window."
+          checked={settings.startup.start_in_tray}
+          onChange={(v) =>
+            patch({ ...settings, startup: { ...settings.startup, start_in_tray: v } })
+          }
+        />
+      </section>
+
 
       <section className="panel">
         <h2 className="panel__title">Troubleshooting</h2>

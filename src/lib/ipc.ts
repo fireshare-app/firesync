@@ -113,7 +113,14 @@ export interface Settings {
     group_bursts: boolean
     copy_link_on_complete: boolean
   }
-  transfers: { max_concurrent: number; speed_cap: number | null }
+  transfers: {
+    max_concurrent: number
+    /** Bytes per second, shared by every upload, or null for none. */
+    speed_cap: number | null
+    while_playing: 'full' | 'limit' | 'pause'
+    /** Bytes per second while playing, when `while_playing` is `limit`. */
+    while_playing_cap: number | null
+  }
   startup: { launch_at_login: boolean; start_in_tray: boolean }
   updates: { auto_install: boolean }
 }
@@ -313,10 +320,14 @@ export interface UploadEvent {
   removedLocal: string | null
   /** Current upload speed in bytes per second, on an `uploading` event. */
   bytesPerSecond: number | null
+  /** Why it is going slower than it could: the speed limit, or a game. */
+  limit: 'limit' | 'playing' | null
 }
 
 export interface QueueStatus {
   paused: boolean
+  /** Waiting because a game has the screen. Not a pause, and has no Resume. */
+  held: boolean
   pauseReason: string | null
   queued: number
   uploading: number

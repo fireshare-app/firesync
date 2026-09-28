@@ -573,6 +573,19 @@ impl Ledger {
         Ok(())
     }
 
+    /// Back to the queue with a reason and no attempt counted: something other
+    /// than the file is holding it up, and it should not burn its retries.
+    pub fn hold_back(&self, id: i64, reason: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET state = 'queued', reason = ?1, updated_at = ?2
+              WHERE id = ?3 AND state = 'uploading'",
+            params![reason, now(), id],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Put a claimed row back untouched — used when the whole queue pauses, so a
     /// file in flight at that moment is not charged an attempt for it.
     pub fn release(&self, id: i64) -> Result<()> {

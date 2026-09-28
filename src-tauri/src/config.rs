@@ -99,13 +99,31 @@ pub struct NotificationSettings {
     pub copy_link_on_complete: bool,
 }
 
+/// What uploads do while a game has the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhilePlaying {
+    /// Carry on as usual.
+    #[default]
+    Full,
+    /// Hold to `while_playing_cap`.
+    Limit,
+    /// Start nothing new until the game lets go of the screen.
+    Pause,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferSettings {
     #[serde(default = "default_concurrency")]
     pub max_concurrent: u8,
-    /// Bytes per second, or None for unlimited.
+    /// Bytes per second, or None for unlimited. Total, across every upload.
     #[serde(default)]
     pub speed_cap: Option<u64>,
+    #[serde(default)]
+    pub while_playing: WhilePlaying,
+    /// Bytes per second while playing, when `while_playing` is `Limit`.
+    #[serde(default)]
+    pub while_playing_cap: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,7 +191,12 @@ impl Default for NotificationSettings {
 
 impl Default for TransferSettings {
     fn default() -> Self {
-        Self { max_concurrent: default_concurrency(), speed_cap: None }
+        Self {
+            max_concurrent: default_concurrency(),
+            speed_cap: None,
+            while_playing: WhilePlaying::Full,
+            while_playing_cap: None,
+        }
     }
 }
 

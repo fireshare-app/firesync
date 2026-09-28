@@ -141,6 +141,8 @@ export function TrayPanel() {
   const total = (status?.uploading ?? 0) + (status?.queued ?? 0)
   const line = status?.paused
     ? 'Paused'
+    : status?.held
+      ? `Waiting for you to tab out${total ? ` · ${total} queued` : ''}`
     : status?.uploading
       ? total > (status?.uploading ?? 0)
         ? `Uploading ${status.uploading} of ${total}`
@@ -161,7 +163,11 @@ export function TrayPanel() {
         <img src={logo} alt="" width={22} height={22} className="tp__logo" />
         <div className="tp__headtext">
           <span className="tp__name">Firesync</span>
-          <span className={`tp__status ${status?.failed ? 'tp__status--bad' : ''}`}>
+          <span
+            className={`tp__status ${
+              status?.failed ? 'tp__status--bad' : status?.held ? 'tp__status--held' : ''
+            }`}
+          >
             {line}
             {status?.failed ? ` · ${status.failed} need attention` : ''}
           </span>

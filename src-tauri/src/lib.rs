@@ -82,6 +82,8 @@ pub fn run() {
             let queue_ledger = state.ledger.clone();
             let queue_settings = state.settings.clone();
             let queue_control = state.queue.clone();
+            let governor_settings = state.settings.clone();
+            let governor_control = state.queue.clone();
             let queue_token = state.token.clone();
             let queue_options = state.options.clone();
             let event_settings = state.settings.clone();
@@ -149,6 +151,8 @@ pub fn run() {
                     let _ = queue_handle.emit("firesync://upload", event);
                 }),
             });
+
+            queue::spawn_governor(governor_settings, governor_control);
 
             // Each folder that could not be watched is logged by the watcher
             // itself, once, rather than every time this list is asked for.
@@ -326,6 +330,7 @@ mod note_tests {
             landed_as: Some("valorant/ace.mp4".into()),
             removed_local: None,
             bytes_per_second: None,
+            limit: None,
         }
     }
 

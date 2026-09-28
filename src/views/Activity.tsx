@@ -103,9 +103,9 @@ export function Activity() {
   const [counts, setCounts] = useState<ActivityCounts | null>(null)
   const [folders, setFolders] = useState<FolderSummary[]>([])
   const [status, setStatus] = useState<QueueStatus | null>(null)
-  const [sending, setSending] = useState<Record<string, { fraction: number; rate: number | null }>>(
-    {},
-  )
+  const [sending, setSending] = useState<
+    Record<string, { fraction: number; rate: number | null; limit: UploadEvent['limit'] }>
+  >({})
   const [landings, setLandings] = useState<Record<string, string>>({})
   const [tab, setTab] = useState<ActivityTab>('all')
   const [typed, setTyped] = useState('')
@@ -159,13 +159,13 @@ export function Activity() {
 
   useEffect(() => {
     const stop = listen<UploadEvent>('firesync://upload', (event) => {
-      const { path, state, sent, size, bytesPerSecond, landedAs, removedLocal } = event.payload
+      const { path, state, sent, size, bytesPerSecond, landedAs, removedLocal, limit } = event.payload
       // Progress arrives twice a second and does not change the ledger row, so
       // it updates in place rather than triggering a reread.
       if (state === 'uploading') {
         setSending((prev) => ({
           ...prev,
-          [path]: { fraction: size > 0 ? sent / size : 0, rate: bytesPerSecond },
+          [path]: { fraction: size > 0 ? sent / size : 0, rate: bytesPerSecond, limit },
         }))
         return
       }
@@ -369,6 +369,14 @@ export function Activity() {
       {status?.paused && (
         <div className="banner banner--bad">{status.pauseReason ?? 'Uploads are paused.'}</div>
       )}
+      {!status?.paused && status?.held && (
+        <div className="banner banner--info">
+          <PauseIcon />
+          <span>
+            A game has the screen, so uploads are waiting. They carry on as soon as you tab out.
+          </span>
+        </div>
+      )}
 
       <div className="tabs">
         {TABS.map(([key, label]) => {
@@ -417,7 +425,11 @@ export function Activity() {
               {inFlight ? (
                 <>
                   {flight.rate !== null && flight.rate > 0 && (
-                    <span className="arow__rate mono">{humanRate(flight.rate)}</span>
+                    <span className={`arow__rate mono ${flight.limit === 'playing' ? 'arow__slow' : ''}`}>
+                      {humanRate(flight.rate)}
+                      {flight.limit === 'limit' && ' · limited'}
+                      {flight.limit === 'playing' && ' · slowed while you play'}
+                    </span>
                   )}
                   <span className="arow__bar">
                     <span

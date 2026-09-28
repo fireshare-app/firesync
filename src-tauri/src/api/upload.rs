@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 
 use serde::Deserialize;
 
+use super::throttle::Throttle;
 use crate::error::AppError;
 
 /// Uploads get their own budget. A clip on a slow upstream can legitimately take
@@ -49,6 +50,32 @@ pub enum UploadError {
 /// should not be deciding how often the UI redraws.
 pub type Progress = Arc<AtomicU64>;
 
+/// A file's bytes as a request body: read 64 KiB at a time, each piece held to
+/// the speed limit and counted as it goes.
+///
+/// 64 KiB rather than the reader's 4 KiB default, so the limiter is not woken
+/// thousands of times a second on a fast connection.
+fn metered<R>(
+    reader: R,
+    progress: Progress,
+    throttle: Arc<Throttle>,
+) -> impl futures_util::Stream<Item = std::io::Result<tokio_util::bytes::Bytes>> + Send + 'static
+where
+    R: tokio::io::AsyncRead + Send + 'static,
+{
+    tokio_util::io::ReaderStream::with_capacity(reader, 64 * 1024).then(move |result| {
+        let progress = progress.clone();
+        let throttle = throttle.clone();
+        async move {
+            if let Ok(bytes) = &result {
+                throttle.take(bytes.len()).await;
+                progress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
+            result
+        }
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct UploadMeta {
     pub folder: Option<String>,
@@ -80,6 +107,7 @@ pub async fn upload_single(
     path: &Path,
     meta: &UploadMeta,
     progress: Progress,
+    throttle: Arc<Throttle>,
 ) -> std::result::Result<UploadResult, UploadError> {
     let file = tokio::fs::File::open(path)
         .await
@@ -96,12 +124,7 @@ pub async fn upload_single(
         .unwrap_or("upload")
         .to_string();
 
-    let stream = tokio_util::io::ReaderStream::new(file).map(move |result| {
-        if let Ok(bytes) = &result {
-            progress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        }
-        result
-    });
+    let stream = metered(file, progress, throttle);
     let part = reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(stream), size)
         .file_name(filename.clone())
         .mime_str("application/octet-stream")
@@ -356,6 +379,7 @@ pub async fn upload_chunk(
     file_size: u64,
     chunk_size: u64,
     progress: Progress,
+    throttle: Arc<Throttle>,
 ) -> std::result::Result<ChunkOutcome, UploadError> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -377,12 +401,7 @@ pub async fn upload_chunk(
     // Streamed and length-limited rather than read into a buffer: the chunk is
     // 32 MB and there is no reason for it to also be 32 MB of memory.
     let slice = file.take(len);
-    let counted = tokio_util::io::ReaderStream::new(slice).map(move |result| {
-        if let Ok(bytes) = &result {
-            progress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        }
-        result
-    });
+    let counted = metered(slice, progress, throttle);
     let part = reqwest::multipart::Part::stream_with_length(
         reqwest::Body::wrap_stream(counted),
         len,
