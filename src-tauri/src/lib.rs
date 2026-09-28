@@ -140,7 +140,10 @@ pub fn run() {
 
             // Each folder that could not be watched is logged by the watcher
             // itself, once, rather than every time this list is asked for.
+            // Attaching also catches each folder up on whatever arrived while
+            // Firesync was not running.
             let _ = app.state::<AppState>().resync_watchers();
+            spawn_upkeep(app.handle().clone());
 
             tray::build(app.handle())?;
             tray::spawn_status_loop(app.handle().clone());
@@ -189,7 +192,6 @@ pub fn run() {
             commands::check_backlog_against_library,
             commands::queue_backlog,
             commands::recent_activity,
-            commands::watcher_problems,
             commands::test_notification,
             commands::release_history,
             commands::get_settings,
@@ -224,6 +226,20 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Every 30 seconds: reattach what came back, drop what went away, and give each
+/// watched folder its rescans and sweeps. Blocking work — directory listings, and
+/// on a share that has vanished a network timeout — so it runs off the async
+/// workers.
+fn spawn_upkeep(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let app = app.clone();
+            let _ = tokio::task::spawn_blocking(move || app.state::<AppState>().upkeep()).await;
+        }
+    });
 }
 
 /// Which upload outcomes are worth interrupting somebody for.

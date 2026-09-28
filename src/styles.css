@@ -439,6 +439,16 @@ select {
 
 .fcard__warn { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border-soft); padding-top: 10px; font-size: 12.5px; color: var(--warn); }
 
+/* A folder that is enabled but not reachable, and files held for review. */
+.dot--warn { background: var(--warn); }
+.pill--warn { color: var(--warn); background: rgba(255, 181, 71, 0.12); }
+.fcard--away .fcard__path { color: var(--text-dim); }
+.fcard__held { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border-soft); padding-top: 10px; font-size: 12.5px; color: var(--text-dim); }
+.fcard__held svg { color: var(--accent-light); flex-shrink: 0; }
+.fcard__held strong { color: var(--text); font-weight: 600; }
+.linkbtn { background: transparent; border: 0; padding: 0; color: var(--accent-light); font-family: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; flex-shrink: 0; }
+.linkbtn:hover { text-decoration: underline; }
+
 .fcard__foot { display: flex; align-items: center; gap: 16px; border-top: 1px solid var(--border-soft); padding-top: 10px; font-size: 12px; color: var(--text-muted); }
 .fcard__foot strong { color: var(--text); font-weight: 600; }
 
@@ -580,6 +590,9 @@ select {
 .pick__when { width: 120px; text-align: right; color: var(--text-muted); font-size: 11.5px; }
 .pick__status { width: 132px; text-align: right; font-size: 11.5px; color: var(--text-muted); }
 .pick--on .pick__status { color: var(--accent-light); font-weight: 600; }
+.pick__status--held { color: var(--accent-light); }
+.modal__group { display: flex; align-items: center; gap: 8px; padding: 12px 10px 6px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+.modal__group:first-child { padding-top: 4px; }
 
 .settings__note { margin: 8px 0 0; }
 

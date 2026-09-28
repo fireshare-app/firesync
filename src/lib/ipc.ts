@@ -168,6 +168,13 @@ export interface FolderSummary extends WatchedFolder {
   presentCount: number
   /** Unix seconds when something from this folder last reached the server. */
   lastUploadAt: number | null
+  /** Files held for review rather than uploaded: turned up during a pause, say. */
+  held: number
+  /** Why they were held, when every one shares a reason. */
+  heldReason: string | null
+  availability: 'watching' | 'unavailable' | 'paused'
+  /** Why this folder is not being watched, when it is not. */
+  problem: string | null
 }
 
 export interface FolderRules {
@@ -207,7 +214,6 @@ export const folders = {
   update: (id: string, rules: FolderRules) => invoke<void>('update_folder', { id, rules }),
   uploadExisting: (folderId: string, paths: string[]) =>
     invoke<number>('upload_existing', { folderId, paths }),
-  problems: () => invoke<string[]>('watcher_problems'),
 }
 
 export const activity = {
@@ -312,6 +318,8 @@ export interface BacklogFile {
   excluded: string | null
   /** Filled in once the library has been asked. */
   inLibrary: boolean | null
+  /** Why it was held for review, for a file that did not predate the folder. */
+  held: string | null
 }
 
 export const backlog = {

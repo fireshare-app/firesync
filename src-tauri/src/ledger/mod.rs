@@ -5,6 +5,7 @@
 //! folder when you added it stay put until you ask for them. Both are just
 //! "have I seen this before, and in what state".
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -36,6 +37,17 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS idx_files_state    ON files(state);
 CREATE INDEX IF NOT EXISTS idx_files_folder   ON files(folder_id);
 CREATE INDEX IF NOT EXISTS idx_files_observed ON files(observed_at DESC);
+
+-- How far each folder is known to be complete: every file present when this
+-- folder was last scanned is in the ledger. A file dated after it, and not in
+-- the ledger, arrived while nothing was watching.
+CREATE TABLE IF NOT EXISTS folder_marks (
+  folder_id       TEXT    PRIMARY KEY,
+  watched_through INTEGER NOT NULL,
+  -- Set when the next scan should hold what it finds for review rather than
+  -- upload it: after a pause, which was somebody's choice not to upload.
+  hold_reason     TEXT
+);
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +135,13 @@ pub struct Ledger {
     conn: Mutex<Connection>,
 }
 
+/// How far a folder is known to be complete. See `folder_marks`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderMark {
+    pub watched_through: i64,
+    pub hold_reason: Option<String>,
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -161,7 +180,16 @@ impl Ledger {
     ///
     /// `INSERT OR IGNORE` so re-running a scan over a folder that has live rows
     /// cannot demote an upload back to baseline.
-    pub fn record_baseline(&self, folder_id: &str, entries: &[(String, i64, i64)]) -> Result<usize> {
+    ///
+    /// A `reason` marks the rows as held for review rather than present when
+    /// the folder was added: files that turned up while nothing was allowed to
+    /// upload them, which somebody should be shown rather than left to find.
+    pub fn record_baseline(
+        &self,
+        folder_id: &str,
+        entries: &[(String, i64, i64)],
+        reason: Option<&str>,
+    ) -> Result<usize> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(db_err)?;
         let ts = now();
@@ -170,12 +198,13 @@ impl Ledger {
             let mut stmt = tx
                 .prepare(
                     "INSERT OR IGNORE INTO files
-                       (folder_id, path, size, mtime, state, observed_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, 'baseline', ?5, ?5)",
+                       (folder_id, path, size, mtime, state, reason, observed_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 'baseline', ?5, ?6, ?6)",
                 )
                 .map_err(db_err)?;
             for (path, size, mtime) in entries {
-                inserted += stmt.execute(params![folder_id, path, size, mtime, ts]).map_err(db_err)?;
+                inserted +=
+                    stmt.execute(params![folder_id, path, size, mtime, reason, ts]).map_err(db_err)?;
             }
         }
         tx.commit().map_err(db_err)?;
@@ -319,8 +348,83 @@ impl Ledger {
 
     pub fn forget_folder(&self, folder_id: &str) -> Result<usize> {
         let conn = self.lock();
+        conn.execute("DELETE FROM folder_marks WHERE folder_id = ?1", params![folder_id])
+            .map_err(db_err)?;
         conn.execute("DELETE FROM files WHERE folder_id = ?1", params![folder_id])
             .map_err(db_err)
+    }
+
+    /// How far this folder is known to be complete, and whether its next scan
+    /// should hold what it finds. None for a folder this version has never
+    /// scanned — one added before marks existed.
+    pub fn folder_mark(&self, folder_id: &str) -> Result<Option<FolderMark>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT watched_through, hold_reason FROM folder_marks WHERE folder_id = ?1",
+            params![folder_id],
+            |r| Ok(FolderMark { watched_through: r.get(0)?, hold_reason: r.get(1)? }),
+        )
+        .optional()
+        .map_err(db_err)
+    }
+
+    /// Everything present in this folder at `through` is now in the ledger.
+    /// Clears any pending hold: the scan that just ran is the one it was for.
+    pub fn mark_watched(&self, folder_id: &str, through: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO folder_marks (folder_id, watched_through, hold_reason)
+             VALUES (?1, ?2, NULL)
+             ON CONFLICT(folder_id) DO UPDATE SET watched_through = ?2, hold_reason = NULL",
+            params![folder_id, through],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Have the next scan of this folder hold what it finds, for `reason`.
+    pub fn hold_next_scan(&self, folder_id: &str, reason: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO folder_marks (folder_id, watched_through, hold_reason)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(folder_id) DO UPDATE SET hold_reason = ?3",
+            params![folder_id, now(), reason],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Every file this folder has a row for, with the size and mtime recorded.
+    pub fn known_files(&self, folder_id: &str) -> Result<HashMap<String, (i64, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT path, size, mtime FROM files WHERE folder_id = ?1")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![folder_id], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))
+            .map_err(db_err)?
+            .collect::<std::result::Result<HashMap<_, _>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Files held for review in this folder, by reason, most common first.
+    pub fn held_reasons(&self, folder_id: &str) -> Result<Vec<(String, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT reason, COUNT(*) FROM files
+                  WHERE folder_id = ?1 AND state = 'baseline' AND reason IS NOT NULL
+                  GROUP BY reason ORDER BY COUNT(*) DESC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![folder_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
     }
 }
 
@@ -582,7 +686,9 @@ impl Ledger {
                 "SELECT id, folder_id, path, size, mtime, state, reason, attempts,
                         content_hash, observed_at, updated_at
                    FROM files WHERE folder_id = ?1 AND state = 'baseline'
-                  ORDER BY mtime DESC",
+                  -- Held files first: they turned up recently, and are the
+                  -- ones somebody opening this is most likely looking for.
+                  ORDER BY reason IS NULL, mtime DESC",
             )
             .map_err(db_err)?;
         let rows = stmt
@@ -668,6 +774,7 @@ mod path_migration_tests {
                 (format!(r"{old}\a.mp4"), 10, 1),
                 (format!(r"{old}\b.mp4"), 20, 2),
             ],
+            None,
         )
         .unwrap();
 
@@ -688,8 +795,8 @@ mod path_migration_tests {
     fn only_the_named_folder_moves() {
         let (l, dir) = ledger();
         let old = r"\\?\E:\Clips";
-        l.record_baseline("f1", &[(format!(r"{old}\one.mp4"), 1, 1)]).unwrap();
-        l.record_baseline("f2", &[(format!(r"{old}\two.mp4"), 1, 1)]).unwrap();
+        l.record_baseline("f1", &[(format!(r"{old}\one.mp4"), 1, 1)], None).unwrap();
+        l.record_baseline("f2", &[(format!(r"{old}\two.mp4"), 1, 1)], None).unwrap();
 
         assert_eq!(l.rewrite_path_prefix("f1", old, r"E:\Clips").unwrap(), 1);
 
@@ -703,7 +810,7 @@ mod path_migration_tests {
     #[test]
     fn only_a_real_prefix_counts() {
         let (l, dir) = ledger();
-        l.record_baseline("f1", &[(r"D:\other\file.mp4".to_string(), 1, 1)]).unwrap();
+        l.record_baseline("f1", &[(r"D:\other\file.mp4".to_string(), 1, 1)], None).unwrap();
         assert_eq!(l.rewrite_path_prefix("f1", r"\\?\E:\Clips", r"E:\Clips").unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -764,6 +871,79 @@ mod claim_order_tests {
         let next = l.claim(2, &[]).unwrap();
         let paths: Vec<&str> = next.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, vec!["/w/fresh.mp4"], "a retry due in an hour is not due now");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use super::*;
+
+    fn ledger() -> (Ledger, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("firesync-marks-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Ledger::open(&dir.join("l.sqlite")).unwrap(), dir)
+    }
+
+    #[test]
+    fn a_folder_with_no_mark_says_so() {
+        let (l, dir) = ledger();
+        assert_eq!(l.folder_mark("f1").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hold_waits_for_the_next_scan_and_the_scan_clears_it() {
+        let (l, dir) = ledger();
+        l.mark_watched("f1", 100).unwrap();
+        l.hold_next_scan("f1", "Arrived while paused").unwrap();
+        assert_eq!(
+            l.folder_mark("f1").unwrap(),
+            Some(FolderMark { watched_through: 100, hold_reason: Some("Arrived while paused".into()) }),
+            "holding should not move the mark"
+        );
+
+        l.mark_watched("f1", 200).unwrap();
+        assert_eq!(
+            l.folder_mark("f1").unwrap(),
+            Some(FolderMark { watched_through: 200, hold_reason: None })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn held_files_are_counted_by_reason_and_listed_first() {
+        let (l, dir) = ledger();
+        l.record_baseline("f1", &[("/w/old.mp4".into(), 1, 10)], None).unwrap();
+        l.record_baseline(
+            "f1",
+            &[("/w/new-a.mp4".into(), 1, 5), ("/w/new-b.mp4".into(), 1, 6)],
+            Some("Arrived while paused"),
+        )
+        .unwrap();
+
+        assert_eq!(l.held_reasons("f1").unwrap(), vec![("Arrived while paused".to_string(), 2)]);
+        let order: Vec<String> = l.baseline_files("f1").unwrap().into_iter().map(|r| r.path).collect();
+        assert_eq!(order, vec!["/w/new-b.mp4", "/w/new-a.mp4", "/w/old.mp4"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_a_folder_forgets_its_mark() {
+        let (l, dir) = ledger();
+        l.mark_watched("f1", 100).unwrap();
+        l.forget_folder("f1").unwrap();
+        assert_eq!(l.folder_mark("f1").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn known_files_carry_what_was_recorded() {
+        let (l, dir) = ledger();
+        l.record_baseline("f1", &[("/w/a.mp4".into(), 42, 7)], None).unwrap();
+        let known = l.known_files("f1").unwrap();
+        assert_eq!(known.get("/w/a.mp4"), Some(&(42, 7)));
+        assert!(l.known_files("f2").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

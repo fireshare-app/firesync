@@ -72,6 +72,14 @@ impl TokenCache {
         Self { cached: RwLock::new(cached) }
     }
 
+    /// No token, and no keychain read. For tests, which must never touch the
+    /// real credential store — on a development machine it holds a real token,
+    /// and on macOS asking for it can put up a password prompt.
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self { cached: RwLock::new(None) }
+    }
+
     pub fn get(&self) -> Option<String> {
         self.cached.read().expect("token cache poisoned").clone()
     }

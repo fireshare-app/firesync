@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import {
+  ClockIcon,
   PauseIcon,
   PencilIcon,
   PlayIcon,
@@ -74,7 +75,6 @@ interface InFlight {
 
 export function Folders({ onChanged }: Props) {
   const [list, setList] = useState<FolderSummary[]>([])
-  const [problems, setProblems] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState<FolderSummary | 'new' | null>(null)
   const [backlogFor, setBacklogFor] = useState<FolderSummary | null>(null)
@@ -83,7 +83,6 @@ export function Folders({ onChanged }: Props) {
   const refresh = useCallback(async () => {
     try {
       setList(await foldersApi.list())
-      setProblems(await foldersApi.problems())
       onChanged?.()
     } catch (e) {
       setError(asAppError(e).message)
@@ -152,11 +151,6 @@ export function Folders({ onChanged }: Props) {
       </header>
 
       {error && <div className="banner banner--bad">{error}</div>}
-      {problems.map((p) => (
-        <div key={p} className="banner banner--warn">
-          {p}
-        </div>
-      ))}
 
       {list.length === 0 && !error && (
         <div className="empty">
@@ -172,15 +166,27 @@ export function Folders({ onChanged }: Props) {
           const live = flights.length > 0
           const failed = countOf(folder, 'failed')
           const lastUpload = ago(folder.lastUploadAt ?? 0)
+          // Enabled, but its path is not there: a drive unplugged, a share
+          // down. Said on the card it belongs to rather than across the page.
+          const away = folder.availability === 'unavailable'
           return (
-            <article key={folder.id} className={`fcard ${live ? 'fcard--live' : ''}`}>
+            <article
+              key={folder.id}
+              className={`fcard ${live ? 'fcard--live' : ''} ${away ? 'fcard--away' : ''}`}
+            >
               <div className="fcard__head">
                 <span
-                  className={`dot ${!folder.enabled ? 'dot--off' : live ? 'dot--live' : 'dot--ok'}`}
+                  className={`dot ${
+                    !folder.enabled ? 'dot--off' : away ? 'dot--warn' : live ? 'dot--live' : 'dot--ok'
+                  }`}
                 />
                 <span className="mono fcard__path">{folder.path}</span>
-                <span className={`pill ${!folder.enabled ? '' : live ? 'pill--live' : 'pill--ok'}`}>
-                  {!folder.enabled ? 'Paused' : live ? 'Uploading' : 'Watching'}
+                <span
+                  className={`pill ${
+                    !folder.enabled ? '' : away ? 'pill--warn' : live ? 'pill--live' : 'pill--ok'
+                  }`}
+                >
+                  {!folder.enabled ? 'Paused' : away ? 'Not reachable' : live ? 'Uploading' : 'Watching'}
                 </span>
                 <span className="spacer" />
                 <button
@@ -201,7 +207,7 @@ export function Folders({ onChanged }: Props) {
                 >
                   <PencilIcon />
                 </button>
-                {folder.presentCount > 0 && (
+                {(folder.presentCount > 0 || folder.held > 0) && (
                   <button
                     type="button"
                     className="iconbtn"
@@ -240,7 +246,15 @@ export function Folders({ onChanged }: Props) {
                 )}
               </div>
 
-              {flights.length > 0 ? (
+              {away ? (
+                <div className="fcard__warn">
+                  <WarningTriangleIcon />
+                  <span>
+                    {folder.problem ?? 'This folder is not reachable.'} Watching starts again by
+                    itself when it is back, and anything recorded into it meanwhile is uploaded then.
+                  </span>
+                </div>
+              ) : flights.length > 0 ? (
                 <div className="fcard__flights">
                   {flights.map(([path, flight]) => {
                     const pct = Math.min(100, Math.round(flight.fraction * 100))
@@ -272,6 +286,24 @@ export function Folders({ onChanged }: Props) {
                 </div>
               ) : null}
 
+              {folder.held > 0 && (
+                <div className="fcard__held">
+                  <ClockIcon size={15} />
+                  <span>
+                    <strong>
+                      {folder.held} file{folder.held === 1 ? '' : 's'}
+                    </strong>{' '}
+                    held for review
+                    {folder.heldReason ? ` (${folder.heldReason.toLowerCase()})` : ''}. They wait for
+                    you rather than uploading on their own.
+                  </span>
+                  <span className="spacer" />
+                  <button type="button" className="linkbtn" onClick={() => setBacklogFor(folder)}>
+                    Review
+                  </button>
+                </div>
+              )}
+
               <div className="fcard__foot">
                 <span>
                   <strong>{countOf(folder, 'done')}</strong> uploaded
@@ -283,7 +315,7 @@ export function Folders({ onChanged }: Props) {
                   <strong>{countOf(folder, 'skipped')}</strong> skipped
                 </span>
                 <span>
-                  <strong>{folder.presentCount}</strong> here now
+                  <strong>{away ? '—' : folder.presentCount}</strong> here now
                 </span>
                 <span className="spacer" />
                 {lastUpload && <span>Last upload {lastUpload}</span>}

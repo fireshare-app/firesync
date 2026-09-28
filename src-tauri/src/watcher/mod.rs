@@ -1,3 +1,4 @@
+pub mod catchup;
 pub mod settle;
 
 use std::collections::{HashMap, HashSet};
@@ -34,10 +35,42 @@ pub struct Decision {
     pub at: i64,
 }
 
+/// Where a watched folder stands, for its card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Availability {
+    Watching,
+    /// Enabled, but its path is not there: an unplugged drive, a share that is
+    /// down, a folder moved away. Retried until it comes back.
+    Unavailable,
+    Paused,
+}
+
+/// What `sync` changed.
+#[derive(Default)]
+pub struct Synced {
+    /// Folders a watch was started on just now. Each has a gap behind it to
+    /// catch up on.
+    pub attached: Vec<String>,
+    pub problems: Vec<(String, AppError)>,
+}
+
+struct Running {
+    /// Held, never read: the watch lasts exactly as long as this does.
+    _debouncer: Deb,
+    /// What it was started watching, so a change to it restarts the watch.
+    /// Without this, turning on "Watch subfolders" did nothing until relaunch.
+    recursive: bool,
+}
+
 pub struct Watchers {
-    debouncers: HashMap<String, Deb>,
+    running: HashMap<String, Running>,
     tx: tokio::sync::mpsc::UnboundedSender<(String, PathBuf)>,
     debounce: Duration,
+    /// Folders whose watch reported that it may have missed events — a
+    /// change buffer overflowing, or an error from the watch itself. They get a
+    /// catch-up scan at the next opportunity.
+    rescan: Arc<Mutex<HashSet<String>>>,
     /// The last problem logged per folder. `sync` runs whenever the folders
     /// page refreshes, and a folder whose drive is unplugged would otherwise
     /// write the same warning into the log on every one of those.
@@ -46,7 +79,7 @@ pub struct Watchers {
 
 impl Watchers {
     pub fn new(tx: tokio::sync::mpsc::UnboundedSender<(String, PathBuf)>) -> Self {
-        Self { debouncers: HashMap::new(), tx, debounce: DEBOUNCE, reported: HashMap::new() }
+        Self { running: HashMap::new(), tx, debounce: DEBOUNCE, rescan: Arc::default(), reported: HashMap::new() }
     }
 
     /// Tests need the debounce shorter than the two seconds a real recorder
@@ -56,31 +89,65 @@ impl Watchers {
         tx: tokio::sync::mpsc::UnboundedSender<(String, PathBuf)>,
         debounce: Duration,
     ) -> Self {
-        Self { debouncers: HashMap::new(), tx, debounce, reported: HashMap::new() }
+        Self { running: HashMap::new(), tx, debounce, rescan: Arc::default(), reported: HashMap::new() }
     }
 
     /// Bring the running watchers in line with the configured folders. Called on
     /// startup and after any folder is added, removed, paused or resumed.
-    pub fn sync(&mut self, folders: &[WatchedFolder]) -> Vec<(String, AppError)> {
-        let wanted: HashSet<&str> =
-            folders.iter().filter(|f| f.enabled).map(|f| f.id.as_str()).collect();
+    #[cfg(test)]
+    pub fn sync(&mut self, folders: &[WatchedFolder]) -> Synced {
+        self.sync_with(folders, &HashSet::new())
+    }
 
-        self.debouncers.retain(|id, _| wanted.contains(id.as_str()));
+    /// `sync`, told which enabled folders were found missing.
+    ///
+    /// Reachability is asked by the caller, before this is locked, because on a
+    /// network share that has gone away the question can take as long as the
+    /// network's timeout — and the folders page waits on this lock.
+    pub fn sync_with(&mut self, folders: &[WatchedFolder], unreachable: &HashSet<String>) -> Synced {
+        let wanted: HashMap<&str, bool> = folders
+            .iter()
+            .filter(|f| f.enabled)
+            .map(|f| (f.id.as_str(), f.include_subfolders))
+            .collect();
 
-        let mut problems = Vec::new();
+        // Stopped when no longer wanted, and restarted when what it should
+        // cover has changed.
+        self.running.retain(|id, r| wanted.get(id.as_str()) == Some(&r.recursive));
+        self.reported.retain(|id, _| wanted.contains_key(id.as_str()));
+
+        // A folder whose path has gone — a drive pulled out, a share down — is
+        // stopped rather than left watching nothing and looking fine. The next
+        // sync tries it again.
+        for folder in folders.iter().filter(|f| unreachable.contains(&f.id)) {
+            if self.running.remove(&folder.id).is_some() {
+                log::warn!("{} is no longer reachable", folder.path.display());
+            }
+        }
+
+        let mut synced = Synced::default();
         for folder in folders.iter().filter(|f| f.enabled) {
-            if self.debouncers.contains_key(&folder.id) {
+            if self.running.contains_key(&folder.id) {
                 continue;
             }
-            match self.start_one(folder) {
-                Ok(deb) => {
+            let started = if unreachable.contains(&folder.id) {
+                Err(not_reachable(folder))
+            } else {
+                self.start_one(folder)
+            };
+            match started {
+                Ok(debouncer) => {
                     log::info!(
                         "Watching {}{}",
                         folder.path.display(),
                         if folder.include_subfolders { " and its subfolders" } else { "" }
                     );
                     self.reported.remove(&folder.id);
-                    self.debouncers.insert(folder.id.clone(), deb);
+                    self.running.insert(
+                        folder.id.clone(),
+                        Running { _debouncer: debouncer, recursive: folder.include_subfolders },
+                    );
+                    synced.attached.push(folder.id.clone());
                 }
                 Err(e) => {
                     let message = e.to_string();
@@ -88,30 +155,74 @@ impl Watchers {
                         log::warn!("Not watching {}: {message}", folder.path.display());
                         self.reported.insert(folder.id.clone(), message);
                     }
-                    problems.push((folder.id.clone(), e));
+                    synced.problems.push((folder.id.clone(), e));
                 }
             }
         }
-        problems
+        synced
+    }
+
+    /// Folders that asked for a rescan since the last call.
+    pub fn take_rescans(&self) -> Vec<String> {
+        self.rescan.lock().expect("rescan mutex").drain().collect()
+    }
+
+    pub fn is_running(&self, folder_id: &str) -> bool {
+        self.running.contains_key(folder_id)
+    }
+
+    pub fn availability(&self, folder: &WatchedFolder) -> Availability {
+        if !folder.enabled {
+            Availability::Paused
+        } else if self.running.contains_key(&folder.id) {
+            Availability::Watching
+        } else {
+            Availability::Unavailable
+        }
+    }
+
+    /// Why this folder is not being watched, if it is not.
+    pub fn problem(&self, folder_id: &str) -> Option<&str> {
+        self.reported.get(folder_id).map(String::as_str)
+    }
+
+    /// Where the watchers send the paths they hear about. A catch-up scan
+    /// sends into the same place, so what it finds is settled and ruled on
+    /// exactly as a live event would be.
+    pub fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<(String, PathBuf)> {
+        self.tx.clone()
     }
 
     fn start_one(&self, folder: &WatchedFolder) -> Result<Deb> {
         if !folder.path.is_dir() {
-            return Err(AppError::Storage(format!(
-                "{} is not a folder, or is not reachable from this machine.",
-                folder.path.display()
-            )));
+            return Err(not_reachable(folder));
         }
 
         let tx = self.tx.clone();
         let folder_id = folder.id.clone();
+        let rescan = self.rescan.clone();
 
         let mut debouncer = new_debouncer(
             self.debounce,
             None,
             move |result: std::result::Result<Vec<DebouncedEvent>, Vec<notify::Error>>| {
-                let Ok(events) = result else { return };
+                let events = match result {
+                    Ok(events) => events,
+                    // An error from the watch means it may have missed things.
+                    // Rather than guess what, look at the whole folder again.
+                    Err(errors) => {
+                        log::warn!("The watch reported {} error(s); rescanning", errors.len());
+                        rescan.lock().expect("rescan mutex").insert(folder_id.clone());
+                        return;
+                    }
+                };
                 for event in events {
+                    // The platform's change buffer overflowed and events were
+                    // dropped: the same answer.
+                    if event.need_rescan() {
+                        rescan.lock().expect("rescan mutex").insert(folder_id.clone());
+                        continue;
+                    }
                     // Creates, writes and renames-into-the-folder all mean "look
                     // at this path". Removals are ignored: the ledger keeps its
                     // row so a file that comes back is not treated as new.
@@ -138,6 +249,13 @@ impl Watchers {
 
         Ok(debouncer)
     }
+}
+
+fn not_reachable(folder: &WatchedFolder) -> AppError {
+    AppError::Storage(format!(
+        "{} is not a folder, or is not reachable from this machine.",
+        folder.path.display()
+    ))
 }
 
 /// Resolve a path to the form the ledger keys on.
@@ -289,10 +407,39 @@ pub fn spawn_event_loop<F>(
     });
 }
 
-/// Everything already in a folder, for the baseline snapshot taken when it is
-/// added. Only files the rules could ever accept are listed — a folder full of
-/// `.log` noise should not produce thousands of baseline rows.
-pub fn scan_existing(folder: &WatchedFolder, types: &SupportedTypes) -> Vec<(String, i64, i64)> {
+/// One file found by a scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub path: String,
+    pub size: i64,
+    pub mtime: i64,
+    /// When this copy of the file came into being, where the filesystem knows.
+    /// Zero where it does not.
+    pub created: i64,
+}
+
+impl Found {
+    /// When the file appeared in the folder, as well as that can be told.
+    ///
+    /// The later of the two times, because each covers what the other misses.
+    /// A recording's mtime is when it finished. A copy keeps its original
+    /// mtime on Windows but gets a fresh creation time, and a copy is as new
+    /// to the folder as anything recorded into it.
+    pub fn appeared(&self) -> i64 {
+        self.mtime.max(self.created)
+    }
+}
+
+fn unix_secs(time: std::io::Result<std::time::SystemTime>) -> i64 {
+    time.ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Every file in a folder the rules could ever accept, with its times. A
+/// folder full of `.log` noise should not produce thousands of rows.
+pub fn scan_found(folder: &WatchedFolder, types: &SupportedTypes) -> Vec<Found> {
     let mut out = Vec::new();
     // Start canonical so every path below is too, matching what the watcher
     // records for the same file.
@@ -313,16 +460,21 @@ pub fn scan_existing(folder: &WatchedFolder, types: &SupportedTypes) -> Vec<(Str
             if !meta.is_file() || !rules::worth_settling(&path, types) {
                 continue;
             }
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            out.push((path.to_string_lossy().to_string(), meta.len() as i64, mtime));
+            out.push(Found {
+                path: path.to_string_lossy().to_string(),
+                size: meta.len() as i64,
+                mtime: unix_secs(meta.modified()),
+                created: unix_secs(meta.created()),
+            });
         }
     }
     out
+}
+
+/// Everything already in a folder, for the baseline snapshot taken when it is
+/// added.
+pub fn scan_existing(folder: &WatchedFolder, types: &SupportedTypes) -> Vec<(String, i64, i64)> {
+    scan_found(folder, types).into_iter().map(|f| (f.path, f.size, f.mtime)).collect()
 }
 
 #[cfg(test)]
@@ -372,7 +524,7 @@ mod tests {
 
         let present = scan_existing(&folder, &types);
         assert_eq!(present.len(), 2, "baseline scan should see both existing clips");
-        ledger.record_baseline(&folder.id, &present).unwrap();
+        ledger.record_baseline(&folder.id, &present, None).unwrap();
 
         let settings = Arc::new(Mutex::new(Settings {
             folders: vec![folder.clone()],
@@ -381,7 +533,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut watchers = Watchers::with_debounce(tx, Duration::from_millis(120));
-        assert!(watchers.sync(&[folder.clone()]).is_empty(), "watch should start cleanly");
+        assert!(watchers.sync(&[folder.clone()]).problems.is_empty(), "watch should start cleanly");
 
         let decisions = Arc::new(Mutex::new(Vec::new()));
         let sink = decisions.clone();
@@ -517,7 +669,7 @@ mod tests {
             auto_sort_by_game: false,
         };
         let present = scan_existing(&folder, &SupportedTypes::default());
-        reopened.record_baseline(&folder.id, &present).unwrap();
+        reopened.record_baseline(&folder.id, &present, None).unwrap();
 
         let rows = reopened.recent(500).unwrap();
         assert_eq!(rows.len(), before, "relaunch created duplicate rows");
