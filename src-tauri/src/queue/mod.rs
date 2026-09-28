@@ -109,9 +109,16 @@ where
     }
 
     tauri::async_runtime::spawn(async move {
+        // One task per file in flight, and a slot that frees is filled straight
+        // away. The loop used to claim a batch and wait for all of it, so with
+        // two slots a three-gigabyte clip left the other slot idle until it
+        // finished — "uploads at once: 2" was only true for files the same size.
+        let mut running: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
+            while running.try_join_next().is_some() {}
+
             if deps.control.is_paused() {
-                tokio::time::sleep(IDLE_POLL).await;
+                idle(&mut running).await;
                 continue;
             }
 
@@ -131,32 +138,37 @@ where
             };
 
             let Some(base_url) = base_url else {
-                tokio::time::sleep(IDLE_POLL).await;
+                idle(&mut running).await;
                 continue;
             };
             // From memory. This loop runs every couple of seconds; asking the
             // OS credential store each time is what made macOS prompt for a
             // password on repeat.
             let Some(token) = deps.token.get() else {
-                tokio::time::sleep(IDLE_POLL).await;
+                idle(&mut running).await;
                 continue;
             };
 
-            let claims = match deps.ledger.claim(concurrency, &paused_folders) {
+            let free = concurrency - running.len() as i64;
+            if free <= 0 {
+                idle(&mut running).await;
+                continue;
+            }
+
+            let claims = match deps.ledger.claim(free, &paused_folders) {
                 Ok(c) => c,
                 Err(e) => {
                     log::error!("Could not claim uploads: {e}");
-                    tokio::time::sleep(IDLE_POLL).await;
+                    idle(&mut running).await;
                     continue;
                 }
             };
 
             if claims.is_empty() {
-                tokio::time::sleep(IDLE_POLL).await;
+                idle(&mut running).await;
                 continue;
             }
 
-            let mut tasks = Vec::new();
             for claim in claims {
                 let ledger = deps.ledger.clone();
                 let settings = deps.settings.clone();
@@ -167,7 +179,7 @@ where
                 let token = token.clone();
                 let types = deps.types.clone();
 
-                tasks.push(tauri::async_runtime::spawn(async move {
+                running.spawn(async move {
                     run_one(
                         claim,
                         &base_url,
@@ -181,13 +193,25 @@ where
                         types,
                     )
                     .await;
-                }));
-            }
-            for task in tasks {
-                let _ = task.await;
+                });
             }
         }
     });
+}
+
+/// Wait until a slot frees or `IDLE_POLL` passes, whichever comes first.
+///
+/// The poll is needed even with every slot busy: a pause, or a lower "uploads
+/// at once", has to take effect without waiting for a file to finish.
+async fn idle(running: &mut tokio::task::JoinSet<()>) {
+    if running.is_empty() {
+        tokio::time::sleep(IDLE_POLL).await;
+    } else {
+        tokio::select! {
+            _ = running.join_next() => {}
+            _ = tokio::time::sleep(IDLE_POLL) => {}
+        }
+    }
 }
 
 /// Where an upload goes, and what it says about itself.
@@ -2029,5 +2053,118 @@ mod logging_tests {
 
         let _ = std::fs::remove_dir_all(&sorted.dir);
         let _ = std::fs::remove_dir_all(&refused.dir);
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::tests::read_request;
+    use super::*;
+    use crate::config::{MediaKind, WatchedFolder};
+    use crate::ledger::FileState;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+
+    /// Answers every upload with a 201, taking `slow` over any request bigger
+    /// than `big` bytes — a large clip on a slow upstream — and answering the
+    /// rest at once. Each connection gets its own thread, so a slow answer does
+    /// not hold up the others.
+    fn serve(big: usize, slow: std::time::Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let body = read_request(&mut stream).unwrap_or_default();
+                    if body.len() > big {
+                        std::thread::sleep(slow);
+                    }
+                    let reply = r#"{"status":"accepted","filename":"x.mp4","folder":"clips"}"#;
+                    let response = format!(
+                        "HTTP/1.1 201 CREATED\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn state_of(ledger: &Ledger, path: &std::path::Path) -> FileState {
+        ledger
+            .recent(50)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.path == path.to_string_lossy())
+            .unwrap()
+            .state
+    }
+
+    /// The case the old batch loop got wrong: with two slots, one big slow file
+    /// and four small ones, the small ones should go through beside the big
+    /// one rather than wait for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn small_files_go_through_beside_a_big_one() {
+        let dir = std::env::temp_dir().join(format!("firesync-slots-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = Arc::new(Ledger::open(&dir.join("l.sqlite")).unwrap());
+
+        // Queued big first, so it is claimed first and takes a slot.
+        let big = dir.join("big.mp4");
+        std::fs::write(&big, vec![0u8; 256 << 10]).unwrap();
+        ledger.observe("f1", big.to_str().unwrap(), 256 << 10, 0, None).unwrap();
+        let small: Vec<PathBuf> = (0..4)
+            .map(|i| {
+                let path = dir.join(format!("small-{i}.mp4"));
+                std::fs::write(&path, vec![0u8; 2048]).unwrap();
+                ledger.observe("f1", path.to_str().unwrap(), 2048, 0, None).unwrap();
+                path
+            })
+            .collect();
+
+        let folder = WatchedFolder {
+            id: "f1".into(),
+            path: dir.clone(),
+            enabled: true,
+            include_subfolders: false,
+            media: vec![MediaKind::Video],
+            dest_folder: Some("clips".into()),
+            game: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            after_upload: AfterUpload::Keep,
+            auto_sort_by_game: false,
+        };
+        let mut settings = Settings { folders: vec![folder], ..Settings::default() };
+        settings.server_url = Some(serve(64 << 10, std::time::Duration::from_secs(4)));
+        settings.transfers.max_concurrent = 2;
+
+        spawn(QueueDeps {
+            ledger: ledger.clone(),
+            settings: Arc::new(Mutex::new(settings)),
+            control: Arc::new(QueueControl::new()),
+            token: Arc::new(crate::secrets::TokenCache::holding("fsk_test")),
+            options: Arc::new(OptionsCache::new()),
+            // No pre-flight: this server answers uploads and nothing else.
+            types: Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
+            on_event: Arc::new(|_: UploadEvent| {}),
+        });
+
+        // Well inside the big file's four seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+        while std::time::Instant::now() < deadline
+            && !small.iter().all(|p| state_of(&ledger, p) == FileState::Done)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        for path in &small {
+            assert_eq!(state_of(&ledger, path), FileState::Done, "{} waited", path.display());
+        }
+        assert_eq!(state_of(&ledger, &big), FileState::Uploading, "the big one is still going");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

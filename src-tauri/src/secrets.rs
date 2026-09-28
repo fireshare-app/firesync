@@ -80,6 +80,12 @@ impl TokenCache {
         Self { cached: RwLock::new(None) }
     }
 
+    /// A token in memory only, for tests that run the queue.
+    #[cfg(test)]
+    pub fn holding(token: &str) -> Self {
+        Self { cached: RwLock::new(Some(token.to_string())) }
+    }
+
     pub fn get(&self) -> Option<String> {
         self.cached.read().expect("token cache poisoned").clone()
     }
