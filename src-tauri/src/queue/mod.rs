@@ -539,6 +539,14 @@ async fn run_one<F>(
         }
     };
 
+    // Where it will be watched once it is there. Carried on the finished event
+    // so the tray, the clipboard and the notification all use one answer, the
+    // same one Activity builds from the ledger.
+    let link = hash.as_deref().and_then(|h| {
+        let viewer = types.lock().expect("types mutex").viewer_for(&path)?;
+        Some(crate::api::identity::media_url(base_url, h, viewer))
+    });
+
     // Ask before sending. A video would otherwise cross the network in full
     // before its 409 came back, and an image is never rejected at all — the
     // server accepts it and folds it into the row it already has, so without
@@ -562,7 +570,7 @@ async fn run_one<F>(
                         sent: claim.size,
                         state: "duplicate".into(),
                         reason: Some("Already in your library".into()),
-                        url: answer.url,
+                        url: answer.url.or_else(|| link.clone()),
                         landed_as: None,
                         removed_local: removed,
                         bytes_per_second: None,
@@ -699,7 +707,7 @@ async fn run_one<F>(
                 sent: claim.size,
                 state: "done".into(),
                 reason: None,
-                url: None,
+                url: link.clone(),
                 landed_as: Some(landed),
                 removed_local: removed,
                 bytes_per_second: None,
@@ -722,7 +730,7 @@ async fn run_one<F>(
                 sent: claim.size,
                 state: "duplicate".into(),
                 reason: Some("Already in your library".into()),
-                url,
+                url: url.or(link),
                 landed_as: None,
                 removed_local: removed,
                 bytes_per_second: None,
@@ -1122,6 +1130,26 @@ pub(crate) mod tests {
         server.join().unwrap();
 
         assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The finished event says where the clip can be watched, so the tray and
+    /// the clipboard need not work it out again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_upload_carries_its_link() {
+        let f = fixture();
+        let (url, server) = serve_preflight(
+            200,
+            r#"{"exists":false}"#,
+            Some((201, r#"{"filename":"clip.mp4","folder":"clips"}"#)),
+        );
+        run_checking(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        let hash = f.ledger.recent(1).unwrap()[0].content_hash.clone().expect("hashed before sending");
+        let events = f.events.lock().unwrap();
+        let done = events.iter().find(|e| e.state == "done").expect("a done event");
+        assert_eq!(done.url.as_deref(), Some(format!("{url}/w/{hash}").as_str()));
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 

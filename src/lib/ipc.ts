@@ -111,6 +111,7 @@ export interface Settings {
     on_needs_attention: boolean
     quiet_in_fullscreen: boolean
     group_bursts: boolean
+    copy_link_on_complete: boolean
   }
   transfers: { max_concurrent: number; speed_cap: number | null }
   startup: { launch_at_login: boolean; start_in_tray: boolean }
@@ -367,7 +368,17 @@ export const backlog = {
     invoke<number>('queue_backlog', { folderId, paths }),
 }
 
+/** A finished upload with a page to open, for the tray. */
+export interface RecentLink {
+  id: number
+  name: string
+  link: string
+  /** When it finished, in unix seconds. */
+  at: number
+}
+
 export const tray = {
+  recentLinks: (limit = 3) => invoke<RecentLink[]>('recent_links', { limit }),
   openMain: () => invoke<void>('open_main_window'),
   openSettings: () => invoke<void>('open_main_at', { tab: 'settings' }),
   quit: () => invoke<void>('quit_app'),

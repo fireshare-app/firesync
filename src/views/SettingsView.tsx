@@ -220,6 +220,13 @@ export function SettingsView({ connection, onDisconnected }: Props) {
           checked={n.group_bursts}
           onChange={(v) => patch({ ...settings, notifications: { ...n, group_bursts: v } })}
         />
+        <Toggle
+          id="n-copy"
+          label="Copy the link when an upload finishes"
+          hint="Replaces whatever is on your clipboard with the newest clip's link. Files that were already in your library are left out, so re-sending a folder doesn't keep overwriting it."
+          checked={n.copy_link_on_complete}
+          onChange={(v) => patch({ ...settings, notifications: { ...n, copy_link_on_complete: v } })}
+        />
         <div className="panel__action">
           <button type="button" className="btn btn--ghost btn--icon" onClick={() => void runTest()}>
             <BellIcon />

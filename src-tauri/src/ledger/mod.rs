@@ -1282,3 +1282,53 @@ mod activity_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+impl Ledger {
+    /// The newest uploads that have a page to open, for the tray. Duplicates
+    /// count: the library already had them, so the page is there.
+    pub fn recent_finished(&self, limit: i64) -> Result<Vec<FileRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {ROW_COLUMNS} FROM files
+                  WHERE state IN ('done', 'duplicate') AND content_hash IS NOT NULL
+                  ORDER BY updated_at DESC, id DESC LIMIT ?1"
+            ))
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![limit], file_row)
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod recent_finished_tests {
+    use super::*;
+
+    #[test]
+    fn only_finished_uploads_with_a_page_come_back_newest_first() {
+        let dir = std::env::temp_dir().join(format!("firesync-recent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let l = Ledger::open(&dir.join("l.sqlite")).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            l.observe("f1", &format!("/w/{name}.mp4"), 1, 1, None).unwrap();
+        }
+        let id = |name: &str| l.recent(10).unwrap().into_iter().find(|r| r.path.ends_with(name)).unwrap().id;
+        let (a, b, c) = (id("a.mp4"), id("b.mp4"), id("c.mp4"));
+        l.record_hash(a, "aaaa").unwrap();
+        l.mark_done(a, None).unwrap();
+        l.record_hash(b, "bbbb").unwrap();
+        l.mark_duplicate(b, None).unwrap();
+        // Done, but the hash never got recorded: nothing to link to.
+        l.mark_done(c, None).unwrap();
+        // d is still queued.
+
+        let paths: Vec<String> = l.recent_finished(10).unwrap().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"/w/a.mp4".to_string()) && paths.contains(&"/w/b.mp4".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

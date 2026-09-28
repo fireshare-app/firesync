@@ -799,6 +799,37 @@ pub fn reveal_file(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id:
     }
 }
 
+/// A finished upload, for the tray's Recent block.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentLink {
+    pub id: i64,
+    pub name: String,
+    pub link: String,
+    /// When it finished, in unix seconds.
+    pub at: i64,
+}
+
+/// The newest uploads that can be opened, so a link is one click from the
+/// tray instead of a trip through the main window.
+#[tauri::command]
+pub fn recent_links(state: tauri::State<'_, AppState>, limit: Option<i64>) -> Result<Vec<RecentLink>> {
+    let base = state.settings.lock().expect("settings mutex").server_url.clone();
+    let types = state.types.lock().expect("types mutex").clone();
+    let rows = state.ledger.recent_finished(limit.unwrap_or(3).clamp(1, 20))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|file| {
+            let link = link_for(&file, base.as_deref(), &types)?;
+            let name = std::path::Path::new(&file.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| file.path.clone());
+            Some(RecentLink { id: file.id, name, link, at: file.updated_at })
+        })
+        .collect())
+}
+
 /// The page a row can be opened at, when there is one.
 ///
 /// `duplicate` counts alongside `done`: the server said it already had these

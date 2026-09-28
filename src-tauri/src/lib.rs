@@ -84,6 +84,7 @@ pub fn run() {
             let queue_control = state.queue.clone();
             let queue_token = state.token.clone();
             let queue_options = state.options.clone();
+            let event_settings = state.settings.clone();
             let queue_types = state.types.clone();
 
             let notifier = notify::Notifier::new(app.handle().clone(), settings.clone());
@@ -129,9 +130,20 @@ pub fn run() {
                 options: queue_options,
                 types: queue_types,
                 on_event: std::sync::Arc::new(move |event: queue::UploadEvent| {
+                    // Only a genuinely new upload, and only when asked: a folder
+                    // being re-sent turns up duplicates in bulk, and each would
+                    // replace whatever somebody had copied.
+                    let copy = event.state == "done"
+                        && event_settings
+                            .lock()
+                            .expect("settings mutex")
+                            .notifications
+                            .copy_link_on_complete;
+                    let copied = copy
+                        && event.url.as_deref().is_some_and(|url| copy_link(&queue_handle, url));
                     // Progress ticks are for the window only. A toast every half
                     // second would be its own kind of failure.
-                    if let Some(note) = note_for(&event) {
+                    if let Some(note) = note_for(&event, copied) {
                         queue_notifier.post(note);
                     }
                     let _ = queue_handle.emit("firesync://upload", event);
@@ -192,6 +204,7 @@ pub fn run() {
             commands::check_backlog_against_library,
             commands::queue_backlog,
             commands::activity_page,
+            commands::recent_links,
             commands::retry_file,
             commands::skip_file,
             commands::stop_upload,
@@ -247,8 +260,21 @@ fn spawn_upkeep(app: tauri::AppHandle) {
     });
 }
 
-/// Which upload outcomes are worth interrupting somebody for.
-fn note_for(event: &queue::UploadEvent) -> Option<notify::Note> {
+/// Put a link on the clipboard, and say whether it got there.
+fn copy_link(app: &tauri::AppHandle, link: &str) -> bool {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    match app.clipboard().write_text(link) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("Could not copy the link: {e}");
+            false
+        }
+    }
+}
+
+/// Which upload outcomes are worth interrupting somebody for. `copied` says
+/// the link is already on the clipboard, which is worth saying.
+fn note_for(event: &queue::UploadEvent, copied: bool) -> Option<notify::Note> {
     let name = std::path::Path::new(&event.path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -257,7 +283,7 @@ fn note_for(event: &queue::UploadEvent) -> Option<notify::Note> {
 
     match event.state.as_str() {
         "done" => Some(notify::Note {
-            title: "Upload complete".into(),
+            title: if copied { "Upload complete · link copied" } else { "Upload complete" }.into(),
             body: event
                 .landed_as
                 .clone()
@@ -281,5 +307,33 @@ fn note_for(event: &queue::UploadEvent) -> Option<notify::Note> {
         // A duplicate is a success with nothing to say, and a retry is still in
         // progress. Neither is worth a toast.
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod note_tests {
+    use super::*;
+
+    fn done() -> queue::UploadEvent {
+        queue::UploadEvent {
+            id: 1,
+            path: "/w/ace.mp4".into(),
+            size: 1,
+            sent: 1,
+            state: "done".into(),
+            reason: None,
+            url: Some("https://f.example/w/abc".into()),
+            landed_as: Some("valorant/ace.mp4".into()),
+            removed_local: None,
+            bytes_per_second: None,
+        }
+    }
+
+    #[test]
+    fn a_copied_link_is_mentioned_and_an_uncopied_one_is_not() {
+        let with = note_for(&done(), true).unwrap();
+        assert_eq!(with.title, "Upload complete · link copied");
+        assert_eq!(with.body, "ace.mp4 → valorant/ace.mp4");
+        assert_eq!(note_for(&done(), false).unwrap().title, "Upload complete");
     }
 }

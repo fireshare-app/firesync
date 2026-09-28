@@ -93,6 +93,10 @@ pub struct NotificationSettings {
     pub quiet_in_fullscreen: bool,
     #[serde(default)]
     pub group_bursts: bool,
+    /// Put a finished upload's link on the clipboard. Off by default: it
+    /// replaces whatever was there, which nobody should have happen unasked.
+    #[serde(default)]
+    pub copy_link_on_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +166,7 @@ impl Default for NotificationSettings {
             on_needs_attention: true,
             quiet_in_fullscreen: true,
             group_bursts: false,
+            copy_link_on_complete: false,
         }
     }
 }
