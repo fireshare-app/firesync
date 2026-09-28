@@ -6,11 +6,12 @@ use tauri::Manager;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::api::client::normalize_base_url;
-use crate::api::discovery::{check_token, fetch_options, media_exists, TokenCheck, UploadOptions};
+use crate::api::discovery::{check_token, media_exists, TokenCheck};
 use crate::api::identity::video_id;
 use crate::config::{self, AfterUpload, MediaKind, Settings, WatchedFolder};
 use crate::error::{AppError, Result};
 use crate::ledger::{FileRow, FileState, Ledger};
+use crate::options::{OptionsCache, OptionsSnapshot};
 use crate::queue::rules::SupportedTypes;
 use crate::queue::QueueControl;
 use crate::secrets::TokenCache;
@@ -23,10 +24,10 @@ pub struct AppState {
     pub settings: Arc<Mutex<Settings>>,
     pub ledger: Arc<Ledger>,
     pub types: Arc<Mutex<SupportedTypes>>,
-    /// The server's folder-to-game mapping, refreshed whenever options are
-    /// fetched. Cached because the queue needs it per upload and it changes
-    /// about as often as somebody reorganises their library.
-    pub folder_rules: Arc<Mutex<crate::api::discovery::FolderRules>>,
+    /// Fireshare's folders, games and folder-to-game rules. One copy for the
+    /// pickers and the queue alike, refreshed whenever either is about to rely
+    /// on it.
+    pub options: Arc<OptionsCache>,
     pub watchers: Mutex<Watchers>,
     pub queue: Arc<QueueControl>,
     pub token: Arc<TokenCache>,
@@ -44,7 +45,7 @@ impl AppState {
                 settings: Arc::new(Mutex::new(settings)),
                 ledger: Arc::new(ledger),
                 types: Arc::new(Mutex::new(SupportedTypes::default())),
-                folder_rules: Arc::new(Mutex::new(Default::default())),
+                options: Arc::new(OptionsCache::new()),
                 watchers: Mutex::new(Watchers::new(tx)),
                 queue: Arc::new(QueueControl::new()),
                 // Read from the keychain once, here, rather than on every pass
@@ -123,7 +124,7 @@ impl AppState {
         problems.into_iter().map(|(id, e)| format!("{id}: {e}")).collect()
     }
 
-    fn credentials(&self) -> Result<(String, String)> {
+    pub(crate) fn credentials(&self) -> Result<(String, String)> {
         let url = self
             .snapshot()
             .server_url
@@ -177,6 +178,11 @@ pub async fn connect(
     next.server_url = Some(base_url.clone());
     next.last_check = Some(check.clone());
     state.persist(next)?;
+
+    // Possibly a different library altogether. Whatever was known about the
+    // last one's games and folders is no longer worth offering, and the next
+    // picker or upload to need it will ask this one.
+    state.options.clear();
 
     // A working token is exactly the signal that clears an auth pause: the
     // queue stopped because the credential was bad, and it no longer is.
@@ -248,15 +254,33 @@ pub async fn disconnect(state: tauri::State<'_, AppState>) -> Result<()> {
     state.token.clear()?;
     let mut next = state.snapshot();
     next.server_url = None;
-    state.persist(next)
+    state.persist(next)?;
+    state.options.clear();
+    Ok(())
 }
 
+/// What Fireshare last said it will accept, without asking it again.
+///
+/// Instant, so a picker can open on this at once while `refresh_options`
+/// fetches a newer copy behind it.
 #[tauri::command]
-pub async fn upload_options(state: tauri::State<'_, AppState>) -> Result<UploadOptions> {
+pub fn upload_options(state: tauri::State<'_, AppState>) -> OptionsSnapshot {
+    state.options.snapshot()
+}
+
+/// Ask Fireshare again, and answer with whatever is held afterwards: the new
+/// list, or the old one along with why it could not be refreshed.
+///
+/// A failure to reach the server is part of the answer rather than an error,
+/// because the picker asking still has a list to show and only wants to know
+/// whether it can trust it. Only having nothing to ask with is an error.
+#[tauri::command]
+pub async fn refresh_options(state: tauri::State<'_, AppState>) -> Result<OptionsSnapshot> {
     let (url, token) = state.credentials()?;
-    let options = fetch_options(&url, &token).await?;
-    *state.folder_rules.lock().expect("folder rules mutex") = options.folder_rules.clone();
-    Ok(options)
+    if let Err(e) = state.options.refresh(&url, &token).await {
+        eprintln!("firesync: could not refresh Fireshare's folders and games: {e}");
+    }
+    Ok(state.options.snapshot())
 }
 
 // ---------------------------------------------------------------------------

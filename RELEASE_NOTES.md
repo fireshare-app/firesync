@@ -1,2 +1,3 @@
-- The sidebar no longer repeats the app name and logo that the title bar already shows an inch above them. The version moved to the foot of the sidebar, and is still in Settings under Updates
-- The example path in Add folder is a Windows one now, so it looks like something you might actually be about to type
+- The Game and Fireshare folder lists fetch the latest from Fireshare whenever you open them, so a game you have just added shows up straight away instead of after restarting Firesync
+- Clips set to sort by game no longer land in your default folder when Firesync starts before your network is up. It waits until it can ask Fireshare where the game's folder is
+- Folder settings now warn you when a folder's game has been renamed or deleted in Fireshare, before its uploads start being refused
