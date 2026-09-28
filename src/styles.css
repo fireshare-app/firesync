@@ -375,7 +375,17 @@ select {
 .main { flex-grow: 1; min-width: 0; overflow-y: auto; }
 .page { padding: 24px 26px; display: flex; flex-direction: column; gap: 18px; }
 .page--tall { height: 100%; box-sizing: border-box; padding-bottom: 0; }
-.page__head { display: flex; align-items: flex-end; gap: 16px; }
+.page__head { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; row-gap: 12px; }
+/* A header's controls are one group, all one height. When they do not fit
+   beside the title (the narrowest window leaves about 600 px) the group moves
+   under it whole, and only the search box gives way — never a button. */
+:root { --control-h: 36px; }
+.page__tools { display: flex; align-items: center; gap: 8px; margin-left: auto; min-width: 0; }
+.page__head .btn,
+.page__head .search,
+.page__head .sel__button { height: var(--control-h); padding-top: 0; padding-bottom: 0; box-sizing: border-box; }
+.page__head .btn { display: inline-flex; align-items: center; flex-shrink: 0; }
+.page__filter { width: 170px; flex-shrink: 0; }
 .page__headtext { flex-grow: 1; }
 .page__title { margin: 0; font-size: 21px; font-weight: 700; letter-spacing: -0.015em; }
 .page__sub { margin: 5px 0 0; font-size: 13px; color: var(--text-muted); max-width: 66ch; }
@@ -388,6 +398,8 @@ select {
 .btn--ghost { background: transparent; color: var(--text-dim); border-color: var(--border); }
 .btn--sm { padding: 6px 12px; font-size: 12px; }
 .btn--icon { display: inline-flex; align-items: center; gap: 7px; }
+/* A button's label is one line, everywhere. */
+.btn { white-space: nowrap; }
 
 .iconbtn {
   width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--border);
@@ -439,8 +451,19 @@ select {
 
 .fcard__warn { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border-soft); padding-top: 10px; font-size: 12.5px; color: var(--warn); }
 
+/* A folder that is enabled but not reachable, and files held for review. */
+.dot--warn { background: var(--warn); }
+.pill--warn { color: var(--warn); background: rgba(255, 181, 71, 0.12); }
+.fcard--away .fcard__path { color: var(--text-dim); }
+.fcard__held { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border-soft); padding-top: 10px; font-size: 12.5px; color: var(--text-dim); }
+.fcard__held svg { color: var(--accent-light); flex-shrink: 0; }
+.fcard__held strong { color: var(--text); font-weight: 600; }
+.linkbtn { background: transparent; border: 0; padding: 0; color: var(--accent-light); font-family: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; flex-shrink: 0; }
+.linkbtn:hover { text-decoration: underline; }
+
 .fcard__foot { display: flex; align-items: center; gap: 16px; border-top: 1px solid var(--border-soft); padding-top: 10px; font-size: 12px; color: var(--text-muted); }
 .fcard__foot strong { color: var(--text); font-weight: 600; }
+.fcard__foot > span { white-space: nowrap; }
 
 /* Activity --------------------------------------------------------------- */
 
@@ -472,13 +495,32 @@ select {
 .arow--duplicate .arow__reason,
 .arow--skipped .arow__reason { color: var(--text-muted); }
 .arow--failed .arow__reason { color: var(--bad-text); }
-.arow__when { font-size: 12px; color: var(--text-muted); width: 104px; text-align: right; }
+/* A relative time never wraps. Its column's width is a floor it can grow past;
+   the file name, which already truncates, is what gives way. */
+.arow__when { font-size: 12px; color: var(--text-muted); min-width: 104px; flex-shrink: 0; white-space: nowrap; text-align: right; }
 /* Row actions sit in a fixed slot so names and times stay in their columns
    whether or not a row has a link to offer. */
 .arow__actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; width: 52px; justify-content: flex-end; }
-.arow__bar { width: 140px; height: 4px; border-radius: 3px; background: #12314e; overflow: hidden; flex-shrink: 0; }
+/* Shrinks before anything in the row is pushed out of it. */
+.arow__bar { flex: 0 1 140px; min-width: 60px; height: 4px; border-radius: 3px; background: #12314e; overflow: hidden; }
 .arow__bar-fill { display: block; height: 4px; background: linear-gradient(90deg, #007fff, #66b2ff); transition: width 0.4s ease; }
 .arow__pct { width: 40px; text-align: right; font-size: 12px; font-weight: 600; color: var(--accent-light); font-variant-numeric: tabular-nums; }
+
+/* Search, tab counts, the row menu and paging. */
+.search { display: flex; align-items: center; gap: 7px; flex: 0 1 220px; min-width: 150px; background: var(--panel-sunken); border: 1px solid var(--border); border-radius: 7px; padding: 0 10px; color: var(--text-muted); }
+.search:focus-within { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+.search input { flex: 1; min-width: 0; height: 100%; background: transparent; border: 0; outline: 0; color: var(--text); font-size: 12.5px; padding: 0; font-family: inherit; }
+.tab__count { font-size: 11.5px; font-weight: 500; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.arow__actions--wide { width: 80px; }
+.iconbtn--on { opacity: 1 !important; background: var(--border-soft); color: var(--text); }
+.menuwrap { position: relative; display: inline-flex; }
+.menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; min-width: 210px; background: #0f2b45; border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 14px 34px rgba(0, 0, 0, 0.5); padding: 4px; }
+.menu--up { top: auto; bottom: calc(100% + 6px); }
+.menu__item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text-dim); font-family: inherit; font-size: 12.5px; text-align: left; cursor: pointer; white-space: nowrap; }
+.menu__item:hover, .menu__item:focus-visible { background: #12395e; color: var(--text); outline: none; }
+.menu__hint { margin-left: auto; padding-left: 12px; font-size: 11px; color: var(--text-muted); }
+.menu__sep { height: 1px; background: var(--border-soft); margin: 4px 6px; }
+.feed__more { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 4px 0 10px; font-size: 12px; color: var(--text-muted); }
 
 .feedfoot { flex-shrink: 0; display: flex; align-items: center; gap: 16px; border-top: 1px solid var(--border-soft); padding: 11px 0 13px; font-size: 12.5px; color: var(--text-muted); }
 .feedfoot strong { color: var(--text); font-weight: 600; }
@@ -509,6 +551,32 @@ select {
 .switch input:focus-visible ~ .switch__track { outline: 2px solid var(--accent-light); outline-offset: 2px; }
 
 .settings__path { font-size: 11px; color: var(--text-muted); }
+.panel .settings__path { margin: 10px 0 0; overflow-wrap: anywhere; }
+/* A button beside a setting keeps its size and its one line; the text beside
+   it is what wraps. */
+.setting .btn { flex-shrink: 0; white-space: nowrap; }
+/* A folder's title template, and its tags. */
+.tokens { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.token { font-family: var(--mono); font-size: 11.5px; color: var(--accent-light); background: rgba(102, 178, 255, 0.1); border: 1px solid rgba(102, 178, 255, 0.25); border-radius: 5px; padding: 3px 7px; cursor: pointer; }
+.token:hover { background: rgba(102, 178, 255, 0.18); }
+.preview { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.preview strong { color: var(--text); font-weight: 600; }
+.tagpick { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.tagpick .sel__panel { width: 250px; right: auto; }
+.tagpick__option { width: 100%; border: 0; background: transparent; font-family: inherit; text-align: left; }
+.tagpick__empty { margin: 0; padding: 10px 12px; font-size: 12px; color: var(--text-muted); }
+.tagchip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); background: #12314e; border-radius: 5px; padding: 4px 5px 4px 8px; }
+.tagchip__dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.tagchip__x { border: 0; background: transparent; color: var(--text-muted); cursor: pointer; padding: 0 3px; font-size: 14px; line-height: 1; }
+.tagchip__x:hover { color: var(--text); }
+.tagchip--gone { color: var(--text-muted); text-decoration: line-through; }
+.tagadd { font-family: inherit; font-size: 12px; color: var(--accent-light); background: transparent; border: 1px dashed var(--border); border-radius: 5px; padding: 4px 9px; cursor: pointer; }
+/* Controls that sit side by side at the end of a setting's row. */
+.setting__controls { display: flex; gap: 8px; flex-shrink: 0; }
+.setting__control { width: 200px; flex-shrink: 0; }
+.setting__control--sm { width: 120px; flex-shrink: 0; }
+.banner--info { display: flex; align-items: center; gap: 10px; border: 1px solid #265d97; background: #0c2742; color: var(--accent-light); }
+.tp__status--held { color: var(--accent-light); }
 .settings__conn { display: flex; gap: 10px; align-items: flex-end; }
 .settings__conn .field { flex-grow: 1; margin-top: 0; }
 
@@ -573,9 +641,12 @@ select {
 .pick--blocked { opacity: 0.55; cursor: default; }
 .pick__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pick__size { width: 80px; text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; }
-.pick__when { width: 120px; text-align: right; color: var(--text-muted); font-size: 11.5px; }
+.pick__when { min-width: 120px; flex-shrink: 0; white-space: nowrap; text-align: right; color: var(--text-muted); font-size: 11.5px; }
 .pick__status { width: 132px; text-align: right; font-size: 11.5px; color: var(--text-muted); }
 .pick--on .pick__status { color: var(--accent-light); font-weight: 600; }
+.pick__status--held { color: var(--accent-light); }
+.modal__group { display: flex; align-items: center; gap: 8px; padding: 12px 10px 6px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+.modal__group:first-child { padding-top: 4px; }
 
 .settings__note { margin: 8px 0 0; }
 
@@ -696,6 +767,16 @@ select {
 .tp__value { margin-left: auto; font-size: 12px; color: var(--text-muted); }
 .tp__count { margin-left: auto; font-size: 11px; font-weight: 600; color: #071320; background: var(--warn); border-radius: 9px; padding: 1px 7px; }
 
+/* Recent uploads: a link one click from the tray. */
+.tp__label { padding: 7px 11px 4px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+.tp__empty { padding: 4px 11px 6px; font-size: 12px; color: var(--text-muted); }
+.tp__recent { display: flex; align-items: center; gap: 4px; padding: 5px 5px 5px 11px; border-radius: 6px; cursor: pointer; }
+.tp__recent:hover, .tp__recent:focus-visible { background: #12395e; outline: none; }
+.tp__recent-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--text); }
+.tp__recent-when { flex-shrink: 0; display: inline-flex; align-items: center; gap: 4px; margin: 0 4px 0 6px; font-size: 11.5px; color: var(--text-muted); white-space: nowrap; }
+.tp__recent-when--copied { color: var(--ok); }
+.tp__recent .iconbtn { opacity: 0.8; }
+
 /* Small icon-only action buttons, dim until wanted ----------------------- */
 .iconbtn {
   display: inline-flex; align-items: center; justify-content: center;
@@ -747,6 +828,7 @@ select {
 
 /* Transfer rate, shown beside the percentage while a file is going up. */
 .arow__rate { font-size: 11.5px; color: var(--accent-light); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.arow__slow { color: var(--text-muted); }
 .fcard__rate { font-size: 11.5px; color: var(--accent-light); font-variant-numeric: tabular-nums; }
 .fcard__flightname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 

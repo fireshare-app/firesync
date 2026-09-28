@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { asAppError, backlog as backlogApi, type BacklogFile, type FolderSummary } from '../lib/ipc'
 
 const MB = 1024 * 1024
@@ -82,6 +82,20 @@ export function Backlog({ folder, onClose, onQueued }: Props) {
     () => (files ?? []).filter((f) => !f.excluded && f.inLibrary !== true),
     [files],
   )
+  // Held files are the ones that turned up while nothing would upload them,
+  // and come first. Headed only when both kinds are present; one heading over
+  // a single group would say nothing.
+  const groups = useMemo((): [string | null, BacklogFile[]][] => {
+    const all = files ?? []
+    const held = all.filter((f) => f.held)
+    const present = all.filter((f) => !f.held)
+    if (!held.length || !present.length) return [[null, all]]
+    return [
+      ['Held for review', held],
+      ['Here when the folder was added', present],
+    ]
+  }, [files])
+
   const totalBytes = useMemo(
     () => (files ?? []).filter((f) => chosen.has(f.path)).reduce((n, f) => n + f.size, 0),
     [files, chosen],
@@ -158,29 +172,41 @@ export function Backlog({ folder, onClose, onQueued }: Props) {
               Nothing is being held back — every file here arrived after the folder was added.
             </p>
           )}
-          {files?.map((f) => {
-            const blocked = Boolean(f.excluded) || f.inLibrary === true
-            return (
-              <label
-                key={f.path}
-                className={`pick ${blocked ? 'pick--blocked' : ''} ${chosen.has(f.path) ? 'pick--on' : ''}`}
-              >
-                <input
-                  type="checkbox"
-                  checked={chosen.has(f.path)}
-                  disabled={blocked}
-                  onChange={() => toggle(f.path)}
-                />
-                <span className="mono pick__name">{f.name}</span>
-                <span className="spacer" />
-                <span className="pick__size">{humanSize(f.size)}</span>
-                <span className="pick__when">{whenever(f.mtime)}</span>
-                <span className="pick__status">
-                  {f.inLibrary === true ? 'In library' : (f.excluded ?? 'Ready')}
-                </span>
-              </label>
-            )
-          })}
+          {groups.map(([label, rows]) => (
+            <Fragment key={label ?? 'all'}>
+              {label && (
+                <div className="modal__group">
+                  {label} · {rows.length}
+                </div>
+              )}
+              {rows.map((f) => {
+                const blocked = Boolean(f.excluded) || f.inLibrary === true
+                const status = f.inLibrary === true ? 'In library' : (f.excluded ?? f.held ?? 'Ready')
+                return (
+                  <label
+                    key={f.path}
+                    className={`pick ${blocked ? 'pick--blocked' : ''} ${chosen.has(f.path) ? 'pick--on' : ''}`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={chosen.has(f.path)}
+                      disabled={blocked}
+                      onChange={() => toggle(f.path)}
+                    />
+                    <span className="mono pick__name">{f.name}</span>
+                    <span className="spacer" />
+                    <span className="pick__size">{humanSize(f.size)}</span>
+                    <span className="pick__when">{whenever(f.mtime)}</span>
+                    <span
+                      className={`pick__status ${status === f.held ? 'pick__status--held' : ''}`}
+                    >
+                      {status}
+                    </span>
+                  </label>
+                )
+              })}
+            </Fragment>
+          ))}
         </div>
 
         <footer className="modal__foot">

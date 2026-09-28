@@ -1,9 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window'
 import { listen } from '@tauri-apps/api/event'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import logo from '../assets/logo.png'
 import {
+  CheckIcon,
+  ExternalLinkIcon,
   GearIcon,
+  LinkIcon,
   PauseIcon,
   PlayIcon,
   RetryIcon,
@@ -15,9 +20,19 @@ import {
   queue as queueApi,
   tray as trayApi,
   type QueueStatus,
+  type RecentLink,
   type Settings,
   type UploadEvent,
 } from '../lib/ipc'
+
+/** An age that fits beside a file name in a 320 px panel. */
+function shortAgo(unixSeconds: number) {
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds)
+  if (seconds < 60) return 'now'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`
+  return `${Math.floor(seconds / 86400)}d`
+}
 
 /**
  * The tray panel the design draws.
@@ -32,12 +47,16 @@ export function TrayPanel() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [sending, setSending] = useState<{ fraction: number; name: string } | null>(null)
+  const [recent, setRecent] = useState<RecentLink[] | null>(null)
+  const [copied, setCopied] = useState<number | null>(null)
   const panelRef = useRef<HTMLDivElement>(null)
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const refresh = useCallback(async () => {
     try {
       setStatus(await queueApi.status())
       setSettings(await api.getSettings())
+      setRecent(await trayApi.recentLinks(3))
     } catch (e) {
       setError(asAppError(e).message)
     }
@@ -58,12 +77,29 @@ export function TrayPanel() {
         setSending({ fraction: sent / size, name: path.split(/[\\/]/).pop() ?? '' })
       } else {
         setSending(null)
+        // A finished upload belongs at the top of Recent straight away.
+        if (state === 'done' || state === 'duplicate') void refresh()
       }
     })
     return () => {
       void stop.then((fn) => fn())
     }
+  }, [refresh])
+
+  useEffect(() => () => {
+    if (copiedTimer.current) clearTimeout(copiedTimer.current)
   }, [])
+
+  async function copy(item: RecentLink) {
+    try {
+      await writeText(item.link)
+      setCopied(item.id)
+      if (copiedTimer.current) clearTimeout(copiedTimer.current)
+      copiedTimer.current = setTimeout(() => setCopied(null), 1600)
+    } catch (e) {
+      setError(asAppError(e).message)
+    }
+  }
 
   // The window is sized to its contents rather than to a guess. A menu is
   // exactly as tall as what is in it, and this one's height changes with the
@@ -105,6 +141,8 @@ export function TrayPanel() {
   const total = (status?.uploading ?? 0) + (status?.queued ?? 0)
   const line = status?.paused
     ? 'Paused'
+    : status?.held
+      ? `Waiting for you to tab out${total ? ` · ${total} queued` : ''}`
     : status?.uploading
       ? total > (status?.uploading ?? 0)
         ? `Uploading ${status.uploading} of ${total}`
@@ -125,7 +163,11 @@ export function TrayPanel() {
         <img src={logo} alt="" width={22} height={22} className="tp__logo" />
         <div className="tp__headtext">
           <span className="tp__name">Firesync</span>
-          <span className={`tp__status ${status?.failed ? 'tp__status--bad' : ''}`}>
+          <span
+            className={`tp__status ${
+              status?.failed ? 'tp__status--bad' : status?.held ? 'tp__status--held' : ''
+            }`}
+          >
             {line}
             {status?.failed ? ` · ${status.failed} need attention` : ''}
           </span>
@@ -142,6 +184,62 @@ export function TrayPanel() {
       )}
 
       {error && <div className="tp__error">{error}</div>}
+
+      {/* The thing somebody opens the tray for after a match: a clip's link,
+          without opening the main window to go and find it. */}
+      <div className="tp__sep" />
+      <div className="tp__label">Recent uploads</div>
+      {recent?.length === 0 && <div className="tp__empty">Nothing uploaded yet</div>}
+      {recent?.map((item) => (
+        <div
+          key={item.id}
+          className="tp__recent"
+          role="button"
+          tabIndex={0}
+          title="Copy link"
+          onClick={() => void copy(item)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault()
+              void copy(item)
+            }
+          }}
+        >
+          <span className="mono tp__recent-name">{item.name}</span>
+          {copied === item.id ? (
+            <span className="tp__recent-when tp__recent-when--copied">
+              <CheckIcon size={13} />
+              Copied
+            </span>
+          ) : (
+            <span className="tp__recent-when">{shortAgo(item.at)}</span>
+          )}
+          <button
+            type="button"
+            className="iconbtn"
+            title="Copy link"
+            aria-label={`Copy link to ${item.name}`}
+            onClick={(e) => {
+              e.stopPropagation()
+              void copy(item)
+            }}
+          >
+            <LinkIcon size={14} />
+          </button>
+          <button
+            type="button"
+            className="iconbtn"
+            title="Open in Fireshare"
+            aria-label={`Open ${item.name} in Fireshare`}
+            onClick={(e) => {
+              e.stopPropagation()
+              void hideThen(() => openUrl(item.link))
+            }}
+          >
+            <ExternalLinkIcon size={14} />
+          </button>
+        </div>
+      ))}
 
       <div className="tp__sep" />
 

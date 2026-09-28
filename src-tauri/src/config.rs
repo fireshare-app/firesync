@@ -81,6 +81,30 @@ pub struct WatchedFolder {
     /// its own, since a guess would be worse than the explicit choice.
     #[serde(default = "default_true")]
     pub auto_sort_by_game: bool,
+    /// How uploads from this folder are titled, e.g. `{game} — {date}`. None
+    /// leaves it to Fireshare, which uses the file name. See `titles`.
+    #[serde(default)]
+    pub title_template: Option<String>,
+    /// Fireshare tags every upload from this folder gets. Ids, because that is
+    /// what the upload takes; names come from Fireshare each time they are
+    /// shown, so a rename there shows up here.
+    #[serde(default)]
+    pub tag_ids: Vec<i64>,
+    #[serde(default)]
+    pub watch_mode: WatchMode,
+}
+
+/// How a folder learns that a file has arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchMode {
+    /// Change events on a local disk, a timed scan on a network one.
+    #[default]
+    Auto,
+    /// Change events, wherever the folder is.
+    Events,
+    /// List the folder on a timer and compare it with the ledger.
+    Scan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,15 +117,37 @@ pub struct NotificationSettings {
     pub quiet_in_fullscreen: bool,
     #[serde(default)]
     pub group_bursts: bool,
+    /// Put a finished upload's link on the clipboard. Off by default: it
+    /// replaces whatever was there, which nobody should have happen unasked.
+    #[serde(default)]
+    pub copy_link_on_complete: bool,
+}
+
+/// What uploads do while a game has the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhilePlaying {
+    /// Carry on as usual.
+    #[default]
+    Full,
+    /// Hold to `while_playing_cap`.
+    Limit,
+    /// Start nothing new until the game lets go of the screen.
+    Pause,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferSettings {
     #[serde(default = "default_concurrency")]
     pub max_concurrent: u8,
-    /// Bytes per second, or None for unlimited.
+    /// Bytes per second, or None for unlimited. Total, across every upload.
     #[serde(default)]
     pub speed_cap: Option<u64>,
+    #[serde(default)]
+    pub while_playing: WhilePlaying,
+    /// Bytes per second while playing, when `while_playing` is `Limit`.
+    #[serde(default)]
+    pub while_playing_cap: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,8 +162,10 @@ pub struct StartupSettings {
 pub struct UpdateSettings {
     #[serde(default = "default_true")]
     pub auto_install: bool,
-    #[serde(default)]
-    pub prerelease: bool,
+    // A `prerelease` switch used to live here: stored, never shown, never read,
+    // and unable to work — the updater reads releases/latest, which GitHub never
+    // points at a pre-release. Settings files that still carry it load fine;
+    // unknown keys are ignored.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,13 +208,19 @@ impl Default for NotificationSettings {
             on_needs_attention: true,
             quiet_in_fullscreen: true,
             group_bursts: false,
+            copy_link_on_complete: false,
         }
     }
 }
 
 impl Default for TransferSettings {
     fn default() -> Self {
-        Self { max_concurrent: default_concurrency(), speed_cap: None }
+        Self {
+            max_concurrent: default_concurrency(),
+            speed_cap: None,
+            while_playing: WhilePlaying::Full,
+            while_playing_cap: None,
+        }
     }
 }
 
@@ -181,7 +235,7 @@ impl Default for StartupSettings {
 
 impl Default for UpdateSettings {
     fn default() -> Self {
-        Self { auto_install: true, prerelease: false }
+        Self { auto_install: true }
     }
 }
 
@@ -221,7 +275,7 @@ pub fn load(app_data_dir: &Path) -> Settings {
         return Settings::default();
     };
     serde_json::from_str(&raw).unwrap_or_else(|e| {
-        eprintln!("firesync: {} is not readable ({e}); starting with defaults", path.display());
+        log::warn!("{} is not readable ({e}); starting with defaults", path.display());
         Settings::default()
     })
 }
@@ -245,4 +299,29 @@ pub fn save(app_data_dir: &Path, settings: &Settings) -> Result<()> {
 
     std::fs::rename(&staging, &path)
         .map_err(|e| AppError::Storage(format!("Could not save {}: {e}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every install before this one saved `prerelease` into its settings. It
+    /// must not stop them loading, or everybody's folders would reset.
+    #[test]
+    fn a_settings_file_with_the_retired_prerelease_key_still_loads() {
+        let dir = std::env::temp_dir().join(format!("firesync-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            config_path(&dir),
+            r#"{"server_url":"https://f.example","updates":{"auto_install":false,"prerelease":true},
+                "folders":[{"id":"f1","path":"/w"}]}"#,
+        )
+        .unwrap();
+
+        let settings = load(&dir);
+        assert_eq!(settings.server_url.as_deref(), Some("https://f.example"));
+        assert!(!settings.updates.auto_install);
+        assert_eq!(settings.folders.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

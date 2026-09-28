@@ -66,10 +66,24 @@ impl TokenCache {
     /// outcome than refusing to launch because a keychain was locked.
     pub fn load() -> Self {
         let cached = read().unwrap_or_else(|e| {
-            eprintln!("firesync: could not read the stored token ({e}); starting disconnected");
+            log::warn!("Could not read the stored token ({e}); starting disconnected");
             None
         });
         Self { cached: RwLock::new(cached) }
+    }
+
+    /// No token, and no keychain read. For tests, which must never touch the
+    /// real credential store — on a development machine it holds a real token,
+    /// and on macOS asking for it can put up a password prompt.
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self { cached: RwLock::new(None) }
+    }
+
+    /// A token in memory only, for tests that run the queue.
+    #[cfg(test)]
+    pub fn holding(token: &str) -> Self {
+        Self { cached: RwLock::new(Some(token.to_string())) }
     }
 
     pub fn get(&self) -> Option<String> {

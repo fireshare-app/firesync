@@ -13,7 +13,7 @@ use crate::api::upload::{
 };
 use crate::api::discovery::FolderRules;
 use crate::config::{AfterUpload, MediaKind, Settings};
-use crate::ledger::{Claim, Ledger};
+use crate::ledger::{ChunkState, Claim, Ledger};
 use crate::options::{OptionsCache, RULES_MAX_AGE};
 use crate::secrets::TokenCache;
 
@@ -44,6 +44,9 @@ pub struct UploadEvent {
     /// both should agree, and because the raw figure needs smoothing before it
     /// is fit to read.
     pub bytes_per_second: Option<i64>,
+    /// Why this upload is going slower than it could, on an `uploading` event:
+    /// `limit` for the speed limit, `playing` for a game having the screen.
+    pub limit: Option<String>,
 }
 
 /// Shared run/stop control for the whole queue.
@@ -55,11 +58,66 @@ pub struct UploadEvent {
 pub struct QueueControl {
     paused: AtomicBool,
     pause_reason: Mutex<Option<String>>,
+    /// One per upload in flight, by ledger id, for "Stop".
+    stops: Mutex<std::collections::HashMap<i64, tokio_util::sync::CancellationToken>>,
+    /// The speed limit every upload shares.
+    pub throttle: Arc<crate::api::throttle::Throttle>,
+    /// Nothing new starts: a game has the screen and the setting says to wait.
+    /// A third reason alongside a pause and a refused token, and kept apart
+    /// from them so the window never offers "Resume" for a pause nobody made.
+    held: AtomicBool,
+    /// A game has the screen and uploads are being held back for it, by
+    /// waiting or by a lower limit.
+    for_game: AtomicBool,
 }
 
 impl QueueControl {
     pub fn new() -> Self {
-        Self { paused: AtomicBool::new(false), pause_reason: Mutex::new(None) }
+        Self {
+            paused: AtomicBool::new(false),
+            pause_reason: Mutex::new(None),
+            stops: Mutex::new(std::collections::HashMap::new()),
+            throttle: Arc::new(crate::api::throttle::Throttle::new()),
+            held: AtomicBool::new(false),
+            for_game: AtomicBool::new(false),
+        }
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn set_held(&self, held: bool) {
+        self.held.store(held, Ordering::Relaxed);
+    }
+
+    /// Whether a game is the reason uploads are slower than they could be.
+    pub fn for_game(&self) -> bool {
+        self.for_game.load(Ordering::Relaxed)
+    }
+
+    fn watch_for_stop(&self, id: i64) -> tokio_util::sync::CancellationToken {
+        let token = tokio_util::sync::CancellationToken::new();
+        self.stops.lock().expect("stops mutex").insert(id, token.clone());
+        token
+    }
+
+    fn forget_stop(&self, id: i64) {
+        self.stops.lock().expect("stops mutex").remove(&id);
+    }
+
+    /// Stop the upload of this file, if it is going. False when it is not —
+    /// it finished, or never started — which the caller reads as "nothing to
+    /// do" rather than as a failure.
+    pub fn stop(&self, id: i64) -> bool {
+        match self.stops.lock().expect("stops mutex").get(&id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn is_paused(&self) -> bool {
@@ -105,13 +163,20 @@ where
     // Anything left mid-upload was interrupted by a quit or a crash, not by a
     // decision, so it goes back in the queue rather than sitting as a lie.
     if let Err(e) = deps.ledger.requeue_interrupted() {
-        eprintln!("firesync: could not requeue interrupted uploads: {e}");
+        log::error!("Could not requeue interrupted uploads: {e}");
     }
 
     tauri::async_runtime::spawn(async move {
+        // One task per file in flight, and a slot that frees is filled straight
+        // away. The loop used to claim a batch and wait for all of it, so with
+        // two slots a three-gigabyte clip left the other slot idle until it
+        // finished — "uploads at once: 2" was only true for files the same size.
+        let mut running: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
-            if deps.control.is_paused() {
-                tokio::time::sleep(IDLE_POLL).await;
+            while running.try_join_next().is_some() {}
+
+            if deps.control.is_paused() || deps.control.is_held() {
+                idle(&mut running).await;
                 continue;
             }
 
@@ -131,32 +196,37 @@ where
             };
 
             let Some(base_url) = base_url else {
-                tokio::time::sleep(IDLE_POLL).await;
+                idle(&mut running).await;
                 continue;
             };
             // From memory. This loop runs every couple of seconds; asking the
             // OS credential store each time is what made macOS prompt for a
             // password on repeat.
             let Some(token) = deps.token.get() else {
-                tokio::time::sleep(IDLE_POLL).await;
+                idle(&mut running).await;
                 continue;
             };
 
-            let claims = match deps.ledger.claim(concurrency, &paused_folders) {
+            let free = concurrency - running.len() as i64;
+            if free <= 0 {
+                idle(&mut running).await;
+                continue;
+            }
+
+            let claims = match deps.ledger.claim(free, &paused_folders) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("firesync: could not claim uploads: {e}");
-                    tokio::time::sleep(IDLE_POLL).await;
+                    log::error!("Could not claim uploads: {e}");
+                    idle(&mut running).await;
                     continue;
                 }
             };
 
             if claims.is_empty() {
-                tokio::time::sleep(IDLE_POLL).await;
+                idle(&mut running).await;
                 continue;
             }
 
-            let mut tasks = Vec::new();
             for claim in claims {
                 let ledger = deps.ledger.clone();
                 let settings = deps.settings.clone();
@@ -166,28 +236,138 @@ where
                 let base_url = base_url.clone();
                 let token = token.clone();
                 let types = deps.types.clone();
+                let stop = deps.control.watch_for_stop(claim.id);
 
-                tasks.push(tauri::async_runtime::spawn(async move {
-                    run_one(
-                        claim,
-                        &base_url,
-                        &token,
-                        ledger,
-                        settings,
-                        control,
-                        on_event,
-                        ChunkPolicy::default(),
-                        options,
-                        types,
-                    )
-                    .await;
-                }));
-            }
-            for task in tasks {
-                let _ = task.await;
+                running.spawn(async move {
+                    let id = claim.id;
+                    let (stopped_claim, stopped_ledger, stopped_events) =
+                        (claim.clone(), ledger.clone(), on_event.clone());
+                    let forget = control.clone();
+                    // Dropping the upload's future is the stop: the request is
+                    // abandoned where it stands. What it had finished — the
+                    // chunks the server acknowledged — stays in the ledger.
+                    tokio::select! {
+                        _ = run_one(
+                            claim,
+                            &base_url,
+                            &token,
+                            ledger,
+                            settings,
+                            control,
+                            on_event,
+                            ChunkPolicy::default(),
+                            options,
+                            types,
+                        ) => {}
+                        _ = stop.cancelled() => {
+                            stopped(&stopped_claim, &stopped_ledger, &stopped_events);
+                        }
+                    }
+                    forget.forget_stop(id);
+                });
             }
         }
     });
+}
+
+/// A task that is aborted when this is dropped.
+struct AbortOnDrop(tauri::async_runtime::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Record an upload somebody stopped. A no-op if it finished first: the
+/// ledger only moves a row that is still uploading.
+fn stopped<F>(claim: &Claim, ledger: &Ledger, on_event: &Arc<F>)
+where
+    F: Fn(UploadEvent) + Send + Sync + 'static,
+{
+    let reason = match ledger.chunk_state(claim.id) {
+        Ok(ChunkState { chunks_total: Some(total), chunks_done, .. }) if chunks_done > 0 => {
+            format!("Stopped by you · {chunks_done} of {total} parts sent")
+        }
+        _ => "Stopped by you".to_string(),
+    };
+    if let Ok(true) = ledger.stop_by_user(claim.id, &reason) {
+        log::info!("#{} stopped by the user", claim.id);
+        emit(on_event, claim, "skipped", Some(&reason), None);
+    }
+}
+
+/// A single-shot upload going when a game takes the screen goes on at this,
+/// rather than stopping: idle for longer than a proxy's body timeout (nginx's
+/// is a minute) and the whole request fails.
+const TRICKLE: u64 = 256 * 1024;
+
+/// The in-game limit when "slow down" was chosen without a speed: 5 Mbps.
+const DEFAULT_GAME_CAP: u64 = 625_000;
+
+/// The lower of two limits, where 0 means none.
+fn lower_limit(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, b) => b,
+        (a, 0) => a,
+        (a, b) => a.min(b),
+    }
+}
+
+/// What the transfers settings and the screen come to: the rate every upload
+/// shares (0 for none), whether nothing new should start, and whether a game
+/// is the reason for either.
+fn govern(t: &crate::config::TransferSettings, playing: bool) -> (u64, bool, bool) {
+    use crate::config::WhilePlaying;
+    let normal = t.speed_cap.unwrap_or(0);
+    if !playing {
+        return (normal, false, false);
+    }
+    match t.while_playing {
+        WhilePlaying::Full => (normal, false, false),
+        WhilePlaying::Limit => {
+            (lower_limit(normal, t.while_playing_cap.unwrap_or(DEFAULT_GAME_CAP)), false, true)
+        }
+        WhilePlaying::Pause => (lower_limit(normal, TRICKLE), true, true),
+    }
+}
+
+/// Once a second, set the speed limit and the hold from the settings and from
+/// whether a game has the screen. Only Windows can say whether one does; on
+/// the others the in-game setting never applies, and the window says so.
+pub fn spawn_governor(settings: Arc<Mutex<Settings>>, control: Arc<QueueControl>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let transfers = settings.lock().expect("settings mutex").transfers.clone();
+            let playing = crate::notify::screen_is_busy();
+            let (rate, held, for_game) = govern(&transfers, playing);
+            control.throttle.set_rate(rate);
+            if control.held.swap(held, Ordering::Relaxed) != held {
+                if held {
+                    log::info!("A game has the screen; new uploads wait until it lets go");
+                } else {
+                    log::info!("The screen is free again; uploads carry on");
+                }
+            }
+            control.for_game.store(for_game, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+/// Wait until a slot frees or `IDLE_POLL` passes, whichever comes first.
+///
+/// The poll is needed even with every slot busy: a pause, or a lower "uploads
+/// at once", has to take effect without waiting for a file to finish.
+async fn idle(running: &mut tokio::task::JoinSet<()>) {
+    if running.is_empty() {
+        tokio::time::sleep(IDLE_POLL).await;
+    } else {
+        tokio::select! {
+            _ = running.join_next() => {}
+            _ = tokio::time::sleep(IDLE_POLL) => {}
+        }
+    }
 }
 
 /// Where an upload goes, and what it says about itself.
@@ -224,7 +404,7 @@ fn destination_for(
                     && !folder.media.contains(&MediaKind::Video));
 
             if let Some(sorted) = rules.folder_for(game, is_image) {
-                return UploadMeta { folder: Some(sorted), game: None, title: None };
+                return UploadMeta { folder: Some(sorted), game: None, ..UploadMeta::default() };
             }
         }
     }
@@ -232,7 +412,7 @@ fn destination_for(
     UploadMeta {
         folder: folder.dest_folder.clone(),
         game: folder.game.clone(),
-        title: None,
+        ..UploadMeta::default()
     }
 }
 
@@ -243,7 +423,13 @@ enum SendOutcome {
     Ok(UploadResult),
     Err(UploadError),
     Restart(String),
+    /// Stopped at a chunk boundary because a game has the screen. Nothing
+    /// went wrong, and the parts sent so far are kept.
+    Held,
 }
+
+/// Why a file that stopped for a game is waiting.
+const WAITING_FOR_GAME: &str = "Waiting for you to tab out";
 
 /// Send a large file in pieces, picking up wherever the last attempt stopped.
 ///
@@ -261,6 +447,7 @@ async fn send_chunked(
     ledger: &Arc<Ledger>,
     policy: ChunkPolicy,
     progress: Progress,
+    control: &QueueControl,
 ) -> SendOutcome {
     let total = chunk_count(file_size, policy.size);
     let state = ledger.chunk_state(claim.id).unwrap_or_default();
@@ -283,6 +470,11 @@ async fn send_chunked(
     };
 
     for index in (done + 1)..=total {
+        // The one safe place to stop for a game: between requests, with every
+        // acknowledged part recorded, so carrying on later re-sends nothing.
+        if control.is_held() {
+            return SendOutcome::Held;
+        }
         match upload_chunk(
             base_url,
             token,
@@ -294,6 +486,7 @@ async fn send_chunked(
             file_size,
             policy.size,
             progress.clone(),
+            control.throttle.clone(),
         )
         .await
         {
@@ -363,6 +556,7 @@ async fn run_one<F>(
     // The file may have been moved or deleted between being queued and being
     // sent. That is not a failure worth retrying.
     if !path.is_file() {
+        log::warn!("#{} {} is no longer on disk", claim.id, claim.path);
         let _ = ledger.mark_failed(claim.id, "The file is no longer on disk.");
         emit(&on_event, &claim, "failed", Some("The file is no longer on disk."), None);
         return;
@@ -408,10 +602,27 @@ async fn run_one<F>(
     } else {
         FolderRules::default()
     };
-    let meta = destination_for(&folder, &rules, &path);
+    let mut meta = destination_for(&folder, &rules, &path);
+    meta.title = crate::titles::for_file(
+        folder.title_template.as_deref(),
+        folder.game.as_deref(),
+        &folder.path,
+        &path,
+    );
+    meta.tag_ids = tags_to_send(&folder, &options, base_url, token).await;
     let after_upload = folder.after_upload;
 
     let file_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+    let started = std::time::Instant::now();
+    log::info!(
+        "#{} starting {} ({} bytes, attempt {}) to {}{}",
+        claim.id,
+        claim.path,
+        file_size,
+        claim.attempts + 1,
+        meta.folder.as_deref().unwrap_or("the default folder"),
+        meta.game.as_deref().map(|g| format!(" as {g}")).unwrap_or_default()
+    );
 
     // Fireshare's id for these bytes, worked out before a single one is sent.
     // The order matters twice over: it is what lets us ask whether the server
@@ -435,6 +646,14 @@ async fn run_one<F>(
         }
     };
 
+    // Where it will be watched once it is there. Carried on the finished event
+    // so the tray, the clipboard and the notification all use one answer, the
+    // same one Activity builds from the ledger.
+    let link = hash.as_deref().and_then(|h| {
+        let viewer = types.lock().expect("types mutex").viewer_for(&path)?;
+        Some(crate::api::identity::media_url(base_url, h, viewer))
+    });
+
     // Ask before sending. A video would otherwise cross the network in full
     // before its 409 came back, and an image is never rejected at all — the
     // server accepts it and folds it into the row it already has, so without
@@ -448,6 +667,7 @@ async fn run_one<F>(
                 crate::api::discovery::media_exists(base_url, token, hash, viewer).await
             {
                 if answer.exists {
+                    log::info!("#{} is already in the library; nothing sent", claim.id);
                     let _ = ledger.mark_duplicate(claim.id, answer.url.as_deref());
                     let removed = reclaim_space(&path, after_upload).await;
                     on_event(UploadEvent {
@@ -457,10 +677,11 @@ async fn run_one<F>(
                         sent: claim.size,
                         state: "duplicate".into(),
                         reason: Some("Already in your library".into()),
-                        url: answer.url,
+                        url: answer.url.or_else(|| link.clone()),
                         landed_as: None,
                         removed_local: removed,
                         bytes_per_second: None,
+                        limit: None,
                     });
                     return;
                 }
@@ -473,8 +694,12 @@ async fn run_one<F>(
     // three gigabyte upload should not be deciding how often the UI redraws,
     // and a small one should not be paying for progress it does not need.
     let progress: Progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let ticker = {
+    // Aborted when this function ends however it ends — including by being
+    // dropped when somebody stops the upload, when a plain abort at the bottom
+    // would never run and the ticker would report progress forever.
+    let _ticker = AbortOnDrop({
         let progress = progress.clone();
+        let control = control.clone();
         let on_event = on_event.clone();
         let path_str = claim.path.clone();
         let id = claim.id;
@@ -516,18 +741,27 @@ async fn run_one<F>(
                     landed_as: None,
                     removed_local: None,
                     bytes_per_second: smoothed.map(|r| r.round() as i64),
+                    limit: if control.for_game() {
+                        Some("playing".into())
+                    } else if control.throttle.rate() > 0 {
+                        Some("limit".into())
+                    } else {
+                        None
+                    },
                 });
             }
         })
-    };
+    });
 
     let outcome = if file_size > policy.threshold {
         send_chunked(
-            &claim, base_url, token, &path, &meta, file_size, &ledger, policy, progress,
+            &claim, base_url, token, &path, &meta, file_size, &ledger, policy, progress, &control,
         )
         .await
     } else {
-        match upload_single(base_url, token, &path, &meta, progress.clone()).await {
+        match upload_single(base_url, token, &path, &meta, progress.clone(), control.throttle.clone())
+            .await
+        {
             Ok(r) => SendOutcome::Ok(r),
             // Under the threshold but still refused for its size: something
             // between here and Fireshare caps how big one request may be, and
@@ -539,6 +773,7 @@ async fn run_one<F>(
                 progress.store(0, Ordering::Relaxed);
                 send_chunked(
                     &claim, base_url, token, &path, &meta, file_size, &ledger, policy, progress,
+                    &control,
                 )
                 .await
             }
@@ -546,16 +781,21 @@ async fn run_one<F>(
         }
     };
 
-    ticker.abort();
-
     let result = match outcome {
         SendOutcome::Ok(r) => Ok(r),
         SendOutcome::Err(e) => Err(e),
+        SendOutcome::Held => {
+            log::info!("#{} waiting at a chunk boundary while a game has the screen", claim.id);
+            let _ = ledger.hold_back(claim.id, WAITING_FOR_GAME);
+            emit(&on_event, &claim, "waiting", Some(WAITING_FOR_GAME), None);
+            return;
+        }
         SendOutcome::Restart(message) => {
             // Start the file again from nothing: a new id, and no progress to
             // resume onto. Counted as an attempt so a server that keeps losing
             // sets cannot hold one file in a loop forever.
             let _ = ledger.clear_chunks(claim.id);
+            log::warn!("#{} starting over: {message}", claim.id);
             if retry::should_retry(claim.attempts) {
                 let wait = retry::backoff(claim.attempts);
                 let reason = retry::waiting_reason(
@@ -582,6 +822,7 @@ async fn run_one<F>(
             } else {
                 format!("{folder}/{filename}")
             };
+            log::info!("#{} uploaded in {:.1?} as {landed}", claim.id, started.elapsed());
             let _ = ledger.mark_done(claim.id, None);
             let removed = reclaim_space(&path, after_upload).await;
             on_event(UploadEvent {
@@ -591,10 +832,11 @@ async fn run_one<F>(
                 sent: claim.size,
                 state: "done".into(),
                 reason: None,
-                url: None,
+                url: link.clone(),
                 landed_as: Some(landed),
                 removed_local: removed,
                 bytes_per_second: None,
+                limit: None,
             });
         }
 
@@ -604,6 +846,7 @@ async fn run_one<F>(
         // 201 gives — so the local copy is just as safe to clear, and a folder
         // being re-scanned after an earlier upload is exactly when it helps.
         Ok(UploadResult::Duplicate { url }) => {
+            log::info!("#{} was already in the library ({:.1?})", claim.id, started.elapsed());
             let _ = ledger.mark_duplicate(claim.id, url.as_deref());
             let removed = reclaim_space(&path, after_upload).await;
             on_event(UploadEvent {
@@ -613,16 +856,18 @@ async fn run_one<F>(
                 sent: claim.size,
                 state: "duplicate".into(),
                 reason: Some("Already in your library".into()),
-                url,
+                url: url.or(link),
                 landed_as: None,
                 removed_local: removed,
                 bytes_per_second: None,
+                limit: None,
             });
         }
 
         Err(UploadError::Unauthorized(message)) => {
             // Put this file back untouched — it did nothing wrong, and charging
             // it an attempt for a credential problem would burn its retries.
+            log::warn!("#{} refused: {message} Pausing every upload.", claim.id);
             let _ = ledger.release(claim.id);
             control.pause(Some(message.clone()));
             emit(&on_event, &claim, "paused", Some(&message), None);
@@ -631,11 +876,13 @@ async fn run_one<F>(
         // Chunking was the way out of a 413 and it did not help, so the cap is
         // below the chunk size or the refusal was never about size.
         Err(UploadError::TooLarge(message)) => {
+            log::warn!("#{} failed: {message}", claim.id);
             let _ = ledger.mark_failed(claim.id, &message);
             emit(&on_event, &claim, "failed", Some(&message), None);
         }
 
         Err(UploadError::Permanent(message)) => {
+            log::warn!("#{} failed: {message}", claim.id);
             let _ = ledger.mark_failed(claim.id, &message);
             emit(&on_event, &claim, "failed", Some(&message), None);
         }
@@ -645,12 +892,41 @@ async fn run_one<F>(
         Err(UploadError::RetryAfter { message, seconds }) => {
             let due = unix_now() + seconds as i64;
             let reason = format!("{message} Waiting {seconds}s as asked.");
+            log::info!("#{} {reason}", claim.id);
             let _ = ledger.reschedule(claim.id, &reason, due);
             emit(&on_event, &claim, "waiting", Some(&reason), None);
         }
 
         Err(UploadError::Retryable(message)) => retry_later(&claim, &ledger, &on_event, &message),
     }
+}
+
+/// The folder's tags, less any Fireshare no longer offers.
+///
+/// Fireshare stores whatever tag ids an upload names without checking them, so
+/// a tag deleted since the folder chose it would leave a link to nothing.
+/// Checked against a copy no older than the rules would be; sent unchecked
+/// only when there is no list to check against, which is also a Fireshare too
+/// old to have offered tags to choose from in the first place.
+async fn tags_to_send(
+    folder: &crate::config::WatchedFolder,
+    options: &OptionsCache,
+    base_url: &str,
+    token: &str,
+) -> Vec<i64> {
+    if folder.tag_ids.is_empty() {
+        return Vec::new();
+    }
+    let offered = options.fresh(base_url, token, RULES_MAX_AGE).await.ok().and_then(|o| o.tags);
+    let Some(offered) = offered else {
+        return folder.tag_ids.clone();
+    };
+    let (kept, dropped): (Vec<i64>, Vec<i64>) =
+        folder.tag_ids.iter().partition(|id| offered.iter().any(|t| t.id == **id));
+    if !dropped.is_empty() {
+        log::info!("Leaving off tags Fireshare no longer offers: {dropped:?}");
+    }
+    kept
 }
 
 /// Whether this folder files its uploads by game, and so needs the rules.
@@ -673,11 +949,13 @@ where
     if retry::should_retry(claim.attempts) {
         let wait = retry::backoff(claim.attempts);
         let reason = retry::waiting_reason(message, claim.attempts, wait);
+        log::info!("#{} {reason}", claim.id);
         let due = unix_now() + wait.as_secs() as i64;
         let _ = ledger.reschedule(claim.id, &reason, due);
         emit(on_event, claim, "waiting", Some(&reason), None);
     } else {
         let reason = format!("{message} Gave up after {} attempts.", retry::MAX_ATTEMPTS);
+        log::warn!("#{} {reason}", claim.id);
         let _ = ledger.mark_failed(claim.id, &reason);
         emit(on_event, claim, "failed", Some(&reason), None);
     }
@@ -711,14 +989,14 @@ async fn reclaim_space(path: &std::path::Path, action: AfterUpload) -> Option<St
         AfterUpload::Trash => match trash::delete(&path) {
             Ok(()) => Some("Moved to trash".to_string()),
             Err(e) => {
-                eprintln!("firesync: could not trash {}: {e}", path.display());
+                log::warn!("Could not trash {}: {e}", path.display());
                 None
             }
         },
         AfterUpload::Delete => match std::fs::remove_file(&path) {
             Ok(()) => Some("Deleted locally".to_string()),
             Err(e) => {
-                eprintln!("firesync: could not delete {}: {e}", path.display());
+                log::warn!("Could not delete {}: {e}", path.display());
                 None
             }
         },
@@ -742,6 +1020,7 @@ where
         landed_as: None,
         removed_local: None,
         bytes_per_second: None,
+        limit: None,
     });
 }
 
@@ -888,6 +1167,9 @@ pub(crate) mod tests {
             max_size_bytes: None,
             after_upload,
             auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         };
 
         let ledger = Arc::new(Ledger::open(&dir.join("l.sqlite")).unwrap());
@@ -1007,6 +1289,26 @@ pub(crate) mod tests {
         server.join().unwrap();
 
         assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The finished event says where the clip can be watched, so the tray and
+    /// the clipboard need not work it out again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_upload_carries_its_link() {
+        let f = fixture();
+        let (url, server) = serve_preflight(
+            200,
+            r#"{"exists":false}"#,
+            Some((201, r#"{"filename":"clip.mp4","folder":"clips"}"#)),
+        );
+        run_checking(&f, &url, Arc::new(QueueControl::new())).await;
+        server.join().unwrap();
+
+        let hash = f.ledger.recent(1).unwrap()[0].content_hash.clone().expect("hashed before sending");
+        let events = f.events.lock().unwrap();
+        let done = events.iter().find(|e| e.state == "done").expect("a done event");
+        assert_eq!(done.url.as_deref(), Some(format!("{url}/w/{hash}").as_str()));
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 
@@ -1512,6 +1814,38 @@ mod chunked_tests {
         .await;
     }
 
+    /// A game taking the screen stops a chunked upload between chunks, with no
+    /// attempt charged and every acknowledged part kept for later.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chunked_upload_waits_for_a_game_at_a_chunk_boundary() {
+        let f = Arc::new(big_fixture());
+        let server = FakeServer::start(Behaviour::Honest);
+        let control = Arc::new(QueueControl::new());
+        // Slow enough to be caught part-way: 2 KiB/s against 1 KiB chunks.
+        control.throttle.set_rate(2048);
+
+        let run = {
+            let (f, url, control) = (f.clone(), server.url.clone(), control.clone());
+            tokio::spawn(async move { run_chunked(&f, &url, control).await })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while server.chunks_seen().len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "the upload never got going");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        control.set_held(true);
+        run.await.unwrap();
+
+        let row = f.ledger.file(f.claim.id).unwrap().unwrap();
+        assert_eq!(row.state, FileState::Queued, "back in the queue, to carry on later");
+        assert_eq!(row.attempts, 0, "a game is not the file's fault");
+        assert_eq!(row.reason.as_deref(), Some(WAITING_FOR_GAME));
+        let sent = f.ledger.chunk_state(f.claim.id).unwrap().chunks_done;
+        assert!((2..10).contains(&sent), "stopped part-way, parts kept: {sent} of 10");
+        assert!(server.chunks_seen().len() < 10, "the rest were not sent");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_large_file_goes_up_in_order_and_completes() {
         let f = big_fixture();
@@ -1740,6 +2074,9 @@ mod routing_tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: auto,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
         }
     }
 
@@ -1915,6 +2252,32 @@ mod sorting_tests {
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 
+    /// Tags are checked against Fireshare before they go, and the folder's
+    /// title template is rendered for the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_carries_its_title_and_only_the_tags_that_still_exist() {
+        let f = fixture();
+        {
+            let mut settings = f.settings.lock().unwrap();
+            let folder = &mut settings.folders[0];
+            folder.tag_ids = vec![1, 2, 99];
+            folder.title_template = Some("{game} — {filename}".into());
+        }
+        let (url, server) = serve_sequence(vec![
+            (200, r##"{"tags":[{"id":1,"name":"Clutch","color":"#ff5733"},{"id":2,"name":"Ranked"}]}"##),
+            (201, r#"{"status":"accepted","filename":"clip.mp4","folder":"clips"}"#),
+        ]);
+
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2, "one request for the tags, then the upload");
+        assert_eq!(field(&bodies[1], "tag_ids"), Some("1,2"), "99 was deleted in Fireshare");
+        assert_eq!(field(&bodies[1], "title"), Some("VALORANT — clip"));
+        assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
     /// A folder that is not sorted by game never needed the rules, so an
     /// unreachable options route must not hold it up.
     #[tokio::test(flavor = "multi_thread")]
@@ -1931,5 +2294,302 @@ mod sorting_tests {
         assert_eq!(field(&bodies[0], "folder"), Some("clips"));
         assert_eq!(state_of(&f), FileState::Done);
         let _ = std::fs::remove_dir_all(&f.dir);
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::tests::{fixture, read_request, state_of};
+    use super::*;
+    use crate::ledger::FileState;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    const SECRET: &str = "fsk_do_not_ever_log_this_31337";
+
+    fn serve(answers: Vec<(u16, &'static str)>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (status, body) in answers {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let _ = read_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn upload(f: &tests::Fixture, url: &str) {
+        run_one(
+            f.claim.clone(),
+            url,
+            SECRET,
+            f.ledger.clone(),
+            f.settings.clone(),
+            Arc::new(QueueControl::new()),
+            Arc::new(|_: UploadEvent| {}),
+            ChunkPolicy::default(),
+            Arc::new(OptionsCache::new()),
+            Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
+        )
+        .await;
+    }
+
+    /// The token is the one thing a log must never hold: a log is exactly what
+    /// somebody attaches to a public issue. Every level is captured here, the
+    /// HTTP layer's included, across a sorted upload that fetches options and an
+    /// upload the server refuses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_token_never_reaches_the_log() {
+        let lines = crate::logging::capture::lines();
+
+        let sorted = fixture();
+        sorted.settings.lock().unwrap().folders[0].auto_sort_by_game = true;
+        let (url, server) = serve(vec![
+            (200, r#"{"folder_rules":{"video":[{"folder":"valorant","game":"VALORANT"}],"image":[]}}"#),
+            (201, r#"{"status":"accepted","filename":"clip.mp4","folder":"valorant"}"#),
+        ]);
+        upload(&sorted, &url).await;
+        server.join().unwrap();
+        assert_eq!(state_of(&sorted), FileState::Done);
+
+        let refused = fixture();
+        let (url, server) = serve(vec![(401, "Invalid upload token.")]);
+        upload(&refused, &url).await;
+        server.join().unwrap();
+
+        let lines = lines.lock().unwrap();
+        let ours = format!("#{} starting", sorted.claim.id);
+        assert!(lines.iter().any(|l| l.contains(&ours)), "the capture should have seen the upload");
+        let leaked: Vec<&String> = lines.iter().filter(|l| l.contains(SECRET)).collect();
+        assert!(leaked.is_empty(), "the token was logged: {leaked:?}");
+
+        let _ = std::fs::remove_dir_all(&sorted.dir);
+        let _ = std::fs::remove_dir_all(&refused.dir);
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::tests::read_request;
+    use super::*;
+    use crate::config::{MediaKind, WatchedFolder};
+    use crate::ledger::FileState;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+
+    /// Answers every upload with a 201, taking `slow` over any request bigger
+    /// than `big` bytes — a large clip on a slow upstream — and answering the
+    /// rest at once. Each connection gets its own thread, so a slow answer does
+    /// not hold up the others.
+    fn serve(big: usize, slow: std::time::Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let body = read_request(&mut stream).unwrap_or_default();
+                    if body.len() > big {
+                        std::thread::sleep(slow);
+                    }
+                    let reply = r#"{"status":"accepted","filename":"x.mp4","folder":"clips"}"#;
+                    let response = format!(
+                        "HTTP/1.1 201 CREATED\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn state_of(ledger: &Ledger, path: &std::path::Path) -> FileState {
+        ledger
+            .recent(50)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.path == path.to_string_lossy())
+            .unwrap()
+            .state
+    }
+
+    /// The case the old batch loop got wrong: with two slots, one big slow file
+    /// and four small ones, the small ones should go through beside the big
+    /// one rather than wait for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn small_files_go_through_beside_a_big_one() {
+        let dir = std::env::temp_dir().join(format!("firesync-slots-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = Arc::new(Ledger::open(&dir.join("l.sqlite")).unwrap());
+
+        // Queued big first, so it is claimed first and takes a slot.
+        let big = dir.join("big.mp4");
+        std::fs::write(&big, vec![0u8; 256 << 10]).unwrap();
+        ledger.observe("f1", big.to_str().unwrap(), 256 << 10, 0, None).unwrap();
+        let small: Vec<PathBuf> = (0..4)
+            .map(|i| {
+                let path = dir.join(format!("small-{i}.mp4"));
+                std::fs::write(&path, vec![0u8; 2048]).unwrap();
+                ledger.observe("f1", path.to_str().unwrap(), 2048, 0, None).unwrap();
+                path
+            })
+            .collect();
+
+        let folder = WatchedFolder {
+            id: "f1".into(),
+            path: dir.clone(),
+            enabled: true,
+            include_subfolders: false,
+            media: vec![MediaKind::Video],
+            dest_folder: Some("clips".into()),
+            game: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            after_upload: AfterUpload::Keep,
+            auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
+        };
+        let mut settings = Settings { folders: vec![folder], ..Settings::default() };
+        settings.server_url = Some(serve(64 << 10, std::time::Duration::from_secs(4)));
+        settings.transfers.max_concurrent = 2;
+
+        spawn(QueueDeps {
+            ledger: ledger.clone(),
+            settings: Arc::new(Mutex::new(settings)),
+            control: Arc::new(QueueControl::new()),
+            token: Arc::new(crate::secrets::TokenCache::holding("fsk_test")),
+            options: Arc::new(OptionsCache::new()),
+            // No pre-flight: this server answers uploads and nothing else.
+            types: Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
+            on_event: Arc::new(|_: UploadEvent| {}),
+        });
+
+        // Well inside the big file's four seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+        while std::time::Instant::now() < deadline
+            && !small.iter().all(|p| state_of(&ledger, p) == FileState::Done)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        for path in &small {
+            assert_eq!(state_of(&ledger, path), FileState::Done, "{} waited", path.display());
+        }
+        assert_eq!(state_of(&ledger, &big), FileState::Uploading, "the big one is still going");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stop abandons the transfer where it stands, records who stopped it,
+    /// and leaves nothing behind still reporting progress.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_upload_stops_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("firesync-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = Arc::new(Ledger::open(&dir.join("l.sqlite")).unwrap());
+        let clip = dir.join("long.mp4");
+        std::fs::write(&clip, vec![0u8; 256 << 10]).unwrap();
+        ledger.observe("f1", clip.to_str().unwrap(), 256 << 10, 0, None).unwrap();
+
+        let folder = WatchedFolder {
+            id: "f1".into(),
+            path: dir.clone(),
+            enabled: true,
+            include_subfolders: false,
+            media: vec![MediaKind::Video],
+            dest_folder: None,
+            game: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            after_upload: AfterUpload::Keep,
+            auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
+        };
+        let mut settings = Settings { folders: vec![folder], ..Settings::default() };
+        // Slow enough that the stop certainly lands mid-upload.
+        settings.server_url = Some(serve(64 << 10, std::time::Duration::from_secs(10)));
+
+        let events: Arc<Mutex<Vec<(String, std::time::Instant)>>> = Arc::default();
+        let sink = events.clone();
+        let control = Arc::new(QueueControl::new());
+        spawn(QueueDeps {
+            ledger: ledger.clone(),
+            settings: Arc::new(Mutex::new(settings)),
+            control: control.clone(),
+            token: Arc::new(crate::secrets::TokenCache::holding("fsk_test")),
+            options: Arc::new(OptionsCache::new()),
+            types: Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
+            on_event: Arc::new(move |e: UploadEvent| {
+                sink.lock().unwrap().push((e.state, std::time::Instant::now()))
+            }),
+        });
+
+        let id = ledger.recent(1).unwrap()[0].id;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !control.stop(id) {
+            assert!(std::time::Instant::now() < deadline, "the upload never started");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let stopped_at = std::time::Instant::now();
+        // Long enough for a leaked ticker to have reported at least twice.
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+
+        let row = ledger.file(id).unwrap().unwrap();
+        assert_eq!(row.state, FileState::Skipped);
+        assert_eq!(row.reason.as_deref(), Some("Stopped by you"));
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|(state, _)| state == "skipped"), "the window is told");
+        let late: Vec<_> = events
+            .iter()
+            .filter(|(state, at)| state == "uploading" && *at > stopped_at + std::time::Duration::from_millis(100))
+            .collect();
+        assert!(late.is_empty(), "progress kept arriving after the stop: {} events", late.len());
+        assert!(!control.stop(id), "nothing left to stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod playing_tests {
+    use super::*;
+    use crate::config::{TransferSettings, WhilePlaying};
+
+    fn transfers(cap: Option<u64>, mode: WhilePlaying, game_cap: Option<u64>) -> TransferSettings {
+        TransferSettings { max_concurrent: 2, speed_cap: cap, while_playing: mode, while_playing_cap: game_cap }
+    }
+
+    #[test]
+    fn with_no_game_the_normal_limit_applies() {
+        assert_eq!(govern(&transfers(None, WhilePlaying::Pause, None), false), (0, false, false));
+        assert_eq!(govern(&transfers(Some(3_125_000), WhilePlaying::Limit, None), false), (3_125_000, false, false));
+    }
+
+    #[test]
+    fn keep_uploading_ignores_the_game() {
+        assert_eq!(govern(&transfers(Some(1_000), WhilePlaying::Full, None), true), (1_000, false, false));
+    }
+
+    #[test]
+    fn slowing_down_takes_the_lower_of_the_two_limits() {
+        assert_eq!(govern(&transfers(None, WhilePlaying::Limit, Some(625_000)), true), (625_000, false, true));
+        assert_eq!(govern(&transfers(Some(100_000), WhilePlaying::Limit, Some(625_000)), true), (100_000, false, true));
+        assert_eq!(govern(&transfers(None, WhilePlaying::Limit, None), true).0, DEFAULT_GAME_CAP);
+    }
+
+    #[test]
+    fn pausing_holds_new_work_and_trickles_what_is_already_going() {
+        assert_eq!(govern(&transfers(None, WhilePlaying::Pause, None), true), (TRICKLE, true, true));
+        assert_eq!(govern(&transfers(Some(1_000), WhilePlaying::Pause, None), true), (1_000, true, true));
     }
 }

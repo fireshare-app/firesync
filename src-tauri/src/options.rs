@@ -157,6 +157,17 @@ impl OptionsCache {
             }
             match &result {
                 Ok(options) => {
+                    // Routine refreshes are the common case and say nothing new;
+                    // the first answer, and the first after a failure, do.
+                    let news = !matches!(&held.last_attempt, Some(Attempt { outcome: Ok(()), .. }));
+                    let level = if news { log::Level::Info } else { log::Level::Debug };
+                    log::log!(
+                        level,
+                        "Fireshare lists {} games, {} video and {} image folder rules",
+                        options.games.len(),
+                        options.folder_rules.video.len(),
+                        options.folder_rules.image.len()
+                    );
                     held.options = Some(options.clone());
                     held.fetched_at = Some(Instant::now());
                     held.fetched_unix = Some(unix_now());
@@ -184,18 +195,25 @@ impl OptionsCache {
         token: &str,
         max_age: Duration,
     ) -> Result<FolderRules> {
+        Ok(self.fresh(base_url, token, max_age).await?.folder_rules)
+    }
+
+    /// The whole list, asked for again if the copy held is older than
+    /// `max_age`, and the older copy if Fireshare cannot be asked. An error
+    /// only when there is no copy at all.
+    pub async fn fresh(&self, base_url: &str, token: &str, max_age: Duration) -> Result<UploadOptions> {
         {
             let held = self.lock();
             if let (Some(options), Some(at)) = (&held.options, held.fetched_at) {
                 if at.elapsed() < max_age {
-                    return Ok(options.folder_rules.clone());
+                    return Ok(options.clone());
                 }
             }
         }
 
         match self.refresh(base_url, token).await {
-            Ok(options) => Ok(options.folder_rules),
-            Err(e) => self.lock().options.as_ref().map(|o| o.folder_rules.clone()).ok_or(e),
+            Ok(options) => Ok(options),
+            Err(e) => self.lock().options.clone().ok_or(e),
         }
     }
 
@@ -267,12 +285,12 @@ pub fn spawn_refresh_loop(app: AppHandle) {
                         TICK
                     }
                     Err(AppError::TokenRejected(e)) => {
-                        eprintln!("firesync: Fireshare refused the upload token; not asking again until it changes: {e}");
+                        log::warn!("Fireshare refused the upload token; not asking again until it changes: {e}");
                         refused = Some(creds);
                         TICK
                     }
                     Err(e) => {
-                        eprintln!("firesync: could not refresh Fireshare's folders and games: {e}");
+                        log::warn!("Could not refresh Fireshare's folders and games: {e}");
                         let wait = retry_in;
                         retry_in = (retry_in * 2).min(MAX_RETRY);
                         wait

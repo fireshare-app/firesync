@@ -12,6 +12,7 @@
     "dialog:default",
     "notification:default",
     "clipboard-manager:allow-write-text",
+    "log:default",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",

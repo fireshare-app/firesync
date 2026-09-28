@@ -15,7 +15,18 @@ use crate::options::{OptionsCache, OptionsSnapshot};
 use crate::queue::rules::SupportedTypes;
 use crate::queue::QueueControl;
 use crate::secrets::TokenCache;
-use crate::watcher::{scan_existing, Watchers};
+use crate::watcher::catchup::{self, Since, ARRIVED_WHILE_PAUSED};
+use crate::watcher::{scan_existing, Availability, Watchers};
+
+/// How often a watched folder is compared with the ledger even when nothing
+/// suggests it needs it. The watch is the primary signal; this is the net under
+/// it, for the events a platform drops without saying so.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// How often a folder that is scanned rather than watched is looked at. The
+/// scan is its only way of noticing anything, so this is how late a new clip
+/// can be.
+pub const SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub type WatchEvent = (String, PathBuf);
 
@@ -31,10 +42,21 @@ pub struct AppState {
     pub watchers: Mutex<Watchers>,
     pub queue: Arc<QueueControl>,
     pub token: Arc<TokenCache>,
+    /// When each folder was last compared with the ledger.
+    swept: Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl AppState {
     pub fn new(app_data_dir: PathBuf) -> Result<(Self, UnboundedReceiver<WatchEvent>)> {
+        // Read from the keychain once, here, rather than on every pass of the
+        // upload loop.
+        Self::with_token(app_data_dir, TokenCache::load())
+    }
+
+    fn with_token(
+        app_data_dir: PathBuf,
+        token: TokenCache,
+    ) -> Result<(Self, UnboundedReceiver<WatchEvent>)> {
         let settings = config::load(&app_data_dir);
         let ledger = Ledger::open(&app_data_dir.join("ledger.sqlite"))?;
         let (tx, rx): (UnboundedSender<WatchEvent>, _) = tokio::sync::mpsc::unbounded_channel();
@@ -48,9 +70,8 @@ impl AppState {
                 options: Arc::new(OptionsCache::new()),
                 watchers: Mutex::new(Watchers::new(tx)),
                 queue: Arc::new(QueueControl::new()),
-                // Read from the keychain once, here, rather than on every pass
-                // of the upload loop.
-                token: Arc::new(TokenCache::load()),
+                token: Arc::new(token),
+                swept: Mutex::new(std::collections::HashMap::new()),
             },
             rx,
         ))
@@ -99,18 +120,18 @@ impl AppState {
             let (old, new) = (folder.path.to_string_lossy().to_string(), tidy.to_string_lossy().to_string());
             match self.ledger.rewrite_path_prefix(&folder.id, &old, &new) {
                 Ok(moved) => {
-                    eprintln!("firesync: tidied {old} -> {new} ({moved} rows moved)");
+                    log::info!("Tidied {old} -> {new} ({moved} rows moved)");
                     folder.path = tidy;
                     changed = true;
                 }
                 // Leave the pair alone rather than split them.
-                Err(e) => eprintln!("firesync: could not move rows for {old}: {e}"),
+                Err(e) => log::warn!("Could not move rows for {old}: {e}"),
             }
         }
 
         if changed {
             if let Err(e) = self.persist(settings) {
-                eprintln!("firesync: could not save tidied paths: {e}");
+                log::warn!("Could not save tidied paths: {e}");
             }
         }
     }
@@ -118,10 +139,76 @@ impl AppState {
     /// Bring watchers in line with the current folder list. Any folder that
     /// could not be watched is reported rather than silently dropped — a folder
     /// that looks active in the UI but is watching nothing is the worst outcome.
+    ///
+    /// A folder attached just now has a gap behind it — it was not watched
+    /// until this moment — so it is caught up on straight away.
     pub fn resync_watchers(&self) -> Vec<String> {
         let folders = self.snapshot().folders;
-        let problems = self.watchers.lock().expect("watchers mutex").sync(&folders);
-        problems.into_iter().map(|(id, e)| format!("{id}: {e}")).collect()
+        let unreachable: std::collections::HashSet<String> = folders
+            .iter()
+            .filter(|f| f.enabled && !f.path.is_dir())
+            .map(|f| f.id.clone())
+            .collect();
+        let synced =
+            self.watchers.lock().expect("watchers mutex").sync_with(&folders, &unreachable);
+        for id in &synced.attached {
+            if let Some(folder) = folders.iter().find(|f| &f.id == id) {
+                self.catch_up(folder);
+            }
+        }
+        synced.problems.into_iter().map(|(id, e)| format!("{id}: {e}")).collect()
+    }
+
+    /// Compare one folder with the ledger and act on the difference: see
+    /// `watcher::catchup`. Logged rather than returned when it fails, because
+    /// nothing that calls it could do better than try again next time.
+    pub fn catch_up(&self, folder: &WatchedFolder) {
+        let since = match self.ledger.folder_mark(&folder.id) {
+            Ok(mark) => Since::from_mark(mark),
+            Err(e) => {
+                log::error!("Could not read how far {} was scanned: {e}", folder.path.display());
+                return;
+            }
+        };
+        let types = self.types.lock().expect("types mutex").clone();
+        let send = self.watchers.lock().expect("watchers mutex").sender();
+        match catchup::catch_up(folder, &types, &self.ledger, &send, &since) {
+            Ok(_) => {
+                self.swept
+                    .lock()
+                    .expect("swept mutex")
+                    .insert(folder.id.clone(), std::time::Instant::now());
+            }
+            Err(e) => log::error!("Could not catch up on {}: {e}", folder.path.display()),
+        }
+    }
+
+    /// What the watchers need doing every so often: folders that went away
+    /// stopped, folders that came back attached and caught up on, rescans that
+    /// a watch asked for, and the periodic sweep.
+    pub fn upkeep(&self) {
+        let _ = self.resync_watchers();
+
+        let rescans = self.watchers.lock().expect("watchers mutex").take_rescans();
+        for folder in self.snapshot().folders {
+            let (running, scanning) = {
+                let watchers = self.watchers.lock().expect("watchers mutex");
+                (watchers.is_running(&folder.id), watchers.is_scanning(&folder.id))
+            };
+            if !running {
+                continue;
+            }
+            let every = if scanning { SCAN_EVERY } else { SWEEP_EVERY };
+            let swept_recently = self
+                .swept
+                .lock()
+                .expect("swept mutex")
+                .get(&folder.id)
+                .is_some_and(|at| at.elapsed() < every);
+            if rescans.contains(&folder.id) || !swept_recently {
+                self.catch_up(&folder);
+            }
+        }
     }
 
     pub(crate) fn credentials(&self) -> Result<(String, String)> {
@@ -164,7 +251,14 @@ pub async fn connect(
         return Err(AppError::TokenRejected("Paste an upload token first.".into()));
     }
 
-    let check = check_token(&base_url, &token).await?;
+    let check = match check_token(&base_url, &token).await {
+        Ok(check) => check,
+        Err(e) => {
+            log::warn!("Could not connect to {base_url}: {e}");
+            return Err(e);
+        }
+    };
+    log::info!("Connected to {base_url} as {}", check.username);
 
     // The server's own allowlist replaces the compiled-in default, so the rules
     // match what this instance would actually accept.
@@ -231,18 +325,24 @@ pub async fn connection_status(state: tauri::State<'_, AppState>) -> Result<Opti
             Ok(Some(Connection { server_url, check, verified: true, problem: None }))
         }
 
-        Err(e) if needs_reconnect(&e) => Err(e),
+        Err(e) if needs_reconnect(&e) => {
+            log::warn!("{server_url} no longer accepts the stored connection: {e}");
+            Err(e)
+        }
 
         // Everything else is about reaching the server, not about the token.
         // Carry on with what it told us last time, and say plainly at the top of
         // the window that this is what we are doing.
         Err(e) => match settings.last_check {
-            Some(check) => Ok(Some(Connection {
-                server_url,
-                check,
-                verified: false,
-                problem: Some(e.to_string()),
-            })),
+            Some(check) => {
+                log::warn!("Could not re-check {server_url}; carrying on with its last answer: {e}");
+                Ok(Some(Connection {
+                    server_url,
+                    check,
+                    verified: false,
+                    problem: Some(e.to_string()),
+                }))
+            }
             // Never successfully connected, so there is nothing to fall back to.
             None => Err(e),
         },
@@ -278,7 +378,7 @@ pub fn upload_options(state: tauri::State<'_, AppState>) -> OptionsSnapshot {
 pub async fn refresh_options(state: tauri::State<'_, AppState>) -> Result<OptionsSnapshot> {
     let (url, token) = state.credentials()?;
     if let Err(e) = state.options.refresh(&url, &token).await {
-        eprintln!("firesync: could not refresh Fireshare's folders and games: {e}");
+        log::warn!("Could not refresh Fireshare's folders and games: {e}");
     }
     Ok(state.options.snapshot())
 }
@@ -307,6 +407,12 @@ pub struct NewFolder {
     pub after_upload: AfterUpload,
     #[serde(default = "default_true")]
     pub auto_sort_by_game: bool,
+    #[serde(default)]
+    pub title_template: Option<String>,
+    #[serde(default)]
+    pub tag_ids: Vec<i64>,
+    #[serde(default)]
+    pub watch_mode: crate::config::WatchMode,
     /// Upload what is already there, instead of leaving it as baseline.
     #[serde(default)]
     pub upload_existing: bool,
@@ -333,6 +439,132 @@ pub struct FolderSummary {
     /// present would describe the folder as it was when it was added rather
     /// than as it is.
     pub present_count: i64,
+    /// Files held for review: turned up while this folder was paused, say.
+    pub held: i64,
+    /// Why they were held, when they all share one reason.
+    pub held_reason: Option<String>,
+    pub availability: Availability,
+    /// Why this folder is not being watched, when it is not.
+    pub problem: Option<String>,
+    /// Seconds between scans, for a folder scanned on a timer rather than
+    /// watched: on a network drive, or set to scan.
+    pub scanned_every: Option<u64>,
+    /// Whether the folder's path is on a network drive, for the dialog to say
+    /// what "automatically" chose.
+    pub network: bool,
+}
+
+/// Everything a folder card shows about one folder.
+fn summarise(state: &AppState, folder: WatchedFolder, present_count: i64) -> Result<FolderSummary> {
+    let counts = state.ledger.counts(&folder.id)?;
+    let last_upload_at = state.ledger.last_upload_at(&folder.id)?;
+    let reasons = state.ledger.held_reasons(&folder.id)?;
+    let held = reasons.iter().map(|(_, n)| n).sum();
+    let held_reason = match reasons.as_slice() {
+        [(reason, _)] => Some(reason.clone()),
+        _ => None,
+    };
+    let (availability, problem, scanning) = {
+        let watchers = state.watchers.lock().expect("watchers mutex");
+        (
+            watchers.availability(&folder),
+            watchers.problem(&folder.id).map(str::to_string),
+            watchers.is_scanning(&folder.id),
+        )
+    };
+    let network = crate::watcher::network::is_network_path(&folder.path);
+    Ok(FolderSummary {
+        folder,
+        counts,
+        present_count,
+        last_upload_at,
+        held,
+        held_reason,
+        availability,
+        problem,
+        scanned_every: scanning.then_some(SCAN_EVERY.as_secs()),
+        network,
+    })
+}
+
+/// Whether a folder not yet added is on a network drive, for the add dialog.
+#[tauri::command]
+pub fn detect_network(path: String) -> bool {
+    crate::watcher::network::is_network_path(std::path::Path::new(&path))
+}
+
+/// What the folder's newest file would be titled, for the dialog's preview.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TitlePreview {
+    /// None: Fireshare would title it by its file name, which `from` is.
+    pub title: Option<String>,
+    /// The file the preview was made from, or None for a made-up example.
+    pub from: Option<String>,
+}
+
+/// Render a title template the way an upload will, against the newest file in
+/// the folder, so the preview cannot disagree with what is sent.
+#[tauri::command]
+pub fn preview_title(
+    state: tauri::State<'_, AppState>,
+    template: String,
+    path: String,
+    game: Option<String>,
+    include_subfolders: bool,
+) -> TitlePreview {
+    let folder_path = PathBuf::from(&path);
+    let probe = WatchedFolder {
+        id: String::new(),
+        path: folder_path.clone(),
+        enabled: true,
+        include_subfolders,
+        media: vec![MediaKind::Video, MediaKind::Image],
+        dest_folder: None,
+        game: None,
+        min_size_bytes: None,
+        max_size_bytes: None,
+        after_upload: AfterUpload::Keep,
+        auto_sort_by_game: false,
+        title_template: None,
+        tag_ids: Vec::new(),
+        watch_mode: crate::config::WatchMode::Auto,
+    };
+    let types = state.types.lock().expect("types mutex").clone();
+    let newest = if folder_path.is_dir() {
+        crate::watcher::scan_found(&probe, &types).into_iter().max_by_key(|f| f.mtime)
+    } else {
+        None
+    };
+    let game = game.filter(|g| !g.trim().is_empty());
+    match newest {
+        Some(file) => {
+            let file = PathBuf::from(&file.path);
+            TitlePreview {
+                title: crate::titles::for_file(Some(&template), game.as_deref(), &folder_path, &file),
+                from: file.file_name().map(|n| n.to_string_lossy().to_string()),
+            }
+        }
+        None => TitlePreview {
+            title: crate::titles::render(
+                &template,
+                &crate::titles::Facts {
+                    file_stem: "clip",
+                    game: game.as_deref(),
+                    folder: folder_path.file_name().and_then(|n| n.to_str()).unwrap_or("clips"),
+                    finished: chrono::Local::now(),
+                },
+            ),
+            from: None,
+        },
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[tauri::command]
@@ -382,13 +614,19 @@ pub async fn add_folder(
         max_size_bytes: folder.max_size_bytes,
         after_upload: folder.after_upload,
         auto_sort_by_game: folder.auto_sort_by_game,
+        title_template: folder.title_template.filter(|t| !t.trim().is_empty()),
+        tag_ids: folder.tag_ids,
+        watch_mode: folder.watch_mode,
     };
 
     // Snapshot what is already here BEFORE watching, so nothing that predates
     // the folder being added can be mistaken for something new.
     let types = state.types.lock().expect("types mutex").clone();
+    let listed_at = unix_now();
     let present = scan_existing(&record, &types);
-    let baseline_count = state.ledger.record_baseline(&record.id, &present)? as i64;
+    let baseline_count = state.ledger.record_baseline(&record.id, &present, None)? as i64;
+    // Complete as of the listing: anything that appears after it is new.
+    state.ledger.mark_watched(&record.id, listed_at)?;
 
     if folder.upload_existing {
         let paths: Vec<String> = present.iter().map(|(p, _, _)| p.clone()).collect();
@@ -400,9 +638,8 @@ pub async fn add_folder(
     state.persist(next)?;
     state.resync_watchers();
 
-    let counts = state.ledger.counts(&record.id)?;
     let present_count = baseline_count.max(present.len() as i64);
-    Ok(FolderSummary { folder: record, counts, present_count, last_upload_at: None })
+    summarise(&state, record, present_count)
 }
 
 #[tauri::command]
@@ -421,14 +658,7 @@ pub async fn set_folder_enabled(
     id: String,
     enabled: bool,
 ) -> Result<()> {
-    let mut next = state.snapshot();
-    let Some(folder) = next.folders.iter_mut().find(|f| f.id == id) else {
-        return Err(AppError::Storage("That folder is not being watched.".into()));
-    };
-    folder.enabled = enabled;
-    state.persist(next)?;
-    state.resync_watchers();
-    Ok(())
+    state.set_folder_enabled(&id, enabled)
 }
 
 /// The rules for a folder, as the dialog edits them.
@@ -451,6 +681,12 @@ pub struct FolderRules {
     pub after_upload: AfterUpload,
     #[serde(default = "default_true")]
     pub auto_sort_by_game: bool,
+    #[serde(default)]
+    pub title_template: Option<String>,
+    #[serde(default)]
+    pub tag_ids: Vec<i64>,
+    #[serde(default)]
+    pub watch_mode: crate::config::WatchMode,
 }
 
 /// Change a folder's rules in place.
@@ -468,24 +704,65 @@ pub async fn update_folder(
     id: String,
     rules: FolderRules,
 ) -> Result<()> {
-    let mut next = state.snapshot();
-    let Some(folder) = next.folders.iter_mut().find(|f| f.id == id) else {
-        return Err(AppError::Storage("That folder is not being watched.".into()));
-    };
+    state.update_folder(&id, rules)
+}
 
-    folder.include_subfolders = rules.include_subfolders;
-    folder.media = if rules.media.is_empty() { vec![MediaKind::Video] } else { rules.media };
-    folder.dest_folder = rules.dest_folder.filter(|s| !s.trim().is_empty());
-    folder.game = rules.game.filter(|s| !s.trim().is_empty());
-    folder.min_size_bytes = rules.min_size_bytes.filter(|n| *n > 0);
-    folder.max_size_bytes = rules.max_size_bytes.filter(|n| *n > 0);
-    folder.after_upload = rules.after_upload;
-    folder.auto_sort_by_game = rules.auto_sort_by_game;
+impl AppState {
+    /// Pause or resume a folder.
+    pub fn set_folder_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let mut next = self.snapshot();
+        let Some(folder) = next.folders.iter_mut().find(|f| f.id == id) else {
+            return Err(AppError::Storage("That folder is not being watched.".into()));
+        };
+        let pausing = folder.enabled && !enabled;
+        folder.enabled = enabled;
+        self.persist(next)?;
+        // A pause is a choice not to upload, so whatever lands while it lasts
+        // is held for review when the folder resumes rather than sent. Being
+        // closed is not a choice about uploading, which is why that gap is
+        // caught up on.
+        if pausing {
+            self.ledger.hold_next_scan(id, ARRIVED_WHILE_PAUSED)?;
+        }
+        self.resync_watchers();
+        Ok(())
+    }
 
-    state.persist(next)?;
-    // Recursion may have been turned on or off, which changes what is watched.
-    state.resync_watchers();
-    Ok(())
+    /// Change a folder's rules in place. See `update_folder`.
+    pub fn update_folder(&self, id: &str, rules: FolderRules) -> Result<()> {
+        let mut next = self.snapshot();
+        let Some(folder) = next.folders.iter_mut().find(|f| f.id == id) else {
+            return Err(AppError::Storage("That folder is not being watched.".into()));
+        };
+
+        let newly_recursive = !folder.include_subfolders && rules.include_subfolders;
+        folder.include_subfolders = rules.include_subfolders;
+        folder.media = if rules.media.is_empty() { vec![MediaKind::Video] } else { rules.media };
+        folder.dest_folder = rules.dest_folder.filter(|s| !s.trim().is_empty());
+        folder.game = rules.game.filter(|s| !s.trim().is_empty());
+        folder.min_size_bytes = rules.min_size_bytes.filter(|n| *n > 0);
+        folder.max_size_bytes = rules.max_size_bytes.filter(|n| *n > 0);
+        folder.after_upload = rules.after_upload;
+        folder.auto_sort_by_game = rules.auto_sort_by_game;
+        folder.title_template = rules.title_template.filter(|t| !t.trim().is_empty());
+        folder.tag_ids = rules.tag_ids;
+        folder.watch_mode = rules.watch_mode;
+
+        // Turning on subfolders brings in everything already in them, which is
+        // exactly the situation of adding a folder: present before, so left alone.
+        // Recorded before the watch restarts, so its catch-up finds them known.
+        if newly_recursive {
+            let types = self.types.lock().expect("types mutex").clone();
+            let present = scan_existing(folder, &types);
+            self.ledger.record_baseline(&folder.id, &present, None)?;
+        }
+
+        self.persist(next)?;
+        // Recursion may have been turned on or off, which changes what is
+        // watched.
+        self.resync_watchers();
+        Ok(())
+    }
 }
 
 /// Change what happens to a file after it uploads, without rebuilding the
@@ -512,11 +789,9 @@ pub fn list_folders(state: tauri::State<'_, AppState>) -> Result<Vec<FolderSumma
         .folders
         .into_iter()
         .map(|folder| {
-            let counts = state.ledger.counts(&folder.id)?;
             let types = state.types.lock().expect("types mutex").clone();
             let present_count = scan_existing(&folder, &types).len() as i64;
-            let last_upload_at = state.ledger.last_upload_at(&folder.id)?;
-            Ok(FolderSummary { folder, counts, present_count, last_upload_at })
+            summarise(&state, folder, present_count)
         })
         .collect()
 }
@@ -547,20 +822,124 @@ pub struct ActivityRow {
     pub link: Option<String>,
 }
 
+/// What the activity feed asks for.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityQuery {
+    pub tab: crate::ledger::ActivityTab,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub folder_id: Option<String>,
+    pub limit: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityPage {
+    pub rows: Vec<ActivityRow>,
+    pub counts: crate::ledger::ActivityCounts,
+}
+
+/// One page of the activity feed, and every tab's count under the same filter.
+///
+/// Filtered in the ledger rather than in the window: the window only ever has
+/// a page, so counts and totals worked out there described the page.
 #[tauri::command]
-pub fn recent_activity(
-    state: tauri::State<'_, AppState>,
-    limit: Option<i64>,
-) -> Result<Vec<ActivityRow>> {
-    let rows = state.ledger.recent(limit.unwrap_or(200))?;
+pub fn activity_page(state: tauri::State<'_, AppState>, query: ActivityQuery) -> Result<ActivityPage> {
+    let filter = crate::ledger::ActivityFilter { name: query.name, folder_id: query.folder_id };
+    let rows = state.ledger.activity_page(query.tab, &filter, query.limit.clamp(1, 1000))?;
+    let counts = state.ledger.activity_counts(&filter)?;
     let base = state.settings.lock().expect("settings mutex").server_url.clone();
     let types = state.types.lock().expect("types mutex").clone();
 
-    Ok(rows
+    let rows = rows
         .into_iter()
         .map(|file| {
             let link = link_for(&file, base.as_deref(), &types);
             ActivityRow { file, link }
+        })
+        .collect();
+    Ok(ActivityPage { rows, counts })
+}
+
+/// Queue a failed or waiting file now, with its attempts reset.
+#[tauri::command]
+pub fn retry_file(state: tauri::State<'_, AppState>, id: i64) -> Result<bool> {
+    state.ledger.retry_now(id)
+}
+
+/// Leave a queued or failed file un-uploaded.
+#[tauri::command]
+pub fn skip_file(state: tauri::State<'_, AppState>, id: i64) -> Result<bool> {
+    state.ledger.skip_by_user(id, "Skipped by you")
+}
+
+/// Stop an upload in flight. What it had sent is kept, so uploading it anyway
+/// later carries on from there.
+#[tauri::command]
+pub fn stop_upload(state: tauri::State<'_, AppState>, id: i64) -> bool {
+    state.queue.stop(id)
+}
+
+/// Queue a skipped file, whatever skipped it: a rule, or somebody.
+#[tauri::command]
+pub fn upload_anyway(state: tauri::State<'_, AppState>, id: i64) -> Result<bool> {
+    state.ledger.upload_anyway(id)
+}
+
+/// Show a file in the system's file manager. A file removed after uploading,
+/// or moved, opens the folder it was in instead, which is usually what
+/// somebody asking to see it wants next.
+#[tauri::command]
+pub fn reveal_file(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: i64) -> Result<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let Some(row) = state.ledger.file(id)? else {
+        return Err(AppError::Storage("Firesync has no record of that file.".into()));
+    };
+    let path = PathBuf::from(&row.path);
+    let failed = |e: tauri_plugin_opener::Error| {
+        AppError::Storage(format!("Could not open {}: {e}", path.display()))
+    };
+    if path.exists() {
+        return app.opener().reveal_item_in_dir(&path).map_err(failed);
+    }
+    match path.parent().filter(|dir| dir.is_dir()) {
+        Some(dir) => app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(failed),
+        None => Err(AppError::Storage(format!(
+            "{} and the folder it was in are no longer there.",
+            path.display()
+        ))),
+    }
+}
+
+/// A finished upload, for the tray's Recent block.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentLink {
+    pub id: i64,
+    pub name: String,
+    pub link: String,
+    /// When it finished, in unix seconds.
+    pub at: i64,
+}
+
+/// The newest uploads that can be opened, so a link is one click from the
+/// tray instead of a trip through the main window.
+#[tauri::command]
+pub fn recent_links(state: tauri::State<'_, AppState>, limit: Option<i64>) -> Result<Vec<RecentLink>> {
+    let base = state.settings.lock().expect("settings mutex").server_url.clone();
+    let types = state.types.lock().expect("types mutex").clone();
+    let rows = state.ledger.recent_finished(limit.unwrap_or(3).clamp(1, 20))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|file| {
+            let link = link_for(&file, base.as_deref(), &types)?;
+            let name = std::path::Path::new(&file.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| file.path.clone());
+            Some(RecentLink { id: file.id, name, link, at: file.updated_at })
         })
         .collect())
 }
@@ -606,11 +985,6 @@ pub async fn release_history(limit: Option<u8>) -> Result<Vec<crate::releases::R
     crate::releases::history(limit.unwrap_or(15)).await
 }
 
-#[tauri::command]
-pub fn watcher_problems(state: tauri::State<'_, AppState>) -> Vec<String> {
-    state.resync_watchers()
-}
-
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -637,6 +1011,91 @@ pub fn config_location(app: tauri::AppHandle) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Troubleshooting
+// ---------------------------------------------------------------------------
+
+fn log_dir(app: &tauri::AppHandle) -> Result<PathBuf> {
+    app.path()
+        .app_log_dir()
+        .map_err(|e| AppError::Storage(format!("Could not resolve the log directory: {e}")))
+}
+
+/// Where the log files are, for the Troubleshooting panel to show.
+#[tauri::command]
+pub fn log_location(app: tauri::AppHandle) -> Result<String> {
+    Ok(log_dir(&app)?.display().to_string())
+}
+
+/// Open the log folder in the file manager, so the files can be attached to an
+/// issue or read directly.
+#[tauri::command]
+pub fn open_log_dir(app: tauri::AppHandle) -> Result<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = log_dir(&app)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Storage(format!("Could not create {}: {e}", dir.display())))?;
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| AppError::Storage(format!("Could not open {}: {e}", dir.display())))
+}
+
+/// The login name, for masking where it shows up outside the home folder.
+fn os_user() -> Option<String> {
+    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok()
+}
+
+/// Everything a bug report needs, ready to paste, with what identifies the
+/// person masked. `include_server` keeps the server address, for the reports
+/// where the server or the proxy in front of it is the problem.
+#[tauri::command]
+pub fn diagnostics_report(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    include_server: bool,
+) -> Result<String> {
+    use crate::diagnostics::{report, Facts, Masks, QueueFacts};
+
+    let settings = state.snapshot();
+    let folder_counts = settings
+        .folders
+        .iter()
+        .map(|f| Ok((f.id.clone(), state.ledger.counts(&f.id)?)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let facts = Facts {
+        version: app.package_info().version.to_string(),
+        os: format!("{} · {}", os_info::get(), std::env::consts::ARCH),
+        queue: QueueFacts {
+            paused: state.queue.is_paused(),
+            pause_reason: state.queue.reason(),
+            queued: state.ledger.count_in_state(FileState::Queued)?,
+            uploading: state.ledger.count_in_state(FileState::Uploading)?,
+            failed: state.ledger.count_in_state(FileState::Failed)?,
+        },
+        options: state.options.snapshot(),
+        folder_counts,
+        watcher_problems: state.resync_watchers(),
+        log_lines: crate::logging::recent_lines(&log_dir(&app)?, 200),
+        now_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        settings: settings.clone(),
+    };
+
+    let home = app.path().home_dir().ok();
+    let masks = Masks::new(
+        home.as_deref(),
+        os_user().as_deref(),
+        settings.last_check.as_ref().map(|c| c.username.as_str()),
+        settings.server_url.as_deref(),
+        include_server,
+        state.token.get().as_deref(),
+    );
+    Ok(masks.apply(&report(&facts)))
+}
+
+// ---------------------------------------------------------------------------
 // Queue
 // ---------------------------------------------------------------------------
 
@@ -644,6 +1103,9 @@ pub fn config_location(app: tauri::AppHandle) -> Result<String> {
 #[serde(rename_all = "camelCase")]
 pub struct QueueStatus {
     pub paused: bool,
+    /// Waiting because a game has the screen, which is not a pause anybody
+    /// made and has no Resume.
+    pub held: bool,
     pub pause_reason: Option<String>,
     pub queued: i64,
     pub uploading: i64,
@@ -655,6 +1117,7 @@ pub fn queue_status(state: tauri::State<'_, AppState>) -> Result<QueueStatus> {
     use crate::ledger::FileState;
     Ok(QueueStatus {
         paused: state.queue.is_paused(),
+        held: state.queue.is_held(),
         pause_reason: state.queue.reason(),
         queued: state.ledger.count_in_state(FileState::Queued)?,
         uploading: state.ledger.count_in_state(FileState::Uploading)?,
@@ -743,6 +1206,8 @@ pub struct BacklogFile {
     pub excluded: Option<String>,
     /// Set once the library has been asked about it.
     pub in_library: Option<bool>,
+    /// Why it was held for review, for files that did not predate the folder.
+    pub held: Option<String>,
 }
 
 /// Everything a folder is holding back, with the rules applied.
@@ -778,6 +1243,7 @@ pub fn list_backlog(state: tauri::State<'_, AppState>, folder_id: String) -> Res
                 mtime: row.mtime,
                 excluded,
                 in_library: None,
+                held: row.reason,
             }
         })
         .collect())
@@ -876,5 +1342,204 @@ mod connection_tests {
         assert!(!needs_reconnect(&AppError::Server("502".into())));
         assert!(!needs_reconnect(&AppError::Throttled("slow down".into())));
         assert!(!needs_reconnect(&AppError::Keychain("locked".into())));
+    }
+}
+
+#[cfg(test)]
+mod catch_up_tests {
+    use super::*;
+    use crate::watcher::catchup::{ARRIVED_WHILE_PAUSED, FOUND_ON_UPDATE};
+
+    struct World {
+        state: AppState,
+        rx: UnboundedReceiver<WatchEvent>,
+        root: PathBuf,
+        clips: PathBuf,
+    }
+
+    impl Drop for World {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// An app with one watched folder, `clips`, and no keychain.
+    fn world(clips_exist: bool) -> World {
+        let root = std::env::temp_dir().join(format!("firesync-app-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::watcher::canonical(&root);
+        let clips = root.join("clips");
+        if clips_exist {
+            std::fs::create_dir_all(&clips).unwrap();
+        }
+        let (state, rx) = AppState::with_token(root.join("data"), TokenCache::empty()).unwrap();
+        let mut settings = state.snapshot();
+        settings.folders.push(WatchedFolder {
+            id: "f1".into(),
+            path: clips.clone(),
+            enabled: true,
+            include_subfolders: false,
+            media: vec![MediaKind::Video],
+            dest_folder: None,
+            game: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            after_upload: AfterUpload::Keep,
+            auto_sort_by_game: false,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
+        });
+        state.save(settings).unwrap();
+        World { state, rx, root, clips }
+    }
+
+    /// Names of the clips sent into the pipeline so far. Live watch events for
+    /// directories can arrive too, and are not what these tests are about.
+    fn sent(w: &mut World) -> Vec<String> {
+        let mut names = Vec::new();
+        while let Ok((_, path)) = w.rx.try_recv() {
+            if path.extension().is_some_and(|e| e == "mp4") {
+                names.push(path.file_name().unwrap().to_string_lossy().to_string());
+            }
+        }
+        names
+    }
+
+    fn held(w: &World) -> Vec<(String, Option<String>)> {
+        w.state
+            .ledger
+            .baseline_files("f1")
+            .unwrap()
+            .into_iter()
+            .map(|r| (std::path::Path::new(&r.path).file_name().unwrap().to_string_lossy().to_string(), r.reason))
+            .collect()
+    }
+
+    fn recently_complete(w: &World) {
+        w.state.ledger.mark_watched("f1", unix_now() - 60).unwrap();
+    }
+
+    #[test]
+    fn a_clip_written_while_closed_is_caught_up_at_launch() {
+        let mut w = world(true);
+        recently_complete(&w);
+        std::fs::write(w.clips.join("while-closed.mp4"), b"clip").unwrap();
+
+        w.state.resync_watchers();
+
+        assert_eq!(sent(&mut w), vec!["while-closed.mp4"]);
+    }
+
+    #[test]
+    fn what_arrives_during_a_pause_waits_for_review_when_it_resumes() {
+        let mut w = world(true);
+        recently_complete(&w);
+        w.state.resync_watchers();
+
+        w.state.set_folder_enabled("f1", false).unwrap();
+        std::fs::write(w.clips.join("during-pause.mp4"), b"clip").unwrap();
+        w.state.set_folder_enabled("f1", true).unwrap();
+
+        assert!(sent(&mut w).is_empty(), "nothing from the pause should upload by itself");
+        assert_eq!(held(&w), vec![("during-pause.mp4".into(), Some(ARRIVED_WHILE_PAUSED.into()))]);
+    }
+
+    #[test]
+    fn the_first_launch_of_this_version_holds_rather_than_uploads() {
+        let mut w = world(true);
+        std::fs::write(w.clips.join("unseen.mp4"), b"clip").unwrap();
+
+        w.state.resync_watchers();
+
+        assert!(sent(&mut w).is_empty());
+        assert_eq!(held(&w), vec![("unseen.mp4".into(), Some(FOUND_ON_UPDATE.into()))]);
+    }
+
+    #[test]
+    fn a_folder_that_comes_back_is_watched_again_and_caught_up() {
+        let mut w = world(false);
+        recently_complete(&w);
+
+        assert!(!w.state.resync_watchers().is_empty(), "a missing folder is a problem");
+        let folder = w.state.snapshot().folders[0].clone();
+        {
+            let watchers = w.state.watchers.lock().unwrap();
+            assert_eq!(watchers.availability(&folder), Availability::Unavailable);
+            assert!(watchers.problem("f1").is_some());
+        }
+
+        std::fs::create_dir_all(&w.clips).unwrap();
+        std::fs::write(w.clips.join("while-away.mp4"), b"clip").unwrap();
+        w.state.upkeep();
+
+        assert_eq!(w.state.watchers.lock().unwrap().availability(&folder), Availability::Watching);
+        assert_eq!(sent(&mut w), vec!["while-away.mp4"]);
+    }
+
+    #[test]
+    fn a_folder_that_goes_away_stops_being_watched() {
+        let w = world(true);
+        recently_complete(&w);
+        w.state.resync_watchers();
+        let folder = w.state.snapshot().folders[0].clone();
+
+        std::fs::remove_dir_all(&w.clips).unwrap();
+        w.state.upkeep();
+
+        assert_eq!(w.state.watchers.lock().unwrap().availability(&folder), Availability::Unavailable);
+    }
+
+    /// No watch at all: the folder is listed every `SCAN_EVERY`, and that is
+    /// how a new clip is found.
+    #[test]
+    fn a_folder_set_to_scan_is_scanned_rather_than_watched() {
+        let mut w = world(true);
+        recently_complete(&w);
+        let mut settings = w.state.snapshot();
+        settings.folders[0].watch_mode = crate::config::WatchMode::Scan;
+        w.state.save(settings).unwrap();
+        w.state.resync_watchers();
+        assert!(w.state.watchers.lock().unwrap().is_scanning("f1"));
+
+        std::fs::write(w.clips.join("on-the-nas.mp4"), b"clip").unwrap();
+        w.state.upkeep();
+        assert!(sent(&mut w).is_empty(), "not due yet, and nothing is watching");
+
+        let long_ago = std::time::Instant::now() - SCAN_EVERY - std::time::Duration::from_secs(1);
+        w.state.swept.lock().unwrap().insert("f1".into(), long_ago);
+        w.state.upkeep();
+        assert_eq!(sent(&mut w), vec!["on-the-nas.mp4"]);
+    }
+
+    #[test]
+    fn turning_on_subfolders_leaves_what_was_already_in_them() {
+        let mut w = world(true);
+        recently_complete(&w);
+        w.state.resync_watchers();
+        std::fs::create_dir_all(w.clips.join("older")).unwrap();
+        std::fs::write(w.clips.join("older").join("from-last-year.mp4"), b"clip").unwrap();
+
+        w.state
+            .update_folder(
+                "f1",
+                FolderRules {
+                    include_subfolders: true,
+                    media: vec![MediaKind::Video],
+                    dest_folder: None,
+                    game: None,
+                    min_size_bytes: None,
+                    max_size_bytes: None,
+                    after_upload: AfterUpload::Keep,
+                    auto_sort_by_game: false,
+                    title_template: None,
+                    tag_ids: Vec::new(),
+                    watch_mode: crate::config::WatchMode::Auto,
+                },
+            )
+            .unwrap();
+
+        assert!(sent(&mut w).is_empty(), "turning on subfolders must not upload what is in them");
+        assert_eq!(held(&w), vec![("from-last-year.mp4".into(), None)]);
     }
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { openUrl } from '@tauri-apps/plugin-opener'
@@ -10,17 +10,27 @@ import {
   ClockIcon,
   CopyIcon,
   ExternalLinkIcon,
+  FolderIcon,
   LinkIcon,
   PauseIcon,
+  PlayIcon,
   RetryIcon,
+  SearchIcon,
+  SkipIcon,
+  StopIcon,
+  UploadIcon,
 } from '../components/Icons'
+import { Menu, type MenuItem } from '../components/Menu'
+import { Select } from '../components/Select'
 import { humanRate } from '../lib/format'
 import {
   activity as activityApi,
   asAppError,
   folders as foldersApi,
   queue as queueApi,
+  type ActivityCounts,
   type ActivityRow,
+  type ActivityTab,
   type FileState,
   type FolderSummary,
   type QueueStatus,
@@ -29,6 +39,9 @@ import {
 
 const MB = 1024 * 1024
 const GB = 1024 * MB
+
+/** Rows asked for at a time; "show more" asks for this many more. */
+const PAGE = 100
 
 function humanSize(bytes: number) {
   if (bytes >= GB) return `${(bytes / GB).toFixed(1)} GB`
@@ -53,12 +66,6 @@ function basename(path: string) {
   return path.split(/[\\/]/).pop() ?? path
 }
 
-type Filter = 'all' | 'progress' | 'attention' | 'done'
-
-const NEEDS_ATTENTION: FileState[] = ['failed']
-const IN_PROGRESS: FileState[] = ['queued', 'uploading']
-const FINISHED: FileState[] = ['done', 'duplicate', 'skipped']
-
 function iconFor(state: FileState, inFlight: boolean) {
   if (inFlight) return <ArrowUpIcon />
   switch (state) {
@@ -77,28 +84,63 @@ function iconFor(state: FileState, inFlight: boolean) {
   }
 }
 
+const TABS: [ActivityTab, string][] = [
+  ['all', 'All'],
+  ['progress', 'In progress'],
+  ['attention', 'Needs attention'],
+  ['finished', 'Completed'],
+]
+
+interface Action {
+  key: string
+  title: string
+  icon: ReactNode
+  run: () => void
+}
+
 export function Activity() {
   const [rows, setRows] = useState<ActivityRow[]>([])
+  const [counts, setCounts] = useState<ActivityCounts | null>(null)
   const [folders, setFolders] = useState<FolderSummary[]>([])
   const [status, setStatus] = useState<QueueStatus | null>(null)
-  const [sending, setSending] = useState<Record<string, { fraction: number; rate: number | null }>>(
-    {},
-  )
+  const [sending, setSending] = useState<
+    Record<string, { fraction: number; rate: number | null; limit: UploadEvent['limit'] }>
+  >({})
   const [landings, setLandings] = useState<Record<string, string>>({})
-  const [filter, setFilter] = useState<Filter>('all')
+  const [tab, setTab] = useState<ActivityTab>('all')
+  const [typed, setTyped] = useState('')
+  const [name, setName] = useState('')
+  const [folderId, setFolderId] = useState('')
+  const [limit, setLimit] = useState(PAGE)
   const [copied, setCopied] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  // A query per settled word rather than per keystroke.
+  useEffect(() => {
+    const t = setTimeout(() => setName(typed.trim()), 200)
+    return () => clearTimeout(t)
+  }, [typed])
+
+  // A different question starts from the top of its answer.
+  useEffect(() => setLimit(PAGE), [tab, name, folderId])
+
   const refresh = useCallback(async () => {
     try {
-      setRows(await activityApi.recent(200))
+      const page = await activityApi.page({
+        tab,
+        name: name || null,
+        folderId: folderId || null,
+        limit,
+      })
+      setRows(page.rows)
+      setCounts(page.counts)
       setStatus(await queueApi.status())
-      setFolders(await foldersApi.list())
+      setError(null)
     } catch (e) {
       setError(asAppError(e).message)
     }
-  }, [])
+  }, [tab, name, folderId, limit])
 
   useEffect(() => {
     void refresh()
@@ -106,15 +148,24 @@ export function Activity() {
     return () => clearInterval(t)
   }, [refresh])
 
+  // For the folder chips and the filter. Folders change rarely, and listing
+  // them counts every file on disk, so this is not on the refresh timer.
+  useEffect(() => {
+    foldersApi
+      .list()
+      .then(setFolders)
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
     const stop = listen<UploadEvent>('firesync://upload', (event) => {
-      const { path, state, sent, size, bytesPerSecond, landedAs, removedLocal } = event.payload
+      const { path, state, sent, size, bytesPerSecond, landedAs, removedLocal, limit } = event.payload
       // Progress arrives twice a second and does not change the ledger row, so
       // it updates in place rather than triggering a reread.
       if (state === 'uploading') {
         setSending((prev) => ({
           ...prev,
-          [path]: { fraction: size > 0 ? sent / size : 0, rate: bytesPerSecond },
+          [path]: { fraction: size > 0 ? sent / size : 0, rate: bytesPerSecond, limit },
         }))
         return
       }
@@ -154,6 +205,19 @@ export function Activity() {
     }
   }, [])
 
+  /** Do something to one file, then show what it came to. */
+  const act = useCallback(
+    async (run: () => Promise<unknown>) => {
+      try {
+        await run()
+      } catch (e) {
+        setError(asAppError(e).message)
+      }
+      void refresh()
+    },
+    [refresh],
+  )
+
   const folderName = useCallback(
     (id: string) => {
       const folder = folders.find((f) => f.id === id)
@@ -162,94 +226,192 @@ export function Activity() {
     [folders],
   )
 
-  const counts = useMemo(
-    () => ({
-      attention: rows.filter((r) => NEEDS_ATTENTION.includes(r.state)).length,
-    }),
-    [rows],
+  const folderOptions = useMemo(
+    () => [
+      { value: '', label: 'All folders' },
+      ...folders.map((f) => ({ value: f.id, label: basename(f.path) })),
+    ],
+    [folders],
   )
 
-  const visible = useMemo(() => {
-    switch (filter) {
-      case 'progress':
-        return rows.filter((r) => IN_PROGRESS.includes(r.state))
-      case 'attention':
-        return rows.filter((r) => NEEDS_ATTENTION.includes(r.state))
-      case 'done':
-        return rows.filter((r) => FINISHED.includes(r.state))
-      default:
-        return rows
-    }
-  }, [rows, filter])
+  const inTab = counts ? counts[tab] : 0
 
-  const lifetime = useMemo(() => {
-    const done = rows.filter((r) => r.state === 'done')
-    return { files: done.length, bytes: done.reduce((n, r) => n + r.size, 0) }
-  }, [rows])
+  function actionsFor(r: ActivityRow, inFlight: boolean): { inline: Action[]; menu: MenuItem[] } {
+    const reveal: MenuItem = {
+      key: 'reveal',
+      icon: <FolderIcon size={15} />,
+      label: 'Show in folder',
+      onSelect: () => void act(() => activityApi.reveal(r.id)),
+    }
+    const skip: MenuItem = {
+      key: 'skip',
+      icon: <SkipIcon />,
+      label: 'Skip this file',
+      hint: 'won’t upload',
+      onSelect: () => void act(() => activityApi.skip(r.id)),
+    }
+    const now = Date.now() / 1000
+
+    if (inFlight || r.state === 'uploading') {
+      return {
+        inline: [
+          {
+            key: 'stop',
+            title: 'Stop. You can upload it later from where it got to.',
+            icon: <StopIcon />,
+            run: () => void act(() => activityApi.stop(r.id)),
+          },
+        ],
+        menu: [reveal],
+      }
+    }
+    switch (r.state) {
+      case 'failed':
+        return {
+          inline: [
+            { key: 'retry', title: 'Retry', icon: <RetryIcon />, run: () => void act(() => activityApi.retry(r.id)) },
+          ],
+          menu: [skip, reveal],
+        }
+      case 'queued': {
+        const waiting = r.nextTryAt !== null && r.nextTryAt > now
+        return {
+          inline: waiting
+            ? [
+                {
+                  key: 'now',
+                  title: 'Try now instead of waiting',
+                  icon: <PlayIcon />,
+                  run: () => void act(() => activityApi.retry(r.id)),
+                },
+              ]
+            : [],
+          menu: [skip, reveal],
+        }
+      }
+      case 'skipped':
+        return {
+          inline: [
+            {
+              key: 'anyway',
+              title: 'Upload anyway',
+              icon: <UploadIcon />,
+              run: () => void act(() => activityApi.uploadAnyway(r.id)),
+            },
+          ],
+          menu: [reveal],
+        }
+      default:
+        return {
+          inline: r.link
+            ? [
+                {
+                  key: 'copy',
+                  title: copied === r.id ? 'Link copied' : 'Copy link',
+                  icon: copied === r.id ? <CheckIcon /> : <LinkIcon />,
+                  run: () => void copyLink(r.id, r.link!),
+                },
+                {
+                  key: 'open',
+                  title: 'Open in Fireshare',
+                  icon: <ExternalLinkIcon />,
+                  run: () => void openUrl(r.link!).catch(() => {}),
+                },
+              ]
+            : [],
+          menu: [reveal],
+        }
+    }
+  }
 
   return (
     <div className="page page--tall">
       <header className="page__head">
         <h1 className="page__title">Activity</h1>
-        <span className="spacer" />
-        <button
-          type="button"
-          className="btn btn--ghost btn--icon"
-          onClick={() =>
-            (status?.paused ? queueApi.resume() : queueApi.pause()).then(refresh).catch(() => {})
-          }
-        >
-          <PauseIcon />
-          {status?.paused ? 'Resume' : 'Pause all'}
-        </button>
-        <button
-          type="button"
-          className="btn btn--primary btn--icon"
-          disabled={!status?.failed}
-          onClick={() => queueApi.retryFailed().then(refresh).catch(() => {})}
-        >
-          <RetryIcon />
-          Retry failed
-        </button>
+        <div className="page__tools">
+          <label className="search">
+            <SearchIcon />
+            <input
+              type="text"
+              placeholder="Search file names"
+              aria-label="Search file names"
+              spellCheck={false}
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+            />
+          </label>
+          <div className="page__filter">
+            <Select value={folderId} placeholder="All folders" options={folderOptions} onChange={setFolderId} />
+          </div>
+          <button
+            type="button"
+            className="btn btn--ghost btn--icon"
+            onClick={() =>
+              (status?.paused ? queueApi.resume() : queueApi.pause()).then(refresh).catch(() => {})
+            }
+          >
+            <PauseIcon />
+            {status?.paused ? 'Resume' : 'Pause all'}
+          </button>
+          <button
+            type="button"
+            className="btn btn--primary btn--icon"
+            disabled={!status?.failed}
+            onClick={() => queueApi.retryFailed().then(refresh).catch(() => {})}
+          >
+            <RetryIcon />
+            Retry failed
+          </button>
+        </div>
       </header>
 
       {error && <div className="banner banner--bad">{error}</div>}
       {status?.paused && (
         <div className="banner banner--bad">{status.pauseReason ?? 'Uploads are paused.'}</div>
       )}
+      {!status?.paused && status?.held && (
+        <div className="banner banner--info">
+          <PauseIcon />
+          <span>
+            A game has the screen, so uploads are waiting. They carry on as soon as you tab out.
+          </span>
+        </div>
+      )}
 
       <div className="tabs">
-        {(
-          [
-            ['all', 'All', 0],
-            ['progress', 'In progress', 0],
-            ['attention', 'Needs attention', counts.attention],
-            ['done', 'Completed', 0],
-          ] as [Filter, string, number][]
-        ).map(([key, label, badge]) => (
-          <button
-            key={key}
-            type="button"
-            className={`tab ${filter === key ? 'tab--on' : ''}`}
-            onClick={() => setFilter(key)}
-          >
-            {label}
-            {badge > 0 && <span className="tab__badge">{badge}</span>}
-          </button>
-        ))}
+        {TABS.map(([key, label]) => {
+          const count = counts?.[key] ?? 0
+          return (
+            <button
+              key={key}
+              type="button"
+              className={`tab ${tab === key ? 'tab--on' : ''}`}
+              onClick={() => setTab(key)}
+            >
+              {label}
+              {key === 'attention' ? (
+                count > 0 && <span className="tab__badge">{count.toLocaleString()}</span>
+              ) : (
+                <span className="tab__count">{count.toLocaleString()}</span>
+              )}
+            </button>
+          )
+        })}
       </div>
 
       <div className="feed">
-        {visible.length === 0 && (
+        {rows.length === 0 && (
           <p className="panel__empty">
-            Nothing here yet. Drop a file into a watched folder and it appears once it stops being
-            written.
+            {name
+              ? `No files match “${name}”.`
+              : 'Nothing here yet. Drop a file into a watched folder and it appears once it stops being written.'}
           </p>
         )}
-        {visible.map((r) => {
+        {rows.map((r) => {
           const flight = sending[r.path]
           const inFlight = flight !== undefined
           const state = inFlight ? 'uploading' : r.state
+          const { inline, menu } = actionsFor(r, inFlight)
           return (
             <div key={r.id} className={`arow arow--${state}`}>
               <span className={`arow__icon arow__icon--${state}`}>{iconFor(r.state, inFlight)}</span>
@@ -263,7 +425,11 @@ export function Activity() {
               {inFlight ? (
                 <>
                   {flight.rate !== null && flight.rate > 0 && (
-                    <span className="arow__rate mono">{humanRate(flight.rate)}</span>
+                    <span className={`arow__rate mono ${flight.limit === 'playing' ? 'arow__slow' : ''}`}>
+                      {humanRate(flight.rate)}
+                      {flight.limit === 'limit' && ' · limited'}
+                      {flight.limit === 'playing' && ' · slowed while you play'}
+                    </span>
                   )}
                   <span className="arow__bar">
                     <span
@@ -289,33 +455,36 @@ export function Activity() {
                   )}
                   <span className="arow__meta">{humanSize(r.size)}</span>
                   <span className="arow__when">{ago(r.updatedAt)}</span>
-                  {r.link && (
-                    <span className="arow__actions">
-                      <button
-                        type="button"
-                        className="iconbtn"
-                        title={copied === r.id ? 'Link copied' : 'Copy link'}
-                        aria-label="Copy link"
-                        onClick={() => void copyLink(r.id, r.link!)}
-                      >
-                        {copied === r.id ? <CheckIcon /> : <LinkIcon />}
-                      </button>
-                      <button
-                        type="button"
-                        className="iconbtn"
-                        title="Open in Fireshare"
-                        aria-label="Open in Fireshare"
-                        onClick={() => void openUrl(r.link!).catch(() => {})}
-                      >
-                        <ExternalLinkIcon />
-                      </button>
-                    </span>
-                  )}
                 </>
               )}
+              <span className="arow__actions arow__actions--wide">
+                {inline.map((a) => (
+                  <button
+                    key={a.key}
+                    type="button"
+                    className="iconbtn"
+                    title={a.title}
+                    aria-label={a.title}
+                    onClick={a.run}
+                  >
+                    {a.icon}
+                  </button>
+                ))}
+                <Menu items={menu.length > 1 ? [menu[0], 'separator', ...menu.slice(1)] : menu} />
+              </span>
             </div>
           )
         })}
+        {rows.length > 0 && rows.length < inTab && (
+          <div className="feed__more">
+            <button type="button" className="btn btn--ghost btn--sm" onClick={() => setLimit((n) => n + PAGE)}>
+              Show {Math.min(PAGE, inTab - rows.length).toLocaleString()} more
+            </button>
+            <span>
+              Showing {rows.length.toLocaleString()} of {inTab.toLocaleString()}
+            </span>
+          </div>
+        )}
       </div>
 
       <footer className="feedfoot">
@@ -331,8 +500,9 @@ export function Activity() {
         </span>
         <span className="spacer" />
         <span className="feedfoot__total">
-          {humanSize(lifetime.bytes)} uploaded · {lifetime.files} file
-          {lifetime.files === 1 ? '' : 's'}
+          {humanSize(counts?.uploadedBytes ?? 0)} uploaded ·{' '}
+          {(counts?.uploadedFiles ?? 0).toLocaleString()} file
+          {counts?.uploadedFiles === 1 ? '' : 's'}
         </span>
       </footer>
     </div>

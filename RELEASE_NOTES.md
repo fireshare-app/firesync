@@ -1,3 +1,15 @@
+- Clips recorded while Firesync was closed, or while a folder's drive was disconnected, are now uploaded the next time it sees the folder. Anything that lands while you have paused a folder waits in its backlog for you to look at instead
+- The first time this version looks at each of your folders, anything in it that Firesync has never seen is held in the folder's backlog rather than uploaded, because it cannot tell what arrived while it was closed from what arrived while the folder was paused
+- Every file in Activity has its own actions: retry a failure, try a waiting file now, stop an upload and finish it later, upload a skipped file anyway, or show it in its folder. Activity can also search by file name, narrow to one folder, and go back further than the last 200 files
+- The tray panel lists your last three uploads, so copying a link no longer means opening the window. A new setting can also put each new link on your clipboard as the upload finishes
+- Uploads can have a speed limit, shared between them, and a setting for while a game has the screen: carry on, slow down, or wait until you tab out. Telling that a game has the screen works on Windows only
+- A free upload slot is used as soon as it frees, instead of waiting for the slowest upload in the batch to finish
+- Folders can title what they upload from a template such as {game} — {date}, with a preview of what the newest file would be called
+- Folders can tag everything they upload, choosing from your Fireshare's own tags. This needs a Fireshare new enough to offer tags to upload tokens
+- Folders on a NAS or network share are checked every 15 seconds, since change notifications from them cannot be trusted. Any folder can be set to always watch or always check on a timer
+- A folder whose drive is disconnected says so on its card, and picks up again by itself when the drive comes back
+- Turning on Watch subfolders takes effect straight away instead of after a restart
+- Firesync keeps a log, and Settings has a Troubleshooting section that copies a diagnostics report for a bug report, with your home folder, username and server address masked
 - The Game and Fireshare folder lists fetch the latest from Fireshare whenever you open them, so a game you have just added shows up straight away instead of after restarting Firesync
 - Clips set to sort by game no longer land in your default folder when Firesync starts before your network is up. It waits until it can ask Fireshare where the game's folder is
 - Folder settings now warn you when a folder's game has been renamed or deleted in Fireshare, before its uploads start being refused

@@ -55,10 +55,20 @@ export interface FolderRule {
   game: string | null
 }
 
+/** A Fireshare tag an upload may name. */
+export interface Tag {
+  id: number
+  name: string
+  /** A hex colour, when it has one. */
+  color: string | null
+}
+
 export interface UploadOptions {
   default_folder: string | null
   folders: { video: string[]; image: string[] }
   games: Game[]
+  /** Missing on a Fireshare too old to offer tags to upload tokens. */
+  tags?: Tag[] | null
   /** Which folder each game's media belongs in, as Fireshare's scanner reads it. */
   folder_rules: { video: FolderRule[]; image: FolderRule[] }
 }
@@ -101,7 +111,14 @@ export interface WatchedFolder {
   max_size_bytes: number | null
   after_upload: AfterUpload
   auto_sort_by_game: boolean
+  /** e.g. `{game} — {date}`. Null keeps the file name as the title. */
+  title_template: string | null
+  tag_ids: number[]
+  watch_mode: WatchMode
 }
+
+/** How a folder notices new files: change events, or a timed scan. */
+export type WatchMode = 'auto' | 'events' | 'scan'
 
 export interface Settings {
   server_url: string | null
@@ -111,10 +128,18 @@ export interface Settings {
     on_needs_attention: boolean
     quiet_in_fullscreen: boolean
     group_bursts: boolean
+    copy_link_on_complete: boolean
   }
-  transfers: { max_concurrent: number; speed_cap: number | null }
+  transfers: {
+    max_concurrent: number
+    /** Bytes per second, shared by every upload, or null for none. */
+    speed_cap: number | null
+    while_playing: 'full' | 'limit' | 'pause'
+    /** Bytes per second while playing, when `while_playing` is `limit`. */
+    while_playing_cap: number | null
+  }
   startup: { launch_at_login: boolean; start_in_tray: boolean }
-  updates: { auto_install: boolean; prerelease: boolean }
+  updates: { auto_install: boolean }
 }
 
 export const api = {
@@ -150,6 +175,8 @@ export interface FileRow {
   attempts: number
   /** Fireshare's id for these bytes, once it has been computed. */
   contentHash: string | null
+  /** When a file waiting to retry is next due, in unix seconds. */
+  nextTryAt: number | null
   observedAt: number
   updatedAt: number
 }
@@ -168,6 +195,17 @@ export interface FolderSummary extends WatchedFolder {
   presentCount: number
   /** Unix seconds when something from this folder last reached the server. */
   lastUploadAt: number | null
+  /** Files held for review rather than uploaded: turned up during a pause, say. */
+  held: number
+  /** Why they were held, when every one shares a reason. */
+  heldReason: string | null
+  availability: 'watching' | 'unavailable' | 'paused'
+  /** Why this folder is not being watched, when it is not. */
+  problem: string | null
+  /** Seconds between scans, for a folder scanned rather than watched. */
+  scannedEvery: number | null
+  /** Whether it is on a network drive, for the dialog to explain "automatically". */
+  network: boolean
 }
 
 export interface FolderRules {
@@ -179,6 +217,17 @@ export interface FolderRules {
   maxSizeBytes?: number | null
   afterUpload?: AfterUpload
   autoSortByGame?: boolean
+  titleTemplate?: string | null
+  tagIds?: number[]
+  watchMode?: WatchMode
+}
+
+/** What a folder's newest file would be titled. */
+export interface TitlePreview {
+  /** Null: Fireshare would title it by its file name. */
+  title: string | null
+  /** The file the preview was made from, or null for a made-up example. */
+  from: string | null
 }
 
 export interface NewFolder extends FolderRules {
@@ -205,13 +254,50 @@ export const folders = {
   setAfterUpload: (id: string, afterUpload: AfterUpload) =>
     invoke<void>('set_folder_after_upload', { id, afterUpload }),
   update: (id: string, rules: FolderRules) => invoke<void>('update_folder', { id, rules }),
+  detectNetwork: (path: string) => invoke<boolean>('detect_network', { path }),
+  previewTitle: (template: string, path: string, game: string | null, includeSubfolders: boolean) =>
+    invoke<TitlePreview>('preview_title', { template, path, game, includeSubfolders }),
   uploadExisting: (folderId: string, paths: string[]) =>
     invoke<number>('upload_existing', { folderId, paths }),
-  problems: () => invoke<string[]>('watcher_problems'),
 }
 
+export type ActivityTab = 'all' | 'progress' | 'attention' | 'finished'
+
+/** Counted in the ledger under the same filter as the page, not from the page. */
+export interface ActivityCounts {
+  all: number
+  progress: number
+  attention: number
+  finished: number
+  uploadedFiles: number
+  uploadedBytes: number
+}
+
+export interface ActivityPage {
+  rows: ActivityRow[]
+  counts: ActivityCounts
+}
+
+export interface ActivityQuery {
+  tab: ActivityTab
+  /** Part of a file name. */
+  name?: string | null
+  folderId?: string | null
+  limit: number
+}
+
+/**
+ * The feed, and what can be done to one file in it. Each action answers false
+ * when the file was no longer in a state it applies to — it finished, say —
+ * which is a reason to refresh rather than an error.
+ */
 export const activity = {
-  recent: (limit = 200) => invoke<ActivityRow[]>('recent_activity', { limit }),
+  page: (query: ActivityQuery) => invoke<ActivityPage>('activity_page', { query }),
+  retry: (id: number) => invoke<boolean>('retry_file', { id }),
+  skip: (id: number) => invoke<boolean>('skip_file', { id }),
+  stop: (id: number) => invoke<boolean>('stop_upload', { id }),
+  uploadAnyway: (id: number) => invoke<boolean>('upload_anyway', { id }),
+  reveal: (id: number) => invoke<void>('reveal_file', { id }),
 }
 
 /** What a test notification found out. */
@@ -239,6 +325,16 @@ export const releases = {
   history: (limit = 15) => invoke<Release[]>('release_history', { limit }),
 }
 
+export const diagnostics = {
+  /**
+   * Everything a bug report needs, as text to paste. Home folder, usernames and
+   * (unless asked for) the server address are masked; the token never appears.
+   */
+  report: (includeServer: boolean) => invoke<string>('diagnostics_report', { includeServer }),
+  logLocation: () => invoke<string>('log_location'),
+  openLogFolder: () => invoke<void>('open_log_dir'),
+}
+
 export const notifications = {
   test: () => invoke<NotificationProbe>('test_notification'),
 }
@@ -252,17 +348,21 @@ export interface UploadEvent {
   size: number
   /** Bytes handed to the socket so far, on an `uploading` event. */
   sent: number
-  state: 'uploading' | 'done' | 'duplicate' | 'failed' | 'waiting' | 'paused'
+  state: 'uploading' | 'done' | 'duplicate' | 'failed' | 'waiting' | 'paused' | 'skipped'
   reason: string | null
   url: string | null
   landedAs: string | null
   removedLocal: string | null
   /** Current upload speed in bytes per second, on an `uploading` event. */
   bytesPerSecond: number | null
+  /** Why it is going slower than it could: the speed limit, or a game. */
+  limit: 'limit' | 'playing' | null
 }
 
 export interface QueueStatus {
   paused: boolean
+  /** Waiting because a game has the screen. Not a pause, and has no Resume. */
+  held: boolean
   pauseReason: string | null
   queued: number
   uploading: number
@@ -302,6 +402,8 @@ export interface BacklogFile {
   excluded: string | null
   /** Filled in once the library has been asked. */
   inLibrary: boolean | null
+  /** Why it was held for review, for a file that did not predate the folder. */
+  held: string | null
 }
 
 export const backlog = {
@@ -312,7 +414,17 @@ export const backlog = {
     invoke<number>('queue_backlog', { folderId, paths }),
 }
 
+/** A finished upload with a page to open, for the tray. */
+export interface RecentLink {
+  id: number
+  name: string
+  link: string
+  /** When it finished, in unix seconds. */
+  at: number
+}
+
 export const tray = {
+  recentLinks: (limit = 3) => invoke<RecentLink[]>('recent_links', { limit }),
   openMain: () => invoke<void>('open_main_window'),
   openSettings: () => invoke<void>('open_main_at', { tab: 'settings' }),
   quit: () => invoke<void>('quit_app'),

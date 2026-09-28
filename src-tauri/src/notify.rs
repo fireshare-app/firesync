@@ -150,7 +150,7 @@ impl Notifier {
 
     fn show_logging(&self, note: &Note) {
         if let Err(e) = self.show(note) {
-            eprintln!("firesync: the system refused a notification: {e}");
+            log::warn!("The system refused a notification: {e}");
         }
     }
 
