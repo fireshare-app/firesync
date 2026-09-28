@@ -19,7 +19,7 @@ It sits in your system tray, starts with your computer, and stays out of the way
 - **You want your clips on your own server.** Everything goes to your Fireshare instance. Firesync
   talks to nothing else except GitHub, and only to check for its own updates.
 - **You are playing.** Notifications stay quiet while a game has the screen and arrive once you tab
-  out.
+  out, and uploads can slow down or wait for you too.
 
 ## Getting started
 
@@ -53,7 +53,10 @@ Open Firesync, paste your Fireshare address and the token, then hit **Add folder
 your recorder saves. That is the whole setup.
 
 Each folder gets its own rules — which Fireshare folder things land in, which game they are tagged
-with, a minimum and maximum size, and whether it takes videos, images or both.
+with, what they are titled, which tags they get, a minimum and maximum size, and whether it takes
+videos, images or both. Tags need a Fireshare recent enough to offer them to upload tokens.
+
+![The folder settings, showing the game, a title template with its preview, and tags](docs/screenshots/folder-rules.png)
 
 > **Files already in the folder are left alone.** When you add a folder, whatever is in it is
 > recorded as a starting point rather than uploaded — otherwise adding a folder with three years of
@@ -64,14 +67,27 @@ with, a minimum and maximum size, and whether it takes videos, images or both.
 
 ### Everything that happened, in one list
 
-Every file Firesync has seen, what became of it, and why. Finished uploads have buttons to copy the
-link or open the clip in Fireshare.
+Every file Firesync has seen, what became of it, and why — and something to do about each one. Retry
+a failure, try a waiting file now, stop an upload and finish it later, upload a skipped file anyway,
+or copy a finished clip's link. Search by file name, or narrow it to one folder.
 
-![The Activity screen, listing uploads with their status, size and time](docs/screenshots/activity.png)
+![The Activity screen, with search, a folder filter, and the actions for a failed upload open](docs/screenshots/activity.png)
 
 ### A tray panel for the things you actually need mid-game
 
-![The tray panel, showing upload progress and quick actions](docs/screenshots/tray.png)
+Your last few uploads are in it, so a clip's link is one click away without opening the window.
+Firesync can also put each new link on your clipboard by itself.
+
+![The tray panel, showing upload progress, recent uploads with one link just copied, and quick actions](docs/screenshots/tray.png)
+
+### Uploads that stay out of your game's way
+
+Set a speed limit so uploads never take your whole connection, and choose what happens while a game
+has the screen: carry on, slow down, or wait until you tab out. A big clip stops at a safe point and
+carries on afterwards without sending anything twice. Telling that a game has the screen works on
+Windows.
+
+![The Transfers settings, with a speed limit and uploads set to wait while a game has the screen](docs/screenshots/playing.png)
 
 ### Settings that explain themselves
 
@@ -85,6 +101,11 @@ link or open the clip in Fireshare.
   has *not* seen — a folder you add later, or a fresh install — it works out the file's identity
   locally and asks your library whether it already has it before uploading, so re-sending a folder
   you have already uploaded costs a question rather than a transfer.
+- **It catches up.** Clips recorded while Firesync was closed, or while a folder's drive was
+  disconnected, are uploaded the next time it sees the folder. Anything that lands while you have paused a folder
+  waits for you to review instead.
+- **It copes with network drives.** A folder on a NAS or a network share, where change
+  notifications cannot be trusted, is checked every 15 seconds instead.
 - **Big files go up in pieces.** A clip interrupted halfway resumes rather than starting over, and a
   server that restarts mid-upload does not cost you the whole file.
 - **It retries what is worth retrying.** A server that is down or restarting is waited out. A file
@@ -93,6 +114,14 @@ link or open the clip in Fireshare.
   confirmed it — off by default.
 - **It updates itself.** New versions install when nothing is uploading, never mid-transfer. The
   **What's new** button in Settings shows what changed, including releases you skipped.
+
+## If something goes wrong
+
+**Settings → Troubleshooting → Copy diagnostics** gives you a report to paste into an
+[issue](https://github.com/fireshare-app/firesync/issues/new): what Firesync is doing, how it is set
+up, and its recent log. Your home folder and username are masked, and so is your server address
+unless you choose to include it. The upload token is never included. The full log files, which are
+not masked, are one button away in the same place.
 
 ## What you need
 
