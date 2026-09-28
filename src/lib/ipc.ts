@@ -114,7 +114,7 @@ export interface Settings {
   }
   transfers: { max_concurrent: number; speed_cap: number | null }
   startup: { launch_at_login: boolean; start_in_tray: boolean }
-  updates: { auto_install: boolean; prerelease: boolean }
+  updates: { auto_install: boolean }
 }
 
 export const api = {

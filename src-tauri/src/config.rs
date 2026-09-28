@@ -116,8 +116,10 @@ pub struct StartupSettings {
 pub struct UpdateSettings {
     #[serde(default = "default_true")]
     pub auto_install: bool,
-    #[serde(default)]
-    pub prerelease: bool,
+    // A `prerelease` switch used to live here: stored, never shown, never read,
+    // and unable to work — the updater reads releases/latest, which GitHub never
+    // points at a pre-release. Settings files that still carry it load fine;
+    // unknown keys are ignored.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,7 +183,7 @@ impl Default for StartupSettings {
 
 impl Default for UpdateSettings {
     fn default() -> Self {
-        Self { auto_install: true, prerelease: false }
+        Self { auto_install: true }
     }
 }
 
@@ -245,4 +247,29 @@ pub fn save(app_data_dir: &Path, settings: &Settings) -> Result<()> {
 
     std::fs::rename(&staging, &path)
         .map_err(|e| AppError::Storage(format!("Could not save {}: {e}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every install before this one saved `prerelease` into its settings. It
+    /// must not stop them loading, or everybody's folders would reset.
+    #[test]
+    fn a_settings_file_with_the_retired_prerelease_key_still_loads() {
+        let dir = std::env::temp_dir().join(format!("firesync-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            config_path(&dir),
+            r#"{"server_url":"https://f.example","updates":{"auto_install":false,"prerelease":true},
+                "folders":[{"id":"f1","path":"/w"}]}"#,
+        )
+        .unwrap();
+
+        let settings = load(&dir);
+        assert_eq!(settings.server_url.as_deref(), Some("https://f.example"));
+        assert!(!settings.updates.auto_install);
+        assert_eq!(settings.folders.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
