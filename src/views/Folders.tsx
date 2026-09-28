@@ -17,7 +17,6 @@ import {
   folders as foldersApi,
   type FolderSummary,
   type UploadEvent,
-  type UploadOptions,
 } from '../lib/ipc'
 
 const MB = 1024 * 1024
@@ -55,7 +54,6 @@ function sizeRule(folder: FolderSummary) {
 }
 
 interface Props {
-  options: UploadOptions | null
   onChanged?: () => void
 }
 
@@ -74,7 +72,7 @@ interface InFlight {
   rate: number | null
 }
 
-export function Folders({ options, onChanged }: Props) {
+export function Folders({ onChanged }: Props) {
   const [list, setList] = useState<FolderSummary[]>([])
   const [problems, setProblems] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -298,7 +296,6 @@ export function Folders({ options, onChanged }: Props) {
       {editing && (
         <FolderDialog
           folder={editing === 'new' ? undefined : editing}
-          options={options}
           onClose={() => setEditing(null)}
           onSaved={refresh}
         />

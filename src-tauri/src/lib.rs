@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod ledger;
 mod notify;
+mod options;
 mod queue;
 mod releases;
 mod secrets;
@@ -70,7 +71,7 @@ pub fn run() {
             let queue_settings = state.settings.clone();
             let queue_control = state.queue.clone();
             let queue_token = state.token.clone();
-            let queue_rules = state.folder_rules.clone();
+            let queue_options = state.options.clone();
             let queue_types = state.types.clone();
 
             let notifier = notify::Notifier::new(app.handle().clone(), settings.clone());
@@ -79,6 +80,14 @@ pub fn run() {
 
             // Before anything watches or scans, so both see the same spelling.
             app.state::<AppState>().tidy_stored_paths();
+
+            // Every refresh reaches whichever windows are open, whoever asked
+            // for it — a dialog shows the game the queue's refresh just found.
+            let options_handle = app.handle().clone();
+            app.state::<AppState>().options.on_change(move |snapshot| {
+                let _ = options_handle.emit("firesync://options", snapshot);
+            });
+            options::spawn_refresh_loop(app.handle().clone());
 
             // Decisions are pushed rather than polled: a clip can settle minutes
             // after the event that started the wait, long after any request the
@@ -105,7 +114,7 @@ pub fn run() {
                 settings: queue_settings,
                 control: queue_control,
                 token: queue_token,
-                folder_rules: queue_rules,
+                options: queue_options,
                 types: queue_types,
                 on_event: std::sync::Arc::new(move |event: queue::UploadEvent| {
                     // Progress ticks are for the window only. A toast every half
@@ -157,6 +166,7 @@ pub fn run() {
             commands::connection_status,
             commands::disconnect,
             commands::upload_options,
+            commands::refresh_options,
             commands::add_folder,
             commands::remove_folder,
             commands::set_folder_enabled,

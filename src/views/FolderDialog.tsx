@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
 import { Select } from '../components/Select'
 import {
@@ -7,8 +7,8 @@ import {
   type AfterUpload,
   type FolderSummary,
   type MediaKind,
-  type UploadOptions,
 } from '../lib/ipc'
+import { pickerStatus, useUploadOptions } from '../lib/useUploadOptions'
 
 const MB = 1024 * 1024
 const GB = 1024 * MB
@@ -30,13 +30,22 @@ function formatLimit(bytes: number | null | undefined, unit: number): string {
 interface Props {
   /** Editing an existing folder, or undefined when adding one. */
   folder?: FolderSummary
-  options: UploadOptions | null
   onClose: () => void
   onSaved: () => void
 }
 
-export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
+export function FolderDialog({ folder, onClose, onSaved }: Props) {
   const editing = Boolean(folder)
+
+  // The lists this dialog offers are asked for again as it opens, and again as
+  // each picker opens: somebody who has just added a game in Fireshare and
+  // come here to choose it should find it, without reloading anything.
+  const fresh = useUploadOptions()
+  const { options, refresh } = fresh
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+  const listStatus = pickerStatus(fresh)
 
   const [path, setPath] = useState(folder?.path ?? '')
   const [subfolders, setSubfolders] = useState(folder?.include_subfolders ?? false)
@@ -52,6 +61,14 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // A new folder starts on the server's default. The list may arrive a moment
+  // after the dialog does, so the default is filled in when it lands rather
+  // than read once at the first render.
+  const defaultFolder = options?.default_folder
+  useEffect(() => {
+    if (!folder && defaultFolder) setDest((current) => current || defaultFolder)
+  }, [folder, defaultFolder])
+
   // Which folder list to offer depends on what this folder sends: the server
   // keeps videos and images in separate trees, so a name valid for one is not
   // necessarily valid for the other.
@@ -62,6 +79,17 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
   const sortedInto = game
     ? ruleList?.find((r) => r.game?.toLowerCase() === game.toLowerCase())?.folder
     : undefined
+
+  // A game renamed or deleted in Fireshare. Only said on a list this dialog
+  // can trust — just fetched, not mid-check and not a failed refresh — because
+  // a stale list would miss a game added since and warn about nothing.
+  const gameGone = Boolean(
+    game &&
+      options &&
+      !fresh.checking &&
+      !fresh.error &&
+      !options.games.some((g) => g.name.toLowerCase() === game.toLowerCase()),
+  )
 
   async function browse() {
     setError(null)
@@ -181,6 +209,8 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
                   options={(folderChoices ?? []).map((f) => ({ value: f, label: f }))}
                   onChange={setDest}
                   customLabel="Use a folder that does not exist yet…"
+                  onOpen={() => void refresh()}
+                  status={listStatus}
                 />
               )}
               <span className="field__hint">
@@ -207,12 +237,22 @@ export function FolderDialog({ folder, options, onClose, onSaved }: Props) {
                   ...(options?.games ?? []).map((g) => ({ value: g.name, label: g.name })),
                 ]}
                 onChange={setGame}
+                onOpen={() => void refresh()}
+                status={listStatus}
               />
-              <span className="field__hint">
-                {options
-                  ? 'Every game in your library. Firesync never creates new ones.'
-                  : 'Connect to load your library’s games.'}
-              </span>
+              {gameGone ? (
+                <span className="field__warn">
+                  {game} isn&rsquo;t in your library any more. It was renamed or deleted in
+                  Fireshare, so uploads from this folder would be refused. Pick another game, or
+                  No game.
+                </span>
+              ) : (
+                <span className="field__hint">
+                  {options
+                    ? 'Every game in your library. Firesync never creates new ones.'
+                    : 'Connect to load your library’s games.'}
+                </span>
+              )}
               <label className="inline-check" htmlFor="fd-autosort">
                 <input
                   id="fd-autosort"

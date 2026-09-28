@@ -63,6 +63,27 @@ export interface UploadOptions {
   folder_rules: { video: FolderRule[]; image: FolderRule[] }
 }
 
+/**
+ * What Fireshare last said it will accept, and how recently.
+ *
+ * The core holds this, not the window, and refreshes it whenever something is
+ * about to rely on it. A failed refresh keeps the old list and says why.
+ */
+export interface OptionsSnapshot {
+  options: UploadOptions | null
+  /** Unix seconds of Fireshare's last answer. */
+  fetchedAt: number | null
+  /** Why the latest refresh failed, until one succeeds. */
+  error: string | null
+}
+
+export const uploadOptions = {
+  /** Whatever the core holds right now. Never touches the network. */
+  cached: () => invoke<OptionsSnapshot>('upload_options'),
+  /** Ask Fireshare again. Resolves with the list either way; see `error`. */
+  refresh: () => invoke<OptionsSnapshot>('refresh_options'),
+}
+
 export type MediaKind = 'video' | 'image'
 
 /** What happens to the local file once the server confirms it has it. */
@@ -100,7 +121,6 @@ export const api = {
   connect: (url: string, token: string) => invoke<Connection>('connect', { url, token }),
   connectionStatus: () => invoke<Connection | null>('connection_status'),
   disconnect: () => invoke<void>('disconnect'),
-  uploadOptions: () => invoke<UploadOptions>('upload_options'),
   getSettings: () => invoke<Settings>('get_settings'),
   saveSettings: (settings: Settings) => invoke<void>('save_settings', { settings }),
   configLocation: () => invoke<string>('config_location'),

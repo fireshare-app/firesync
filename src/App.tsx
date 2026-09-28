@@ -14,7 +14,6 @@ import {
   queue as queueApi,
   type Connection,
   type UpdateInfo,
-  type UploadOptions,
 } from './lib/ipc'
 
 type Phase =
@@ -29,7 +28,6 @@ const VERSION = __APP_VERSION__
 export default function App() {
   const [phase, setPhase] = useState<Phase>({ status: 'loading' })
   const [tab, setTab] = useState<Tab>('folders')
-  const [options, setOptions] = useState<UploadOptions | null>(null)
   const [folderCount, setFolderCount] = useState(0)
   const [attention, setAttention] = useState(0)
   const [update, setUpdate] = useState<UpdateInfo | null>(null)
@@ -67,14 +65,6 @@ export default function App() {
   useEffect(() => {
     void checkConnection()
   }, [checkConnection])
-
-  useEffect(() => {
-    if (phase.status !== 'connected') return
-    api
-      .uploadOptions()
-      .then(setOptions)
-      .catch((e) => console.warn('could not load upload options:', asAppError(e).message))
-  }, [phase.status])
 
   // The sidebar counts live here so they are the same whichever view is open.
   const refreshCounts = useCallback(async () => {
@@ -203,7 +193,7 @@ export default function App() {
       </aside>
 
       <main className="main">
-        {tab === 'folders' && <Folders options={options} onChanged={refreshCounts} />}
+        {tab === 'folders' && <Folders onChanged={refreshCounts} />}
         {tab === 'activity' && <Activity />}
         {tab === 'settings' && (
           <SettingsView

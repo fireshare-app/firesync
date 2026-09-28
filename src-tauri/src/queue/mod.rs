@@ -14,6 +14,7 @@ use crate::api::upload::{
 use crate::api::discovery::FolderRules;
 use crate::config::{AfterUpload, MediaKind, Settings};
 use crate::ledger::{Claim, Ledger};
+use crate::options::{OptionsCache, RULES_MAX_AGE};
 use crate::secrets::TokenCache;
 
 /// How long the loop waits when there is nothing due. Short enough that a clip
@@ -91,7 +92,7 @@ pub struct QueueDeps<F: Fn(UploadEvent) + Send + Sync + 'static> {
     pub settings: Arc<Mutex<Settings>>,
     pub control: Arc<QueueControl>,
     pub token: Arc<TokenCache>,
-    pub folder_rules: Arc<Mutex<FolderRules>>,
+    pub options: Arc<OptionsCache>,
     pub types: Arc<Mutex<rules::SupportedTypes>>,
     pub on_event: Arc<F>,
 }
@@ -159,7 +160,7 @@ where
             for claim in claims {
                 let ledger = deps.ledger.clone();
                 let settings = deps.settings.clone();
-                let folder_rules = deps.folder_rules.clone();
+                let options = deps.options.clone();
                 let control = deps.control.clone();
                 let on_event = deps.on_event.clone();
                 let base_url = base_url.clone();
@@ -176,7 +177,7 @@ where
                         control,
                         on_event,
                         ChunkPolicy::default(),
-                        folder_rules,
+                        options,
                         types,
                     )
                     .await;
@@ -352,7 +353,7 @@ async fn run_one<F>(
     control: Arc<QueueControl>,
     on_event: Arc<F>,
     policy: ChunkPolicy,
-    folder_rules: Arc<Mutex<FolderRules>>,
+    options: Arc<OptionsCache>,
     types: Arc<Mutex<rules::SupportedTypes>>,
 ) where
     F: Fn(UploadEvent) + Send + Sync + 'static,
@@ -367,20 +368,48 @@ async fn run_one<F>(
         return;
     }
 
-    let (meta, after_upload) = {
-        let settings = settings.lock().expect("settings mutex");
-        match settings.folders.iter().find(|f| f.id == claim.folder_id) {
-            Some(folder) => (
-                destination_for(folder, &folder_rules.lock().expect("folder rules mutex"), &path),
-                folder.after_upload,
-            ),
-            // The folder was removed while this file was in flight.
-            None => {
-                let _ = ledger.release(claim.id);
+    let folder = settings
+        .lock()
+        .expect("settings mutex")
+        .folders
+        .iter()
+        .find(|f| f.id == claim.folder_id)
+        .cloned();
+    let Some(folder) = folder else {
+        // The folder was removed while this file was in flight.
+        let _ = ledger.release(claim.id);
+        return;
+    };
+
+    // Filing by game needs Fireshare's word on where that game lives. Sending
+    // without it is how auto-sort used to lose a whole session's clips to the
+    // default folder, after one failed fetch at login. So a copy too old to
+    // trust is refreshed first, and having no copy at all waits, like any other
+    // failure to reach the server, rather than guessing.
+    let rules = if sorts_by_game(&folder) {
+        match options.rules_for_upload(base_url, token, RULES_MAX_AGE).await {
+            Ok(rules) => rules,
+            Err(e) if worth_waiting_for(&e) => {
+                let game = folder.game.as_deref().unwrap_or_default();
+                retry_later(
+                    &claim,
+                    &ledger,
+                    &on_event,
+                    &format!("Could not ask Fireshare which folder {game} uses. {e}"),
+                );
                 return;
             }
+            // Fireshare answered, just not usefully. Waiting will not change
+            // that, so file it as a folder with no rules, which is exactly what
+            // the explicit destination is for — and a rejected token then meets
+            // the upload's own 401 handling, which pauses everything.
+            Err(_) => FolderRules::default(),
         }
+    } else {
+        FolderRules::default()
     };
+    let meta = destination_for(&folder, &rules, &path);
+    let after_upload = folder.after_upload;
 
     let file_size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
 
@@ -620,19 +649,37 @@ async fn run_one<F>(
             emit(&on_event, &claim, "waiting", Some(&reason), None);
         }
 
-        Err(UploadError::Retryable(message)) => {
-            if retry::should_retry(claim.attempts) {
-                let wait = retry::backoff(claim.attempts);
-                let reason = retry::waiting_reason(&message, claim.attempts, wait);
-                let due = unix_now() + wait.as_secs() as i64;
-                let _ = ledger.reschedule(claim.id, &reason, due);
-                emit(&on_event, &claim, "waiting", Some(&reason), None);
-            } else {
-                let reason = format!("{message} Gave up after {} attempts.", retry::MAX_ATTEMPTS);
-                let _ = ledger.mark_failed(claim.id, &reason);
-                emit(&on_event, &claim, "failed", Some(&reason), None);
-            }
-        }
+        Err(UploadError::Retryable(message)) => retry_later(&claim, &ledger, &on_event, &message),
+    }
+}
+
+/// Whether this folder files its uploads by game, and so needs the rules.
+fn sorts_by_game(folder: &crate::config::WatchedFolder) -> bool {
+    folder.auto_sort_by_game && folder.game.as_deref().is_some_and(|g| !g.trim().is_empty())
+}
+
+/// Failures to get the rules that another try could fix: the server was not
+/// reachable, was busy, or broke. Anything else is Fireshare giving an answer.
+fn worth_waiting_for(e: &crate::error::AppError) -> bool {
+    use crate::error::AppError;
+    matches!(e, AppError::Unreachable(_) | AppError::Throttled(_) | AppError::Server(_))
+}
+
+/// Back in the queue with backoff, until the attempts run out.
+fn retry_later<F>(claim: &Claim, ledger: &Ledger, on_event: &Arc<F>, message: &str)
+where
+    F: Fn(UploadEvent) + Send + Sync + 'static,
+{
+    if retry::should_retry(claim.attempts) {
+        let wait = retry::backoff(claim.attempts);
+        let reason = retry::waiting_reason(message, claim.attempts, wait);
+        let due = unix_now() + wait.as_secs() as i64;
+        let _ = ledger.reschedule(claim.id, &reason, due);
+        emit(on_event, claim, "waiting", Some(&reason), None);
+    } else {
+        let reason = format!("{message} Gave up after {} attempts.", retry::MAX_ATTEMPTS);
+        let _ = ledger.mark_failed(claim.id, &reason);
+        emit(on_event, claim, "failed", Some(&reason), None);
     }
 }
 
@@ -891,7 +938,7 @@ pub(crate) mod tests {
             control,
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             ChunkPolicy::default(),
-            Arc::new(Mutex::new(Default::default())),
+            Arc::new(OptionsCache::new()),
             Arc::new(Mutex::new(types)),
         )
         .await;
@@ -1457,7 +1504,7 @@ mod chunked_tests {
             control,
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             tiny_policy(),
-            Arc::new(Mutex::new(Default::default())),
+            Arc::new(OptionsCache::new()),
             // No pre-flight: the fake server counts chunk requests, and an
             // exists check it does not understand would be counted as one.
             Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
@@ -1578,7 +1625,7 @@ mod chunked_tests {
             Arc::new(QueueControl::new()),
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             tiny_policy(),
-            Arc::new(Mutex::new(Default::default())),
+            Arc::new(OptionsCache::new()),
             // No pre-flight: the fake server counts chunk requests, and an
             // exists check it does not understand would be counted as one.
             Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
@@ -1612,7 +1659,7 @@ mod chunked_tests {
             Arc::new(QueueControl::new()),
             Arc::new(move |e: UploadEvent| events.lock().unwrap().push(e)),
             ChunkPolicy { threshold: 4096, size: 1024 },
-            Arc::new(Mutex::new(Default::default())),
+            Arc::new(OptionsCache::new()),
             Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
         )
         .await;
@@ -1648,7 +1695,7 @@ mod chunked_tests {
             // Threshold above the file, so it starts as a single request and
             // only reaches the chunked route by being refused.
             ChunkPolicy { threshold: 4096, size: 1024 },
-            Arc::new(Mutex::new(Default::default())),
+            Arc::new(OptionsCache::new()),
             Arc::new(Mutex::new(rules::SupportedTypes { video: vec![], image: vec![] })),
         )
         .await;
@@ -1776,5 +1823,113 @@ mod routing_tests {
         );
         assert_eq!(meta.folder.as_deref(), Some("uploads"));
         assert_eq!(meta.game.as_deref(), Some("VALORANT"));
+    }
+}
+
+#[cfg(test)]
+mod sorting_tests {
+    use super::tests::{fixture, read_request, run_against, state_of};
+    use super::*;
+    use crate::ledger::FileState;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    /// Answers each request in turn with the next of `answers`, and hands back
+    /// the body of every request it saw, in order.
+    fn serve_sequence(
+        answers: Vec<(u16, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for (status, body) in answers {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let seen = read_request(&mut stream).unwrap_or_default();
+                bodies.push(String::from_utf8_lossy(&seen).to_string());
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+            bodies
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn sorting_by_game(f: &tests::Fixture) {
+        f.settings.lock().unwrap().folders[0].auto_sort_by_game = true;
+    }
+
+    /// The value sent for one multipart field, if it was sent at all.
+    fn field<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+        let marker = format!("name=\"{name}\"");
+        let after = &body[body.find(&marker)? + marker.len()..];
+        after.split("\r\n").map(str::trim).find(|line| !line.is_empty())
+    }
+
+    /// The failure this fixes: with no rules, the clip used to go to the
+    /// folder's saved destination and be lost from its game's folder for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_sorted_clip_waits_rather_than_guessing_where_it_goes() {
+        let f = fixture();
+        sorting_by_game(&f);
+        let refused = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+
+        run_against(&f, &refused, Arc::new(QueueControl::new())).await;
+
+        assert_eq!(state_of(&f), FileState::Queued, "it should be waiting to try again");
+        let row = f.ledger.recent(10).unwrap().into_iter().find(|r| r.id == f.claim.id).unwrap();
+        let reason = row.reason.unwrap_or_default();
+        assert!(reason.contains("which folder VALORANT uses"), "unexpected reason: {reason}");
+        assert_eq!(row.attempts, 1, "a server that cannot be reached costs an attempt, as usual");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auto_sorted_clip_asks_for_the_rules_it_does_not_have() {
+        let f = fixture();
+        sorting_by_game(&f);
+        let (url, server) = serve_sequence(vec![
+            (
+                200,
+                r#"{"default_folder":"uploads","folders":{"video":["uploads","valorant"],"image":[]},
+                    "games":[{"id":1,"name":"VALORANT"}],
+                    "folder_rules":{"video":[{"folder":"valorant","game_id":1,"game":"VALORANT"}],"image":[]}}"#,
+            ),
+            (201, r#"{"status":"accepted","media_type":"video","filename":"clip.mp4","folder":"valorant"}"#),
+        ]);
+
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2, "one request for the rules, then the upload");
+        assert_eq!(field(&bodies[1], "folder"), Some("valorant"));
+        assert_eq!(field(&bodies[1], "game"), None, "the folder does the tagging");
+        assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A folder that is not sorted by game never needed the rules, so an
+    /// unreachable options route must not hold it up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_that_does_not_sort_never_asks() {
+        let f = fixture();
+        let (url, server) = serve_sequence(vec![(
+            201,
+            r#"{"status":"accepted","media_type":"video","filename":"clip.mp4","folder":"clips"}"#,
+        )]);
+
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+
+        let bodies = server.join().unwrap();
+        assert_eq!(field(&bodies[0], "folder"), Some("clips"));
+        assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 }

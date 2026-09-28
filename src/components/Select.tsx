@@ -7,6 +7,15 @@ export interface Option {
   note?: string
 }
 
+/** A line under the open list, about the list itself. */
+export interface SelectStatus {
+  text: string
+  /** `busy` spins while something is being checked; `warn` is a problem. */
+  tone?: 'busy' | 'warn'
+  /** The full story, for the tooltip, when `text` is the short version. */
+  detail?: string
+}
+
 interface Props {
   value: string
   options: Option[]
@@ -16,6 +25,13 @@ interface Props {
   mono?: boolean
   /** Offer a free-text entry as the last item, for a name that does not exist yet. */
   customLabel?: string
+  /**
+   * Called as the list opens, for a caller that wants to fetch a fresher one.
+   * The list opens on what it already has either way; nothing waits on this.
+   */
+  onOpen?: () => void
+  /** Shown under the list while it is open. */
+  status?: SelectStatus | null
 }
 
 /**
@@ -35,9 +51,15 @@ export function Select({
   placeholder = 'Select…',
   mono = false,
   customLabel,
+  onOpen,
+  status,
 }: Props) {
   const [open, setOpen] = useState(false)
-  const [active, setActive] = useState(0)
+  // The highlighted option, by value rather than position. A list that
+  // refreshes while open can gain an entry above it, and an index would then
+  // quietly point at a different option from the one somebody was about to
+  // pick.
+  const [activeValue, setActiveValue] = useState<string | null>(null)
   const [custom, setCustom] = useState(false)
   const [draft, setDraft] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
@@ -58,16 +80,24 @@ export function Select({
     return () => document.removeEventListener('mousedown', onPointer)
   }, [open])
 
-  useEffect(() => {
-    if (!open) return
-    const index = options.findIndex((o) => o.value === value)
-    setActive(index >= 0 ? index : 0)
-  }, [open, options, value])
+  const found = options.findIndex((o) => o.value === activeValue)
+  const active = found >= 0 ? found : 0
 
   useEffect(() => {
     if (!open) return
     listRef.current?.children[active]?.scrollIntoView({ block: 'nearest' })
   }, [open, active])
+
+  function openList() {
+    setActiveValue(selected ? value : (options[0]?.value ?? null))
+    setOpen(true)
+    onOpen?.()
+  }
+
+  function moveTo(index: number) {
+    const option = options[Math.max(0, Math.min(options.length - 1, index))]
+    if (option) setActiveValue(option.value)
+  }
 
   function choose(next: string) {
     onChange(next)
@@ -79,7 +109,7 @@ export function Select({
     if (!open) {
       if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown') {
         e.preventDefault()
-        setOpen(true)
+        openList()
       }
       return
     }
@@ -90,19 +120,19 @@ export function Select({
         break
       case 'ArrowDown':
         e.preventDefault()
-        setActive((i) => Math.min(options.length - 1, i + 1))
+        moveTo(active + 1)
         break
       case 'ArrowUp':
         e.preventDefault()
-        setActive((i) => Math.max(0, i - 1))
+        moveTo(active - 1)
         break
       case 'Home':
         e.preventDefault()
-        setActive(0)
+        moveTo(0)
         break
       case 'End':
         e.preventDefault()
-        setActive(options.length - 1)
+        moveTo(options.length - 1)
         break
       case 'Enter':
       case ' ':
@@ -121,7 +151,7 @@ export function Select({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? listId : undefined}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => (open ? setOpen(false) : openList())}
         onKeyDown={onKeyDown}
       >
         <span className={`sel__label ${!selected && !value ? 'sel__label--empty' : ''}`}>
@@ -150,7 +180,7 @@ export function Select({
                 className={`sel__option ${i === active ? 'sel__option--active' : ''} ${
                   o.value === value ? 'sel__option--on' : ''
                 }`}
-                onMouseEnter={() => setActive(i)}
+                onMouseEnter={() => setActiveValue(o.value)}
                 onMouseDown={(e) => {
                   e.preventDefault()
                   choose(o.value)
@@ -161,6 +191,17 @@ export function Select({
               </li>
             ))}
           </ul>
+
+          {status && (
+            <div
+              className={`sel__status ${status.tone === 'warn' ? 'sel__status--warn' : ''}`}
+              role="status"
+              title={status.detail}
+            >
+              {status.tone === 'busy' && <span className="spin" aria-hidden="true" />}
+              {status.text}
+            </div>
+          )}
 
           {customLabel &&
             (custom ? (

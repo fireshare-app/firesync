@@ -6,7 +6,7 @@ use serde::Serialize;
 /// messages are deliberately specific: "request failed" tells somebody setting
 /// this up nothing about whether they typed the URL wrong, pasted a dead token,
 /// or pointed it at a Fireshare too old to have the endpoint at all.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AppError {
     #[error("{0}")]
     BadUrl(String),
