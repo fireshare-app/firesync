@@ -99,6 +99,29 @@ export type MediaKind = 'video' | 'image'
 /** What happens to the local file once the server confirms it has it. */
 export type AfterUpload = 'keep' | 'trash' | 'delete'
 
+/** A subfolder's game, chosen by hand. `game` null: sent without a game. */
+export interface SubfolderGame {
+  subfolder: string
+  game: string | null
+}
+
+/**
+ * How a subfolder's game was settled on: chosen in the settings, matched by
+ * its name, chosen to have none, or neither — in which case its clips wait.
+ */
+export type SubfolderHow = 'chosen' | 'matched' | 'none' | 'unmatched'
+
+export interface SubfolderStatus {
+  name: string
+  /** The game its clips are sent as, when that is settled. */
+  game: string | null
+  how: SubfolderHow
+  /** What matching by name gives, whatever was chosen. */
+  matched: string | null
+  /** Still on disk. A choice for a subfolder that has gone is kept and shown. */
+  present: boolean
+}
+
 export interface WatchedFolder {
   id: string
   path: string
@@ -111,6 +134,9 @@ export interface WatchedFolder {
   max_size_bytes: number | null
   after_upload: AfterUpload
   auto_sort_by_game: boolean
+  /** Each clip's game comes from the subfolder it is in. Implies subfolders. */
+  game_from_subfolder: boolean
+  subfolder_games: SubfolderGame[]
   /** e.g. `{game} — {date}`. Null keeps the file name as the title. */
   title_template: string | null
   tag_ids: number[]
@@ -206,6 +232,8 @@ export interface FolderSummary extends WatchedFolder {
   scannedEvery: number | null
   /** Whether it is on a network drive, for the dialog to explain "automatically". */
   network: boolean
+  /** Each subfolder and its game, for a folder that keeps one per game. Empty otherwise. */
+  subfolders: SubfolderStatus[]
 }
 
 export interface FolderRules {
@@ -217,6 +245,8 @@ export interface FolderRules {
   maxSizeBytes?: number | null
   afterUpload?: AfterUpload
   autoSortByGame?: boolean
+  gameFromSubfolder?: boolean
+  subfolderGames?: SubfolderGame[]
   titleTemplate?: string | null
   tagIds?: number[]
   watchMode?: WatchMode
@@ -255,8 +285,29 @@ export const folders = {
     invoke<void>('set_folder_after_upload', { id, afterUpload }),
   update: (id: string, rules: FolderRules) => invoke<void>('update_folder', { id, rules }),
   detectNetwork: (path: string) => invoke<boolean>('detect_network', { path }),
-  previewTitle: (template: string, path: string, game: string | null, includeSubfolders: boolean) =>
-    invoke<TitlePreview>('preview_title', { template, path, game, includeSubfolders }),
+  /**
+   * The subfolders of a folder, added or not, each with the game it would send
+   * its clips as given these choices. The core does the matching, the same
+   * way it does for an upload, so this cannot disagree with what is sent.
+   */
+  listSubfolders: (path: string, subfolderGames: SubfolderGame[]) =>
+    invoke<SubfolderStatus[]>('list_subfolders', { path, subfolderGames }),
+  previewTitle: (
+    template: string,
+    path: string,
+    game: string | null,
+    includeSubfolders: boolean,
+    gameFromSubfolder: boolean,
+    subfolderGames: SubfolderGame[],
+  ) =>
+    invoke<TitlePreview>('preview_title', {
+      template,
+      path,
+      game,
+      includeSubfolders,
+      gameFromSubfolder,
+      subfolderGames,
+    }),
   uploadExisting: (folderId: string, paths: string[]) =>
     invoke<number>('upload_existing', { folderId, paths }),
 }

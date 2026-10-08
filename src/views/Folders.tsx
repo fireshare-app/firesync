@@ -45,6 +45,21 @@ function countOf(folder: FolderSummary, state: string) {
   return folder.counts.find(([s]) => s === state)?.[1] ?? 0
 }
 
+/** The game chip for a folder that keeps one subfolder per game. */
+function gamesChip(folder: FolderSummary) {
+  const named = folder.subfolders.filter((s) => s.game).length
+  if (named === 0) return 'Games from subfolders'
+  return `${named} game${named === 1 ? '' : 's'} from subfolders`
+}
+
+/** "A", "A and B", "A, B and C", "A, B, C and 2 more". */
+function listed(names: string[]) {
+  const shown = names.slice(0, 3)
+  const more = names.length - shown.length
+  const tail = more > 0 ? `${more} more` : shown.pop()
+  return shown.length ? `${shown.join(', ')} and ${tail}` : tail
+}
+
 function sizeRule(folder: FolderSummary) {
   const min = folder.min_size_bytes
   const max = folder.max_size_bytes
@@ -169,6 +184,7 @@ export function Folders({ onChanged }: Props) {
           // Enabled, but its path is not there: a drive unplugged, a share
           // down. Said on the card it belongs to rather than across the page.
           const away = folder.availability === 'unavailable'
+          const unmatched = folder.subfolders.filter((s) => s.how === 'unmatched' && s.present)
           return (
             <article
               key={folder.id}
@@ -229,7 +245,11 @@ export function Folders({ onChanged }: Props) {
 
               <div className="chips chips--tight">
                 {folder.dest_folder && <span className="tag mono">{folder.dest_folder}</span>}
-                {folder.game && <span className="tag tag--game">{folder.game}</span>}
+                {folder.game_from_subfolder ? (
+                  <span className="tag tag--game">{gamesChip(folder)}</span>
+                ) : (
+                  folder.game && <span className="tag tag--game">{folder.game}</span>
+                )}
                 <span className="tag">
                   {folder.media.includes('image') && folder.media.includes('video')
                     ? 'Video + images'
@@ -238,7 +258,9 @@ export function Folders({ onChanged }: Props) {
                       : 'Video only'}
                 </span>
                 {sizeRule(folder) && <span className="tag">{sizeRule(folder)}</span>}
-                {folder.include_subfolders && <span className="tag">Subfolders</span>}
+                {folder.include_subfolders && !folder.game_from_subfolder && (
+                  <span className="tag">Subfolders</span>
+                )}
                 {folder.scannedEvery && (
                   <span className="tag" title="On a network drive, or set to scan: listed on a timer rather than watched">
                     Checked every {folder.scannedEvery} s
@@ -290,6 +312,20 @@ export function Folders({ onChanged }: Props) {
                   </span>
                 </div>
               ) : null}
+
+              {!away && unmatched.length > 0 && (
+                <div className="fcard__warn">
+                  <WarningTriangleIcon />
+                  <span>
+                    No game in your library is named like {listed(unmatched.map((s) => s.name))}.
+                    Clips from {unmatched.length === 1 ? 'it' : 'them'} wait until you choose one.
+                  </span>
+                  <span className="spacer" />
+                  <button type="button" className="linkbtn" onClick={() => setEditing(folder)}>
+                    Choose
+                  </button>
+                </div>
+              )}
 
               {folder.held > 0 && (
                 <div className="fcard__held">

@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod diagnostics;
 mod error;
+mod games;
 mod ledger;
 mod logging;
 mod notify;
@@ -99,9 +100,14 @@ pub fn run() {
 
             // Every refresh reaches whichever windows are open, whoever asked
             // for it — a dialog shows the game the queue's refresh just found.
+            // It reaches the queue too: a clip waiting because its subfolder
+            // named no game goes on its own once that game is in the library.
             let options_handle = app.handle().clone();
             app.state::<AppState>().options.on_change(move |snapshot| {
                 let _ = options_handle.emit("firesync://options", snapshot);
+                if snapshot.options.is_some() {
+                    options_handle.state::<AppState>().release_unmatched(snapshot.options.as_ref());
+                }
             });
             options::spawn_refresh_loop(app.handle().clone());
 
@@ -211,6 +217,7 @@ pub fn run() {
             commands::activity_page,
             commands::recent_links,
             commands::detect_network,
+            commands::list_subfolders,
             commands::preview_title,
             commands::retry_file,
             commands::skip_file,

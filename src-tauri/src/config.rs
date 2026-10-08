@@ -81,6 +81,18 @@ pub struct WatchedFolder {
     /// its own, since a guess would be worse than the explicit choice.
     #[serde(default = "default_true")]
     pub auto_sort_by_game: bool,
+    /// Take each file's game from the name of the subfolder it is in, rather
+    /// than from `game`. For a recorder that keeps one subfolder per game,
+    /// which is most of them: watching the folder above them as one means a
+    /// game played for the first time needs nothing added here. Implies
+    /// `include_subfolders`.
+    #[serde(default)]
+    pub game_from_subfolder: bool,
+    /// Subfolders whose game was chosen by hand, for when the name alone
+    /// would pick the wrong game or none. Everything else is matched by name;
+    /// see `games`.
+    #[serde(default)]
+    pub subfolder_games: Vec<SubfolderGame>,
     /// How uploads from this folder are titled, e.g. `{game} — {date}`. None
     /// leaves it to Fireshare, which uses the file name. See `titles`.
     #[serde(default)]
@@ -92,6 +104,18 @@ pub struct WatchedFolder {
     pub tag_ids: Vec<i64>,
     #[serde(default)]
     pub watch_mode: WatchMode,
+}
+
+/// A subfolder's game, chosen by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubfolderGame {
+    /// The subfolder's name, as it is on disk. Matched without regard to case,
+    /// since Windows does not regard it either.
+    pub subfolder: String,
+    /// None: its files are sent without a game. Not the same as leaving the
+    /// subfolder out of this list, which matches it by name.
+    #[serde(default)]
+    pub game: Option<String>,
 }
 
 /// How a folder learns that a file has arrived.
@@ -322,6 +346,43 @@ mod tests {
         assert_eq!(settings.server_url.as_deref(), Some("https://f.example"));
         assert!(!settings.updates.auto_install);
         assert_eq!(settings.folders.len(), 1);
+        assert!(!settings.folders[0].game_from_subfolder, "a folder from before is one game");
+        assert!(settings.folders[0].subfolder_games.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A choice of "no game" and a subfolder left to match by name are
+    /// different things, and both have to survive the round trip.
+    #[test]
+    fn a_subfolder_s_chosen_game_and_a_chosen_no_game_both_survive_saving() {
+        let dir = std::env::temp_dir().join(format!("firesync-config-{}", uuid::Uuid::new_v4()));
+        let mut settings = Settings::default();
+        settings.folders.push(WatchedFolder {
+            id: "f1".into(),
+            path: PathBuf::from("/w"),
+            enabled: true,
+            include_subfolders: true,
+            media: vec![MediaKind::Video],
+            dest_folder: None,
+            game: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            after_upload: AfterUpload::Keep,
+            auto_sort_by_game: true,
+            game_from_subfolder: true,
+            subfolder_games: vec![
+                SubfolderGame { subfolder: "cs2".into(), game: Some("Counter-Strike 2".into()) },
+                SubfolderGame { subfolder: "Desktop".into(), game: None },
+            ],
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: WatchMode::Auto,
+        });
+        save(&dir, &settings).unwrap();
+
+        let back = load(&dir);
+        assert!(back.folders[0].game_from_subfolder);
+        assert_eq!(back.folders[0].subfolder_games, settings.folders[0].subfolder_games);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -234,6 +234,8 @@ mod tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: false,
+            game_from_subfolder: false,
+            subfolder_games: Vec::new(),
             title_template: None,
             tag_ids: Vec::new(),
             watch_mode: crate::config::WatchMode::Auto,

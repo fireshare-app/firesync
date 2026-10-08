@@ -8,6 +8,8 @@ import {
   type AfterUpload,
   type FolderSummary,
   type MediaKind,
+  type SubfolderGame,
+  type SubfolderStatus,
   type TitlePreview,
   type WatchMode,
 } from '../lib/ipc'
@@ -39,6 +41,18 @@ function stem(name: string) {
   return dot > 0 ? name.slice(0, dot) : name
 }
 
+/** The two choices for a subfolder that are not a game. */
+const MATCH_BY_NAME = 'auto'
+const NO_GAME = 'none'
+const GAME = 'game:'
+
+/** What a subfolder's row shows selected: the choice made for it, or none. */
+function choiceValue(s: SubfolderStatus) {
+  if (s.how === 'chosen' && s.game) return GAME + s.game
+  if (s.how === 'none') return NO_GAME
+  return MATCH_BY_NAME
+}
+
 interface Props {
   /** Editing an existing folder, or undefined when adding one. */
   folder?: FolderSummary
@@ -61,6 +75,9 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
 
   const [path, setPath] = useState(folder?.path ?? '')
   const [subfolders, setSubfolders] = useState(folder?.include_subfolders ?? false)
+  const [perGame, setPerGame] = useState(folder?.game_from_subfolder ?? false)
+  const [choices, setChoices] = useState<SubfolderGame[]>(folder?.subfolder_games ?? [])
+  const [gameFolders, setGameFolders] = useState<SubfolderStatus[]>(folder?.subfolders ?? [])
   const [video, setVideo] = useState(folder ? folder.media.includes('video') : true)
   const [images, setImages] = useState(folder?.media.includes('image') ?? false)
   const [dest, setDest] = useState(folder?.dest_folder ?? options?.default_folder ?? '')
@@ -96,12 +113,49 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
     }
     const t = setTimeout(() => {
       foldersApi
-        .previewTitle(template, path, game.trim() || null, subfolders)
+        .previewTitle(template, path, game.trim() || null, subfolders, perGame, choices)
         .then(setPreview)
         .catch(() => setPreview(null))
     }, 250)
     return () => clearTimeout(t)
-  }, [template, path, game, subfolders])
+  }, [template, path, game, subfolders, perGame, choices])
+
+  // What each subfolder would send its clips as, from the core, which does
+  // the same matching for uploads — so what this shows is what saving means.
+  // Asked again as the path, the choices, or the library changes.
+  const fetchedAt = fresh.fetchedAt
+  useEffect(() => {
+    if (!perGame || !path.trim()) {
+      setGameFolders([])
+      return
+    }
+    let live = true
+    const t = setTimeout(() => {
+      foldersApi
+        .listSubfolders(path.trim(), choices)
+        .then((list) => live && setGameFolders(list))
+        .catch(() => live && setGameFolders([]))
+    }, 200)
+    return () => {
+      live = false
+      clearTimeout(t)
+    }
+  }, [perGame, path, choices, fetchedAt])
+
+  /** Record what a subfolder's row was set to. "Match by name" is no record. */
+  function choose(subfolder: string, value: string) {
+    setChoices((prev) => {
+      const rest = prev.filter((c) => c.subfolder.toLowerCase() !== subfolder.toLowerCase())
+      if (value === MATCH_BY_NAME) return rest
+      return [...rest, { subfolder, game: value === NO_GAME ? null : value.slice(GAME.length) }]
+    })
+  }
+
+  /** Whether a game a folder names is still in the library, on a list fresh enough to say. */
+  function inLibrary(name: string | null) {
+    if (!name || !options || fresh.checking || fresh.error) return true
+    return options.games.some((g) => g.name.toLowerCase() === name.toLowerCase())
+  }
 
   // For a folder being added: whether "automatically" would mean scanning.
   useEffect(() => {
@@ -158,13 +212,7 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
   // A game renamed or deleted in Fireshare. Only said on a list this dialog
   // can trust — just fetched, not mid-check and not a failed refresh — because
   // a stale list would miss a game added since and warn about nothing.
-  const gameGone = Boolean(
-    game &&
-      options &&
-      !fresh.checking &&
-      !fresh.error &&
-      !options.games.some((g) => g.name.toLowerCase() === game.toLowerCase()),
-  )
+  const gameGone = !perGame && Boolean(game) && !inLibrary(game)
 
   async function browse() {
     setError(null)
@@ -186,7 +234,7 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
       ...(images ? (['image'] as MediaKind[]) : []),
     ]
     const rules = {
-      includeSubfolders: subfolders,
+      includeSubfolders: subfolders || perGame,
       media,
       destFolder: dest.trim() || null,
       game: game.trim() || null,
@@ -194,6 +242,9 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
       maxSizeBytes: parseLimit(maxGb, GB),
       afterUpload: after,
       autoSortByGame: autoSort,
+      gameFromSubfolder: perGame,
+      // Kept even when the mode is off, so turning it back on finds them.
+      subfolderGames: choices,
       titleTemplate: template.trim() || null,
       tagIds,
       watchMode,
@@ -262,11 +313,29 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
               <input
                 id="fd-sub"
                 type="checkbox"
-                checked={subfolders}
+                checked={subfolders || perGame}
+                disabled={perGame}
                 onChange={(e) => setSubfolders(e.target.checked)}
               />
               Watch subfolders too
             </label>
+            <label className="inline-check" htmlFor="fd-pergame">
+              <input
+                id="fd-pergame"
+                type="checkbox"
+                checked={perGame}
+                onChange={(e) => setPerGame(e.target.checked)}
+              />
+              Each subfolder is a game
+            </label>
+            {perGame && (
+              <span className="field__hint">
+                For a recorder that keeps a folder per game, such as Segra or ShadowPlay. Each clip
+                is tagged with the game named like the folder it&rsquo;s in, and a game you play for
+                the first time needs nothing added here. Choose the game yourself for any folder
+                that&rsquo;s spelled differently, below.
+              </span>
+            )}
           </div>
 
           <div className="field">
@@ -297,7 +366,9 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
               <label className="field__label" htmlFor="fd-dest">
                 Fireshare folder
               </label>
-              {autoSort ? (
+              {autoSort && perGame ? (
+                <p className="field__fixed">By game</p>
+              ) : autoSort ? (
                 <p className="field__fixed mono">
                   {sortedInto ?? options?.default_folder ?? 'uploads'}
                 </p>
@@ -315,20 +386,29 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
                 />
               )}
               <span className="field__hint">
-                {autoSort
-                  ? sortedInto
-                    ? `Chosen by the game. Fireshare keeps ${game} here.`
-                    : game
-                      ? `${game} has no folder of its own yet, so uploads use the default.`
-                      : 'Pick a game, or turn auto-sort off to choose a folder.'
-                  : 'One level only — a slash becomes a dash on the server.'}
+                {autoSort && perGame
+                  ? `Each clip goes to the folder Fireshare keeps for its game. One whose game has no folder of its own goes to ${dest.trim() || options?.default_folder || 'uploads'}.`
+                  : autoSort
+                    ? sortedInto
+                      ? `Chosen by the game. Fireshare keeps ${game} here.`
+                      : game
+                        ? `${game} has no folder of its own yet, so uploads use the default.`
+                        : 'Pick a game, or turn auto-sort off to choose a folder.'
+                    : 'One level only — a slash becomes a dash on the server.'}
               </span>
             </div>
 
             <div className="field">
               <label className="field__label" htmlFor="fd-game">
-                Game <span className="field__optional">(optional)</span>
+                Game {!perGame && <span className="field__optional">(optional)</span>}
               </label>
+              {perGame ? (
+                <>
+                  <p className="field__fixed">From each subfolder&rsquo;s name</p>
+                  <span className="field__hint">Matched against your library, or chosen below.</span>
+                </>
+              ) : (
+                <>
               <Select
                 id="fd-game"
                 value={game}
@@ -354,6 +434,8 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
                     : 'Connect to load your library’s games.'}
                 </span>
               )}
+                </>
+              )}
               <label className="inline-check" htmlFor="fd-autosort">
                 <input
                   id="fd-autosort"
@@ -365,6 +447,64 @@ export function FolderDialog({ folder, onClose, onSaved }: Props) {
               </label>
             </div>
           </div>
+
+          {perGame && (
+            <div className="field">
+              <span className="field__label">Games by subfolder</span>
+              {gameFolders.length === 0 ? (
+                <span className="field__hint">
+                  {path.trim()
+                    ? 'No subfolders here yet. Each one that appears is matched by its name.'
+                    : 'Choose the folder above to see its subfolders.'}
+                </span>
+              ) : (
+                <div className="submap">
+                  {gameFolders.map((s) => {
+                    const chosenGone = s.how === 'chosen' && !inLibrary(s.game)
+                    const games = options?.games ?? []
+                    return (
+                      <div key={s.name} className="submap__row">
+                        <span className="submap__name">
+                          <span className="mono">{s.name}</span>
+                          {!s.present && <span className="submap__gone">not here any more</span>}
+                        </span>
+                        <Select
+                          value={choiceValue(s)}
+                          options={[
+                            { value: MATCH_BY_NAME, label: 'Match by name', note: s.matched ?? 'no match' },
+                            { value: NO_GAME, label: 'No game' },
+                            ...games.map((g) => ({ value: GAME + g.name, label: g.name })),
+                            // A game chosen here but gone from the library still
+                            // reads as itself rather than as nothing.
+                            ...(chosenGone && s.game ? [{ value: GAME + s.game, label: s.game }] : []),
+                          ]}
+                          onChange={(v) => choose(s.name, v)}
+                          onOpen={() => void refresh()}
+                          status={listStatus}
+                        />
+                        {s.how === 'unmatched' && (
+                          <span className="field__warn submap__note">
+                            Nothing in your library is named like this, so its clips wait. Choose a
+                            game, or add one in Fireshare.
+                          </span>
+                        )}
+                        {chosenGone && (
+                          <span className="field__warn submap__note">
+                            {s.game} isn&rsquo;t in your library any more, so uploads from here would
+                            be refused.
+                          </span>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+              <span className="field__hint">
+                A subfolder named like nothing in your library holds its clips back until you choose
+                a game for it or add one in Fireshare; they go on their own once you do.
+              </span>
+            </div>
+          )}
 
           <div className="field">
             <label className="field__label" htmlFor="fd-title">

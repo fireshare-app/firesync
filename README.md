@@ -56,6 +56,12 @@ Each folder gets its own rules — which Fireshare folder things land in, which 
 with, what they are titled, which tags they get, a minimum and maximum size, and whether it takes
 videos, images or both. Tags need a Fireshare recent enough to offer them to upload tokens.
 
+If your recorder keeps a subfolder for each game — Segra and ShadowPlay both do — watch the folder
+above them and turn on **Each subfolder is a game**. Every clip is tagged with the game named like
+its subfolder, matched against your library, and a game you play for the first time needs nothing
+added in Firesync. For a subfolder spelled differently from the game in Fireshare, pick the game
+yourself in the folder's settings; until you do, its clips wait rather than being filed wrong.
+
 ![The folder settings, showing the game, a title template with its preview, and tags](docs/screenshots/folder-rules.png)
 
 > **Files already in the folder are left alone.** When you add a folder, whatever is in it is

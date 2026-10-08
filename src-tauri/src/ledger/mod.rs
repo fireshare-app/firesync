@@ -609,6 +609,27 @@ impl Ledger {
         .map_err(db_err)
     }
 
+    /// A folder's failed files whose reason begins with `prefix`: the ones a
+    /// particular kind of failure left behind, to be found again once what
+    /// caused it has changed. `prefix` is taken literally, so a caller's `%`
+    /// or `_` would need escaping; none passes one.
+    pub fn failed_for_reason(&self, folder_id: &str, prefix: &str) -> Result<Vec<FileRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {ROW_COLUMNS} FROM files
+                  WHERE folder_id = ?1 AND state = 'failed' AND reason LIKE ?2 || '%'
+                  ORDER BY id"
+            ))
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![folder_id, prefix], file_row)
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
     /// Clear the backoff on everything that failed, so "Retry failed" means now.
     pub fn retry_failed(&self) -> Result<usize> {
         let conn = self.lock();
