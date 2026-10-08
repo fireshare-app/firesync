@@ -215,7 +215,9 @@ fn folder_line(folder: &WatchedFolder) -> String {
         }
         .into(),
     );
-    if let Some(game) = &folder.game {
+    if folder.game_from_subfolder {
+        parts.push(format!("game from subfolder ({} chosen)", folder.subfolder_games.len()));
+    } else if let Some(game) = &folder.game {
         parts.push(format!("game {game}"));
     }
     if folder.auto_sort_by_game {
@@ -404,6 +406,8 @@ mod tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Trash,
             auto_sort_by_game: true,
+            game_from_subfolder: false,
+            subfolder_games: Vec::new(),
             title_template: None,
             tag_ids: Vec::new(),
             watch_mode: crate::config::WatchMode::Auto,

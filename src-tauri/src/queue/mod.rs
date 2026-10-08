@@ -13,6 +13,7 @@ use crate::api::upload::{
 };
 use crate::api::discovery::FolderRules;
 use crate::config::{AfterUpload, MediaKind, Settings};
+use crate::games::{self, How};
 use crate::ledger::{ChunkState, Claim, Ledger};
 use crate::options::{OptionsCache, RULES_MAX_AGE};
 use crate::secrets::TokenCache;
@@ -370,6 +371,60 @@ async fn idle(running: &mut tokio::task::JoinSet<()>) {
     }
 }
 
+/// The game one file is sent as.
+enum Picked {
+    /// Settled, including on no game at all.
+    Game(Option<String>),
+    /// Not settled yet for a reason another try could fix: the library could
+    /// not be asked which games it has.
+    Wait(String),
+    /// Not settled, and no try will change that: the subfolder names no game
+    /// the library has, and nobody has chosen one for it.
+    Unmatched(String),
+}
+
+/// The game for this file: the folder's, or — in a folder that keeps one
+/// subfolder per game — its subfolder's, decided afresh for every upload so a
+/// choice made since it was queued applies.
+///
+/// A choice made by hand needs nothing from the server. Matching by name needs
+/// the library's list, which is asked for the way the folder rules are: a copy
+/// too old to trust is refreshed first, and no copy at all means waiting
+/// rather than sending the clip without the game it would have had.
+async fn pick_game(
+    folder: &crate::config::WatchedFolder,
+    path: &std::path::Path,
+    options: &OptionsCache,
+    base_url: &str,
+    token: &str,
+) -> Picked {
+    if !folder.game_from_subfolder {
+        return Picked::Game(folder.game.clone());
+    }
+    // In the root itself, where no subfolder says what it is.
+    let Some(subfolder) = games::subfolder_of(&folder.path, path) else {
+        return Picked::Game(None);
+    };
+    let by_choice = games::resolve(folder, &subfolder, None);
+    if by_choice.settled() {
+        return Picked::Game(by_choice.game);
+    }
+    let library = match options.fresh(base_url, token, RULES_MAX_AGE).await {
+        Ok(library) => library,
+        Err(e) => {
+            return Picked::Wait(format!(
+                "Could not ask Fireshare which games it has, to find the one for the folder \
+                 \"{subfolder}\". {e}"
+            ))
+        }
+    };
+    let resolved = games::resolve(folder, &subfolder, Some(&library));
+    match resolved.how {
+        How::Unmatched => Picked::Unmatched(games::unmatched_reason(&subfolder)),
+        _ => Picked::Game(resolved.game),
+    }
+}
+
 /// Where an upload goes, and what it says about itself.
 ///
 /// With auto-sort on, the file is filed in whichever folder Fireshare already
@@ -384,11 +439,12 @@ async fn idle(running: &mut tokio::task::JoinSet<()>) {
 /// somebody already made.
 fn destination_for(
     folder: &crate::config::WatchedFolder,
+    game: Option<&str>,
     rules: &FolderRules,
     path: &std::path::Path,
 ) -> UploadMeta {
     if folder.auto_sort_by_game {
-        if let Some(game) = folder.game.as_deref().filter(|g| !g.trim().is_empty()) {
+        if let Some(game) = game.filter(|g| !g.trim().is_empty()) {
             let is_image = path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -411,7 +467,7 @@ fn destination_for(
 
     UploadMeta {
         folder: folder.dest_folder.clone(),
-        game: folder.game.clone(),
+        game: game.map(str::to_string),
         ..UploadMeta::default()
     }
 }
@@ -575,16 +631,34 @@ async fn run_one<F>(
         return;
     };
 
+    let game = match pick_game(&folder, &path, &options, base_url, token).await {
+        Picked::Game(game) => game,
+        Picked::Wait(message) => {
+            retry_later(&claim, &ledger, &on_event, &message);
+            return;
+        }
+        // Nothing to send it as, and no guess worth making. It is marked as
+        // needing attention rather than retried: the next try would find the
+        // same library, and what changes that — a game added there, or a
+        // choice made in the folder's settings — puts it back itself.
+        Picked::Unmatched(reason) => {
+            log::warn!("#{} waiting: {reason}", claim.id);
+            let _ = ledger.mark_failed(claim.id, &reason);
+            emit(&on_event, &claim, "failed", Some(&reason), None);
+            return;
+        }
+    };
+
     // Filing by game needs Fireshare's word on where that game lives. Sending
     // without it is how auto-sort used to lose a whole session's clips to the
     // default folder, after one failed fetch at login. So a copy too old to
     // trust is refreshed first, and having no copy at all waits, like any other
     // failure to reach the server, rather than guessing.
-    let rules = if sorts_by_game(&folder) {
+    let rules = if sorts_by_game(&folder, game.as_deref()) {
         match options.rules_for_upload(base_url, token, RULES_MAX_AGE).await {
             Ok(rules) => rules,
             Err(e) if worth_waiting_for(&e) => {
-                let game = folder.game.as_deref().unwrap_or_default();
+                let game = game.as_deref().unwrap_or_default();
                 retry_later(
                     &claim,
                     &ledger,
@@ -602,10 +676,10 @@ async fn run_one<F>(
     } else {
         FolderRules::default()
     };
-    let mut meta = destination_for(&folder, &rules, &path);
+    let mut meta = destination_for(&folder, game.as_deref(), &rules, &path);
     meta.title = crate::titles::for_file(
         folder.title_template.as_deref(),
-        folder.game.as_deref(),
+        game.as_deref(),
         &folder.path,
         &path,
     );
@@ -929,9 +1003,9 @@ async fn tags_to_send(
     kept
 }
 
-/// Whether this folder files its uploads by game, and so needs the rules.
-fn sorts_by_game(folder: &crate::config::WatchedFolder) -> bool {
-    folder.auto_sort_by_game && folder.game.as_deref().is_some_and(|g| !g.trim().is_empty())
+/// Whether this upload is filed by its game, and so needs the rules.
+fn sorts_by_game(folder: &crate::config::WatchedFolder, game: Option<&str>) -> bool {
+    folder.auto_sort_by_game && game.is_some_and(|g| !g.trim().is_empty())
 }
 
 /// Failures to get the rules that another try could fix: the server was not
@@ -1167,6 +1241,8 @@ pub(crate) mod tests {
             max_size_bytes: None,
             after_upload,
             auto_sort_by_game: false,
+            game_from_subfolder: false,
+            subfolder_games: Vec::new(),
             title_template: None,
             tag_ids: Vec::new(),
             watch_mode: crate::config::WatchMode::Auto,
@@ -2061,6 +2137,11 @@ mod routing_tests {
         }
     }
 
+    /// The folder's own game, as a folder with one game for everything sends it.
+    fn destination_for(folder: &WatchedFolder, rules: &FolderRules, path: &Path) -> UploadMeta {
+        super::destination_for(folder, folder.game.as_deref(), rules, path)
+    }
+
     fn folder(game: Option<&str>, auto: bool, media: Vec<MediaKind>) -> WatchedFolder {
         WatchedFolder {
             id: "f".into(),
@@ -2074,6 +2155,8 @@ mod routing_tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: auto,
+            game_from_subfolder: false,
+            subfolder_games: Vec::new(),
             title_template: None,
             tag_ids: Vec::new(),
             watch_mode: crate::config::WatchMode::Auto,
@@ -2167,6 +2250,7 @@ mod routing_tests {
 mod sorting_tests {
     use super::tests::{fixture, read_request, run_against, state_of};
     use super::*;
+    use crate::config::WatchedFolder;
     use crate::ledger::FileState;
     use std::io::Write;
     use std::net::TcpListener;
@@ -2293,6 +2377,130 @@ mod sorting_tests {
         let bodies = server.join().unwrap();
         assert_eq!(field(&bodies[0], "folder"), Some("clips"));
         assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A clip in a folder that keeps one subfolder per game, with the clip in
+    /// `subfolder` and nothing but `choices` said about any of them.
+    fn fixture_per_game(subfolder: &str, choices: Vec<crate::config::SubfolderGame>) -> tests::Fixture {
+        let dir = std::env::temp_dir().join(format!(".firesync-q-{}", uuid::Uuid::new_v4()));
+        let game_dir = dir.join(subfolder);
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let clip = game_dir.join("clip.mp4");
+        std::fs::write(&clip, vec![0u8; 4096]).unwrap();
+
+        let folder = WatchedFolder {
+            id: "f1".into(),
+            path: dir.clone(),
+            enabled: true,
+            include_subfolders: true,
+            media: vec![MediaKind::Video],
+            dest_folder: Some("clips".into()),
+            game: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            after_upload: AfterUpload::Keep,
+            auto_sort_by_game: true,
+            game_from_subfolder: true,
+            subfolder_games: choices,
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
+        };
+        let ledger = Arc::new(Ledger::open(&dir.join("l.sqlite")).unwrap());
+        ledger.observe("f1", clip.to_str().unwrap(), 4096, 0, None).unwrap();
+        let claim = ledger.claim(1, &[]).unwrap().pop().expect("one queued file");
+        tests::Fixture {
+            dir,
+            ledger,
+            settings: Arc::new(Mutex::new(Settings { folders: vec![folder], ..Settings::default() })),
+            claim,
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    const LIBRARY: &str = r#"{"default_folder":"uploads","folders":{"video":["uploads","valorant"],"image":[]},
+        "games":[{"id":1,"name":"VALORANT"}],
+        "folder_rules":{"video":[{"folder":"valorant","game_id":1,"game":"VALORANT"}],"image":[]}}"#;
+
+    /// The point of a folder per game: the clip is filed where its own
+    /// subfolder's game lives, with nothing chosen by hand and the name not
+    /// even spelled the library's way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clip_is_filed_by_the_game_its_subfolder_is_named_after() {
+        let f = fixture_per_game("Valorant", vec![]);
+        let (url, server) = serve_sequence(vec![
+            (200, LIBRARY),
+            (201, r#"{"status":"accepted","media_type":"video","filename":"clip.mp4","folder":"valorant"}"#),
+        ]);
+
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 2, "the library once, then the upload");
+        assert_eq!(field(&bodies[1], "folder"), Some("valorant"));
+        assert_eq!(field(&bodies[1], "game"), None, "the folder does the tagging");
+        assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// No guess: a subfolder named like nothing in the library holds its clip
+    /// back, says why, and sends nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subfolder_named_like_no_game_holds_its_clip_rather_than_guessing() {
+        let f = fixture_per_game("Mystery Game", vec![]);
+        let (url, server) = serve_sequence(vec![(200, LIBRARY)]);
+
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+
+        assert_eq!(server.join().unwrap().len(), 1, "only the library was asked");
+        assert_eq!(state_of(&f), FileState::Failed);
+        let row = f.ledger.file(f.claim.id).unwrap().unwrap();
+        let reason = row.reason.unwrap_or_default();
+        assert!(reason.starts_with(games::UNMATCHED), "unexpected reason: {reason}");
+        assert!(reason.contains("\"Mystery Game\""), "it should name the folder: {reason}");
+        assert_eq!(row.attempts, 0, "nothing was tried, so nothing is charged");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A choice made by hand needs nothing from the library, "no game"
+    /// included, and is found however the subfolder is cased.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subfolder_chosen_to_have_no_game_sends_its_clip_plainly() {
+        let f = fixture_per_game(
+            "Desktop",
+            vec![crate::config::SubfolderGame { subfolder: "desktop".into(), game: None }],
+        );
+        let (url, server) = serve_sequence(vec![(
+            201,
+            r#"{"status":"accepted","media_type":"video","filename":"clip.mp4","folder":"clips"}"#,
+        )]);
+
+        run_against(&f, &url, Arc::new(QueueControl::new())).await;
+
+        let bodies = server.join().unwrap();
+        assert_eq!(bodies.len(), 1, "the library was not asked");
+        assert_eq!(field(&bodies[0], "folder"), Some("clips"), "the explicit destination");
+        assert_eq!(field(&bodies[0], "game"), None);
+        assert_eq!(state_of(&f), FileState::Done);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// The library cannot be asked, so the match cannot be made: the clip
+    /// waits to try again, like anything else the server's absence holds up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subfolder_s_game_waits_for_the_library_rather_than_going_without() {
+        let f = fixture_per_game("Valorant", vec![]);
+        let refused = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+
+        run_against(&f, &refused, Arc::new(QueueControl::new())).await;
+
+        assert_eq!(state_of(&f), FileState::Queued);
+        let reason = f.ledger.file(f.claim.id).unwrap().unwrap().reason.unwrap_or_default();
+        assert!(reason.contains("which games it has"), "unexpected reason: {reason}");
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 }
@@ -2455,6 +2663,8 @@ mod slot_tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: false,
+            game_from_subfolder: false,
+            subfolder_games: Vec::new(),
             title_template: None,
             tag_ids: Vec::new(),
             watch_mode: crate::config::WatchMode::Auto,
@@ -2512,6 +2722,8 @@ mod slot_tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: false,
+            game_from_subfolder: false,
+            subfolder_games: Vec::new(),
             title_template: None,
             tag_ids: Vec::new(),
             watch_mode: crate::config::WatchMode::Auto,

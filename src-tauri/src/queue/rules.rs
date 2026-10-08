@@ -162,6 +162,8 @@ mod tests {
             max_size_bytes: Some(8 * 1024 * 1024 * 1024),
             after_upload: crate::config::AfterUpload::Keep,
             auto_sort_by_game: false,
+            game_from_subfolder: false,
+            subfolder_games: Vec::new(),
             title_template: None,
             tag_ids: Vec::new(),
             watch_mode: crate::config::WatchMode::Auto,

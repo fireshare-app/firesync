@@ -8,8 +8,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::api::client::normalize_base_url;
 use crate::api::discovery::{check_token, media_exists, TokenCheck};
 use crate::api::identity::video_id;
-use crate::config::{self, AfterUpload, MediaKind, Settings, WatchedFolder};
+use crate::api::discovery::UploadOptions;
+use crate::config::{self, AfterUpload, MediaKind, Settings, SubfolderGame, WatchedFolder};
 use crate::error::{AppError, Result};
+use crate::games::{self, SubfolderStatus};
 use crate::ledger::{FileRow, FileState, Ledger};
 use crate::options::{OptionsCache, OptionsSnapshot};
 use crate::queue::rules::SupportedTypes;
@@ -408,6 +410,10 @@ pub struct NewFolder {
     #[serde(default = "default_true")]
     pub auto_sort_by_game: bool,
     #[serde(default)]
+    pub game_from_subfolder: bool,
+    #[serde(default)]
+    pub subfolder_games: Vec<SubfolderGame>,
+    #[serde(default)]
     pub title_template: Option<String>,
     #[serde(default)]
     pub tag_ids: Vec<i64>,
@@ -452,10 +458,18 @@ pub struct FolderSummary {
     /// Whether the folder's path is on a network drive, for the dialog to say
     /// what "automatically" chose.
     pub network: bool,
+    /// Each subfolder and its game, for a folder that keeps one per game.
+    /// Empty otherwise.
+    pub subfolders: Vec<SubfolderStatus>,
 }
 
 /// Everything a folder card shows about one folder.
 fn summarise(state: &AppState, folder: WatchedFolder, present_count: i64) -> Result<FolderSummary> {
+    let subfolders = if folder.game_from_subfolder {
+        games::status(&folder, state.options.snapshot().options.as_ref())
+    } else {
+        Vec::new()
+    };
     let counts = state.ledger.counts(&folder.id)?;
     let last_upload_at = state.ledger.last_upload_at(&folder.id)?;
     let reasons = state.ledger.held_reasons(&folder.id)?;
@@ -484,7 +498,39 @@ fn summarise(state: &AppState, folder: WatchedFolder, present_count: i64) -> Res
         problem,
         scanned_every: scanning.then_some(SCAN_EVERY.as_secs()),
         network,
+        subfolders,
     })
+}
+
+/// A folder's subfolders with the game each would send, for the settings
+/// dialog, which shows them for a folder not yet added too. `subfolder_games`
+/// is the dialog's draft of the choices, so what it shows is what saving
+/// would mean.
+#[tauri::command]
+pub fn list_subfolders(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    subfolder_games: Vec<SubfolderGame>,
+) -> Vec<SubfolderStatus> {
+    let probe = WatchedFolder {
+        id: String::new(),
+        path: PathBuf::from(path),
+        enabled: true,
+        include_subfolders: true,
+        media: Vec::new(),
+        dest_folder: None,
+        game: None,
+        min_size_bytes: None,
+        max_size_bytes: None,
+        after_upload: AfterUpload::Keep,
+        auto_sort_by_game: true,
+        game_from_subfolder: true,
+        subfolder_games: games::tidy_choices(subfolder_games),
+        title_template: None,
+        tag_ids: Vec::new(),
+        watch_mode: crate::config::WatchMode::Auto,
+    };
+    games::status(&probe, state.options.snapshot().options.as_ref())
 }
 
 /// Whether a folder not yet added is on a network drive, for the add dialog.
@@ -512,13 +558,16 @@ pub fn preview_title(
     path: String,
     game: Option<String>,
     include_subfolders: bool,
+    game_from_subfolder: Option<bool>,
+    subfolder_games: Option<Vec<SubfolderGame>>,
 ) -> TitlePreview {
     let folder_path = PathBuf::from(&path);
+    let per_game = game_from_subfolder.unwrap_or(false);
     let probe = WatchedFolder {
         id: String::new(),
         path: folder_path.clone(),
         enabled: true,
-        include_subfolders,
+        include_subfolders: include_subfolders || per_game,
         media: vec![MediaKind::Video, MediaKind::Image],
         dest_folder: None,
         game: None,
@@ -526,6 +575,8 @@ pub fn preview_title(
         max_size_bytes: None,
         after_upload: AfterUpload::Keep,
         auto_sort_by_game: false,
+        game_from_subfolder: per_game,
+        subfolder_games: games::tidy_choices(subfolder_games.unwrap_or_default()),
         title_template: None,
         tag_ids: Vec::new(),
         watch_mode: crate::config::WatchMode::Auto,
@@ -536,7 +587,17 @@ pub fn preview_title(
     } else {
         None
     };
-    let game = game.filter(|g| !g.trim().is_empty());
+    // In a folder per game, the newest file's game is its subfolder's, the
+    // way the upload would have it.
+    let game = if per_game {
+        let library = state.options.snapshot().options;
+        newest
+            .as_ref()
+            .and_then(|f| games::subfolder_of(&folder_path, std::path::Path::new(&f.path)))
+            .and_then(|sub| games::resolve(&probe, &sub, library.as_ref()).game)
+    } else {
+        game.filter(|g| !g.trim().is_empty())
+    };
     match newest {
         Some(file) => {
             let file = PathBuf::from(&file.path);
@@ -600,13 +661,18 @@ pub async fn add_folder(
             parent.path.display()
         )));
     }
+    // A folder per game is watched with its subfolders, whatever the box says.
+    let include_subfolders = folder.include_subfolders || folder.game_from_subfolder;
+    if include_subfolders {
+        watched_inside(&existing, &path, None)?;
+    }
 
     let media = if folder.media.is_empty() { vec![MediaKind::Video] } else { folder.media };
     let record = WatchedFolder {
         id: uuid::Uuid::new_v4().to_string(),
         path: path.clone(),
         enabled: true,
-        include_subfolders: folder.include_subfolders,
+        include_subfolders,
         media,
         dest_folder: folder.dest_folder,
         game: folder.game,
@@ -614,6 +680,8 @@ pub async fn add_folder(
         max_size_bytes: folder.max_size_bytes,
         after_upload: folder.after_upload,
         auto_sort_by_game: folder.auto_sort_by_game,
+        game_from_subfolder: folder.game_from_subfolder,
+        subfolder_games: games::tidy_choices(folder.subfolder_games),
         title_template: folder.title_template.filter(|t| !t.trim().is_empty()),
         tag_ids: folder.tag_ids,
         watch_mode: folder.watch_mode,
@@ -640,6 +708,25 @@ pub async fn add_folder(
 
     let present_count = baseline_count.max(present.len() as i64);
     summarise(&state, record, present_count)
+}
+
+/// The other way round from the check above: a folder watched with its
+/// subfolders, with a folder already watched on its own inside it, would
+/// upload that one's files twice too. `except` is the folder being changed,
+/// which is of course inside itself.
+fn watched_inside(folders: &[WatchedFolder], path: &std::path::Path, except: Option<&str>) -> Result<()> {
+    if let Some(child) = folders
+        .iter()
+        .filter(|f| except != Some(f.id.as_str()))
+        .find(|f| f.path != path && f.path.starts_with(path))
+    {
+        return Err(AppError::Storage(format!(
+            "{} is inside this folder and already watched on its own. Stop watching it first, \
+             or its clips would be uploaded twice.",
+            child.path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -681,6 +768,10 @@ pub struct FolderRules {
     pub after_upload: AfterUpload,
     #[serde(default = "default_true")]
     pub auto_sort_by_game: bool,
+    #[serde(default)]
+    pub game_from_subfolder: bool,
+    #[serde(default)]
+    pub subfolder_games: Vec<SubfolderGame>,
     #[serde(default)]
     pub title_template: Option<String>,
     #[serde(default)]
@@ -731,12 +822,19 @@ impl AppState {
     /// Change a folder's rules in place. See `update_folder`.
     pub fn update_folder(&self, id: &str, rules: FolderRules) -> Result<()> {
         let mut next = self.snapshot();
+        let include_subfolders = rules.include_subfolders || rules.game_from_subfolder;
+        if include_subfolders {
+            let path = next.folders.iter().find(|f| f.id == id).map(|f| f.path.clone());
+            if let Some(path) = path {
+                watched_inside(&next.folders, &path, Some(id))?;
+            }
+        }
         let Some(folder) = next.folders.iter_mut().find(|f| f.id == id) else {
             return Err(AppError::Storage("That folder is not being watched.".into()));
         };
 
-        let newly_recursive = !folder.include_subfolders && rules.include_subfolders;
-        folder.include_subfolders = rules.include_subfolders;
+        let newly_recursive = !folder.include_subfolders && include_subfolders;
+        folder.include_subfolders = include_subfolders;
         folder.media = if rules.media.is_empty() { vec![MediaKind::Video] } else { rules.media };
         folder.dest_folder = rules.dest_folder.filter(|s| !s.trim().is_empty());
         folder.game = rules.game.filter(|s| !s.trim().is_empty());
@@ -744,6 +842,9 @@ impl AppState {
         folder.max_size_bytes = rules.max_size_bytes.filter(|n| *n > 0);
         folder.after_upload = rules.after_upload;
         folder.auto_sort_by_game = rules.auto_sort_by_game;
+        folder.game_from_subfolder = rules.game_from_subfolder;
+        folder.subfolder_games = games::tidy_choices(rules.subfolder_games);
+        let per_game = folder.game_from_subfolder;
         folder.title_template = rules.title_template.filter(|t| !t.trim().is_empty());
         folder.tag_ids = rules.tag_ids;
         folder.watch_mode = rules.watch_mode;
@@ -761,7 +862,40 @@ impl AppState {
         // Recursion may have been turned on or off, which changes what is
         // watched.
         self.resync_watchers();
+        // A choice just made may be the one some clip was waiting on.
+        if per_game {
+            self.release_unmatched(self.options.snapshot().options.as_ref());
+        }
         Ok(())
+    }
+
+    /// Put back in the queue every upload that was waiting on a game for its
+    /// subfolder and now has one: a choice made in the folder's settings, or
+    /// a game added to the library since. Only those — one still unmatched
+    /// would only fail the same way again.
+    pub fn release_unmatched(&self, library: Option<&UploadOptions>) -> usize {
+        let mut released = 0;
+        for folder in self.snapshot().folders.iter().filter(|f| f.game_from_subfolder) {
+            let Ok(waiting) = self.ledger.failed_for_reason(&folder.id, games::UNMATCHED) else {
+                continue;
+            };
+            for row in waiting {
+                let Some(subfolder) =
+                    games::subfolder_of(&folder.path, std::path::Path::new(&row.path))
+                else {
+                    continue;
+                };
+                if games::resolve(folder, &subfolder, library).settled()
+                    && self.ledger.retry_now(row.id).unwrap_or(false)
+                {
+                    released += 1;
+                }
+            }
+        }
+        if released > 0 {
+            log::info!("{released} upload(s) whose folder now has a game are back in the queue");
+        }
+        released
     }
 }
 
@@ -1386,6 +1520,8 @@ mod catch_up_tests {
             max_size_bytes: None,
             after_upload: AfterUpload::Keep,
             auto_sort_by_game: false,
+            game_from_subfolder: false,
+            subfolder_games: Vec::new(),
             title_template: None,
             tag_ids: Vec::new(),
             watch_mode: crate::config::WatchMode::Auto,
@@ -1512,6 +1648,109 @@ mod catch_up_tests {
         assert_eq!(sent(&mut w), vec!["on-the-nas.mp4"]);
     }
 
+    /// Rules that change nothing about `world`'s folder.
+    fn rules() -> FolderRules {
+        FolderRules {
+            include_subfolders: false,
+            media: vec![MediaKind::Video],
+            dest_folder: None,
+            game: None,
+            min_size_bytes: None,
+            max_size_bytes: None,
+            after_upload: AfterUpload::Keep,
+            auto_sort_by_game: false,
+            game_from_subfolder: false,
+            subfolder_games: Vec::new(),
+            title_template: None,
+            tag_ids: Vec::new(),
+            watch_mode: crate::config::WatchMode::Auto,
+        }
+    }
+
+    fn choice(subfolder: &str, game: &str) -> SubfolderGame {
+        SubfolderGame { subfolder: subfolder.into(), game: Some(game.into()) }
+    }
+
+    /// Whatever the box says, a folder per game has to see into its subfolders
+    /// or it would see nothing at all.
+    #[test]
+    fn a_folder_per_game_is_watched_with_its_subfolders() {
+        let w = world(true);
+        w.state
+            .update_folder("f1", FolderRules { game_from_subfolder: true, ..rules() })
+            .unwrap();
+        let folder = w.state.snapshot().folders[0].clone();
+        assert!(folder.game_from_subfolder);
+        assert!(folder.include_subfolders);
+    }
+
+    /// The clip that waited for its subfolder to have a game goes the moment
+    /// it has one — and not before: a choice for some other subfolder is not
+    /// about it.
+    #[test]
+    fn choosing_a_game_for_a_subfolder_releases_the_clips_that_waited_on_it() {
+        let w = world(true);
+        recently_complete(&w);
+        w.state
+            .update_folder("f1", FolderRules { game_from_subfolder: true, ..rules() })
+            .unwrap();
+        let sub = w.clips.join("Mystery Game");
+        std::fs::create_dir_all(&sub).unwrap();
+        let clip = crate::watcher::canonical(&sub.join("clip.mp4"));
+        std::fs::write(&clip, b"clip").unwrap();
+        let path = clip.to_string_lossy().to_string();
+        w.state.ledger.observe("f1", &path, 4, 0, None).unwrap();
+        let id = w.state.ledger.recent(10).unwrap().into_iter().find(|r| r.path == path).unwrap().id;
+        w.state.ledger.mark_failed(id, &games::unmatched_reason("Mystery Game")).unwrap();
+
+        w.state
+            .update_folder(
+                "f1",
+                FolderRules {
+                    game_from_subfolder: true,
+                    subfolder_games: vec![choice("Some Other Game", "VALORANT")],
+                    ..rules()
+                },
+            )
+            .unwrap();
+        assert_eq!(w.state.ledger.file(id).unwrap().unwrap().state, FileState::Failed, "not about it");
+
+        w.state
+            .update_folder(
+                "f1",
+                FolderRules {
+                    game_from_subfolder: true,
+                    subfolder_games: vec![choice("mystery game", "VALORANT")],
+                    ..rules()
+                },
+            )
+            .unwrap();
+        let row = w.state.ledger.file(id).unwrap().unwrap();
+        assert_eq!(row.state, FileState::Queued, "back in the queue");
+        assert_eq!(row.reason, None);
+    }
+
+    /// Two watches on one clip would send it twice.
+    #[test]
+    fn a_folder_cannot_take_in_a_subfolder_that_is_watched_on_its_own() {
+        let w = world(true);
+        let inner = w.clips.join("VALORANT");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mut settings = w.state.snapshot();
+        let mut nested = settings.folders[0].clone();
+        nested.id = "f2".into();
+        nested.path = crate::watcher::canonical(&inner);
+        settings.folders.push(nested);
+        w.state.save(settings).unwrap();
+
+        let err = w
+            .state
+            .update_folder("f1", FolderRules { game_from_subfolder: true, ..rules() })
+            .unwrap_err();
+        assert!(err.to_string().contains("already watched on its own"), "{err}");
+        assert!(!w.state.snapshot().folders[0].include_subfolders, "nothing should have changed");
+    }
+
     #[test]
     fn turning_on_subfolders_leaves_what_was_already_in_them() {
         let mut w = world(true);
@@ -1532,6 +1771,8 @@ mod catch_up_tests {
                     max_size_bytes: None,
                     after_upload: AfterUpload::Keep,
                     auto_sort_by_game: false,
+                    game_from_subfolder: false,
+                    subfolder_games: Vec::new(),
                     title_template: None,
                     tag_ids: Vec::new(),
                     watch_mode: crate::config::WatchMode::Auto,
